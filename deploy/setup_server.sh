@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Идемпотентная настройка стенда на Ubuntu 26.04: Docker + compose, UFW 22/80/443, swap, папки данных.
-# Запуск на сервере из корня репозитория: sudo ./deploy/setup_server.sh
+# Запуск на сервере из корня репозитория: sudo [DOCKER_REGISTRY_MIRROR=https://...] ./deploy/setup_server.sh
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -16,6 +16,13 @@ echo "==> Пакеты"
 apt-get update -q
 apt-get install -y -q ca-certificates curl git ufw docker.io docker-compose-v2
 systemctl enable --now docker
+
+# Docker Hub недоступен из части российских сетей: DOCKER_REGISTRY_MIRROR=https://dockerhub.timeweb.cloud
+if [[ -n "${DOCKER_REGISTRY_MIRROR:-}" ]]; then
+  mkdir -p /etc/docker
+  printf '{\n  "registry-mirrors": ["%s"]\n}\n' "$DOCKER_REGISTRY_MIRROR" > /etc/docker/daemon.json
+  systemctl restart docker
+fi
 
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
   usermod -aG docker "$SUDO_USER"
