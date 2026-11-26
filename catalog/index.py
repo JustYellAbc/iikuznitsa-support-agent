@@ -110,9 +110,31 @@ def build(feed, destination, knowledge):
         temporary.unlink(missing_ok=True)
 
 
-def search(index, query, scope="catalog", limit=5):
+MDAEMON = re.compile(r"\b(?:mdaemon|мд[еэ]ймон|мдемон)\b", re.IGNORECASE)
+SEATS = re.compile(r"\b(\d+)\s+(?:пользовател\w*|человек\w*|сотрудник\w*|мест\w*|users?|seats?)\b", re.IGNORECASE)
+
+
+def catalog_lookup(query, expression):
+    """Resolve supported product-family names; edition equivalence stays unconfirmed."""
+    # MDaemon also appears as the vendor on add-ons. Keep their explicit names searchable.
+    for name, marker in (
+        ("connector for outlook", r"outlook|коннектор|connector"),
+        ("activesync", r"activesync"),
+        ("security gateway", r"security gateway"),
+        ("antivirus", r"antivirus|антивирус"),
+    ):
+        if re.search(r"\b(?:" + marker + r")\b", query, re.IGNORECASE):
+            return f'name:"mdaemon" AND name:"{name}"'
+    if re.search(r"\b(?:standard|стандарт|messaging server)\b", query, re.IGNORECASE):
+        return 'name:"mdaemon messaging server"'
+    return f'name:"mdaemon" AND ({expression})'
+
+
+def search(index, query, scope="catalog", limit=5, *, license_type=None):
     # Quote FTS tokens and bind MATCH to keep raw user input out of query syntax.
-    words = re.findall(r"[^\W_]+", query, re.UNICODE)
+    named_family = scope == "catalog" and MDAEMON.search(query)
+    normalized = MDAEMON.sub("MDaemon", query) if named_family else query
+    words = re.findall(r"[^\W_]+", normalized, re.UNICODE)
     if not words:
         return []
     expression = " OR ".join(f'"{word}"*' for word in dict.fromkeys(words))
@@ -122,12 +144,33 @@ def search(index, query, scope="catalog", limit=5):
             rows = db.execute("SELECT title,body,source FROM knowledge WHERE knowledge MATCH ? "
                               "ORDER BY bm25(knowledge,4,1,0) LIMIT ?", (expression, limit))
         else:
-            rows = db.execute("""
+            filters = ["products MATCH ?"]
+            bindings = [catalog_lookup(query, expression) if named_family else expression]
+            ordering = []
+            if named_family:
+                ordering.append("CASE WHEN o.name LIKE '%MDaemon Messaging Server%' THEN 0 ELSE 1 END")
+            seats = SEATS.findall(query) if named_family else []
+            capacity = """CAST(json_extract(o.params, '$."К-во пользователей до"[0]') AS INTEGER)"""
+            if len(seats) == 1:
+                # The feed stores the upper capacity of each pack as a decimal string.
+                size = seats[0].lstrip("0")
+                if not size or len(size) > 18:
+                    return []
+                filters.append(f"{capacity} >= ?")
+                bindings.append(int(size))
+            if named_family:
+                ordering.append(f"{capacity} ASC NULLS LAST")
+            if license_type:
+                filters.append("""EXISTS (SELECT 1 FROM json_each(o.params, '$."Тип лицензии"')
+                                          WHERE value = ?)""")
+                bindings.append(license_type)
+            ordering.extend(["bm25(products,8,10,3,1)", "o.id"])
+            rows = db.execute(f"""
                 SELECT o.id,o.vendor_code,o.name,o.edition,o.price,o.currency,o.available,
                        o.price_state,o.source,o.params,o.details FROM products
-                JOIN offers o ON o.rowid=products.rowid WHERE products MATCH ?
-                ORDER BY bm25(products,8,10,3,1), o.id LIMIT ?
-            """, (expression, limit))
+                JOIN offers o ON o.rowid=products.rowid WHERE {" AND ".join(filters)}
+                ORDER BY {", ".join(ordering)} LIMIT ?
+            """, [*bindings, limit])
         result = [dict(r) for r in rows]
         for item in result:
             if "params" in item:
@@ -147,7 +190,8 @@ if __name__ == "__main__":
     query_cmd.add_argument("index", type=Path)
     query_cmd.add_argument("query")
     query_cmd.add_argument("--scope", choices=["catalog", "knowledge"], default="catalog")
+    query_cmd.add_argument("--license-type", choices=["Полная версия", "Продление"])
     args = parser.parse_args()
     result = (build(args.feed, args.index, args.knowledge) if args.command == "build"
-              else search(args.index, args.query, args.scope))
+              else search(args.index, args.query, args.scope, license_type=args.license_type))
     print(json.dumps(result, ensure_ascii=False, indent=2))

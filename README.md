@@ -11,12 +11,16 @@ python -m pip install beautifulsoup4
 python catalog/refresh_knowledge.py data/private/knowledge.json
 python catalog/index.py build data/raw/Mindbox.yml.gz.xml data/private/catalog.sqlite3 --knowledge data/private/knowledge.json
 python catalog/index.py search data/private/catalog.sqlite3 "MDaemon Messaging Server"
+python catalog/index.py search data/private/catalog.sqlite3 "Нужен Мдеймон на 20 человек"
+python catalog/index.py search data/private/catalog.sqlite3 "MDaemon Standard на 20 пользователей" --license-type "Полная версия"
 python catalog/index.py search data/private/catalog.sqlite3 "восстановить пароль" --scope knowledge
 ```
 
 Без сети сборка работает с шестью краткими справочными карточками из `catalog/knowledge.json`: опустите аргумент `--knowledge`. Расширенный снимок добавляет разделы из двенадцати статей Softline ID и личного кабинета. По оплате и доставке в поставке используются краткие выдержки с URL магазина. Дата и цены каталога относятся к исходному фиду.
 
 Для подключения сервера импортируйте `search(Path(index), query, scope, limit)` из `catalog.index`. Результаты каталога содержат исходный ID, артикул производителя, название, редакцию, цену, валюту, признак доступности, состояние цены, параметры и ссылку. Если редакция или артикул неизвестны, возвращается null. Повторяющиеся значения одного параметра сохраняются списком. Результаты справки содержат заголовок, текст и ссылку на первоисточник. Поиск лексический, по префиксам, возвращает кандидатов для проверки условий агентом.
+
+Для «MDaemon Standard» поиск подбирает варианты Messaging Server из фида. Соответствие конкретной редакции и права после окончания подписки требуют подтверждения. Для запроса с числом пользователей поиск учитывает вместимость упаковки и сначала показывает ближайший подходящий размер в семействе сервера. При явном запросе коннектора Outlook поиск идёт по коннекторам. Пока тип покупки неизвестен, сохраните варианты новой лицензии и продления для уточнения. После ответа клиента передайте `license_type="Полная версия"` или `license_type="Продление"` в `search`.
 
 В SQLite таблица `offers` доступна для точного поиска по `id` и `vendor_code`. Исходные поля варианта (в том числе описание и условия количества) лежат в `details` в формате JSON. `priced_available` означает положительную цену и доступный вариант в снимке, `verify_availability` требует проверки менеджером, `request_price` означает отсутствие пригодной цены. Дата снимка лежит в `metadata.snapshot`. Новый индекс заменяет предыдущий только после успешной сборки. Держите локальные снимки в игнорируемом Git каталоге `data/private/`.
 
