@@ -10,7 +10,7 @@ let state;
 try { state = JSON.parse(sessionStorage.getItem(storageKey)) || {}; } catch { state = {}; }
 function save() { sessionStorage.setItem(storageKey, JSON.stringify(state)); }
 const openHandoffs = new Map();
-const answered = new Set();
+const completedActions = new Set();
 let cursor = 0, posting = false, polling = false, denied = false, waitUntil = 0;
 let timer, wake, actionError = "", historyError = "";
 message.value = state.pending?.body.text || "";
@@ -87,8 +87,11 @@ function display(event) {
   byId("welcome").hidden = true;
   cursor = event.seq;
   if (event.data.type === "handoff") updateHandoffs(event.data.handoff);
-  if (event.data.type !== "message" || !["input", "greeting"].includes(event.data.purpose)) {
-    answered.add(event.actionId);
+  const { type, author, purpose, handoffId } = event.data;
+  // A reply to an operator finishes on delivery. The manager answers with a separate actionId.
+  const deliveredToOperator = type === "message" && author === "customer" && purpose === "input" && Boolean(handoffId);
+  if (deliveredToOperator || type !== "message" || (purpose !== "input" && purpose !== "greeting")) {
+    completedActions.add(event.actionId);
     if (state.receipt === event.actionId) { delete state.receipt; save(); }
   }
   if (atBottom) scroller.scrollTop = scroller.scrollHeight;
@@ -142,7 +145,7 @@ async function submit(body) {
     const receipt = await request(base + "/" + encodeURIComponent(state.id) + "/actions", state.pending.key, body);
     if (denied) return;
     if (!receipt.actionId || receipt.conversationId !== state.id) throw new Error("Не удалось подтвердить отправку.");
-    state.receipt = answered.has(receipt.actionId) ? null : receipt.actionId;
+    state.receipt = completedActions.has(receipt.actionId) ? null : receipt.actionId;
     delete state.pending; save();
     if (body.type === "message") message.value = "";
     poll();
