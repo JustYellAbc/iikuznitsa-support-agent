@@ -23,10 +23,11 @@ LLM — только через app.core.llm.llm_call(). BudgetExceededError м�
 import time
 from collections.abc import Awaitable, Callable
 
-from app.agent.handoff import CONFIRMED, OFFER_HELP, ActionType, SearchFinding, route_action, selected_products
-from app.contracts.schemas import AgentReply, AgentTurn, Message, Session, StepTrace
+from app.agent.handoff import CONFIRMED, OFFER_HELP, ActionType, SearchFinding, route_action
+from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Session, StepTrace
+from app.contracts.t04 import Product
 from app.core.llm import llm_call
-from app.db.repository import new_id
+from app.db.repository import last_products, new_id
 
 EmitStep = Callable[[StepTrace], Awaitable[None]]
 
@@ -40,12 +41,12 @@ async def run_turn(
     emit_step: EmitStep,
     *,
     action_type: ActionType = "message",
-    products: list[dict] | None = None,
+    products: list[Product] | None = None,
     finding: SearchFinding | None = None,
 ) -> AgentReply:
     started = time.perf_counter()
     if products is None:
-        products = await selected_products(session, history)
+        products = [Product.model_validate(p) for p in await last_products(session.id)]
     route = route_action(history, user_text, products, action_type=action_type, finding=finding)
     if route:
         step = StepTrace(
@@ -65,8 +66,10 @@ async def run_turn(
                 total_latency_ms=int((time.perf_counter() - started) * 1000),
             ),
             text=OFFER_HELP if route.offer_help else CONFIRMED,
-            ticket_summary=route.question,
-            collected_params={"question": route.question, "products": products},
+            purpose="clarification" if route.offer_help else "notice",
+            handoff=None
+            if route.offer_help
+            else HandoffRequest(reason=route.reason, question=route.question, products=products),
         )
     resp = await llm_call(
         [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_text}],

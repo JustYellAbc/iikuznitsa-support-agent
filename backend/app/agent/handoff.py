@@ -1,13 +1,11 @@
 """Route requests to the existing operator queue. Product facts come from the catalog."""
 
-import json
 import re
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 
-from app.contracts.schemas import Message, Session
-from app.db.database import get_db
+from app.contracts.schemas import Message
+from app.contracts.t04 import HandoffReason, Product
 
 ActionType = Literal["message", "request_operator"]
 SearchFinding = Literal["partner_required", "insufficient_evidence"]
@@ -57,7 +55,7 @@ def bare_request(text: str) -> bool:
     )
 
 
-def handoff_reason(text: str) -> str | None:
+def handoff_reason(text: str) -> HandoffReason | None:
     if TENDER.search(text) and not NO_TENDER.search(text):
         return "tender"
     if EXTRA_DOCUMENTS.search(text) or SPECIAL.search(text):
@@ -69,57 +67,6 @@ def handoff_reason(text: str) -> str | None:
     if asks_for_operator(text):
         return "customer_request"
     return None
-
-
-async def selected_products(session: Session, history: list[Message]) -> list[dict]:
-    """Resolve the latest cited offers, then the entry page. The browser can supply a URL, never prices."""
-    db = get_db()
-    candidates = [m.sources for m in reversed(history) if m.role in ("agent", "operator") and m.sources]
-    page = session.client_context.get("page")
-    if isinstance(page, str) and page:
-        candidates.append([page.partition("#")[0].partition("?")[0]])
-    for urls in candidates:
-        products = []
-        catalog_reference = False
-        for url in dict.fromkeys(urls):
-            rows = await db.fetchall(
-                "SELECT offer_id,name,url,available,has_price,price,params_json FROM offers WHERE url=? LIMIT 2", (url,)
-            )
-            if not rows:
-                continue
-            catalog_reference = True
-            if len(rows) > 1:
-                continue
-            row = rows[0]
-            known_price = row["has_price"] and row["price"] is not None and row["price"] > 0
-            price_state = ("listed" if row["available"] else "availability_check") if known_price else "on_request"
-            term = json.loads(row["params_json"]).get("Срок действия")
-            values = term if isinstance(term, list) else [term]
-            periods = [
-                v.strip()
-                for v in values
-                if isinstance(v, str)
-                and v.strip().casefold()
-                not in {"", "не определено", "мес.", "нет данных", "не указано", "другое или отсутствует"}
-            ]
-            products.append(
-                {
-                    "offerId": row["offer_id"],
-                    "name": row["name"],
-                    "source": {"url": row["url"], "label": row["name"]},
-                    "available": bool(row["available"]),
-                    "priceState": price_state,
-                    "unitPriceKopecks": (
-                        int((Decimal(str(row["price"])) * 100).to_integral_value(rounding=ROUND_HALF_UP))
-                        if known_price
-                        else None
-                    ),
-                    "licenseTerm": " / ".join(periods) or None,
-                }
-            )
-        if catalog_reference:
-            return products
-    return []
 
 
 def open_question(history: list[Message], text: str, generic: bool) -> str:
@@ -138,7 +85,7 @@ def open_question(history: list[Message], text: str, generic: bool) -> str:
 
 @dataclass(frozen=True)
 class Routing:
-    reason: str
+    reason: HandoffReason
     question: str
     offer_help: bool = False
 
@@ -146,7 +93,7 @@ class Routing:
 def route_action(
     history: list[Message],
     text: str,
-    products: list[dict],
+    products: list[Product],
     *,
     action_type: ActionType = "message",
     finding: SearchFinding | None = None,
@@ -166,11 +113,11 @@ def route_action(
         return Routing("outside_catalog", text)
     if len(products) == 1:
         p = products[0]
-        if PRICE.search(body) and p["priceState"] == "on_request":
+        if PRICE.search(body) and p.priceState == "on_request":
             return Routing("price_request", text)
-        if p["priceState"] == "availability_check" and re.search(r"наличи|доступн|купить|поставк", body):
+        if p.priceState == "availability_check" and re.search(r"наличи|доступн|купить|поставк", body):
             return Routing("availability", text)
-        if TERM.search(body) and p["licenseTerm"] is None:
+        if TERM.search(body) and p.licenseTerm is None:
             finding = "insufficient_evidence"
     if finding == "insufficient_evidence":
         return Routing("insufficient_evidence", text, offer_help=True)

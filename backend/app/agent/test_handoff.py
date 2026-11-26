@@ -5,14 +5,14 @@ from datetime import UTC, datetime
 from threading import Barrier
 
 import pytest
-from tests.conftest import OPERATOR, wait_for
-from tests.conftest import client as stand_client  # noqa: F401 — shared pytest fixture
-from tests.conftest import env as env  # shared autouse fixture
+from tests.conftest import api as stand_api  # noqa: F401 — pytest fixture
+from tests.conftest import client as client
+from tests.conftest import env as env
 
 from app.agent.handoff import OFFER_HELP, route_action
 from app.contracts.schemas import Message
+from app.contracts.t04 import Product, ProductsData
 from app.db import repository
-from app.db.database import get_db
 
 
 @pytest.mark.parametrize(
@@ -61,101 +61,96 @@ def test_search_outcomes_and_explicit_button():
     assert route_action([msg], "Позовите оператора, лицензия не активируется", []).question.endswith("не активируется")
 
 
-def send(stand, sid, text):
-    path = f"/api/sessions/{sid}"
-    assert stand.post(path + "/messages", json={"text": text}).status_code == 202
-    return wait_for(lambda: (state if not (state := stand.get(path).json())["busy"] else None))
+def rows(api, cid):
+    return [e["data"] for e in api.events(cid)]
 
 
-def test_handoff_round_trip(stand_client):  # noqa: F811
-    stand = stand_client
-    sid = stand.post("/api/sessions", json={}).json()["id"]
-    for text in ["Позвать оператора", "Соедините с менеджером"]:
-        state = send(stand, sid, text)
-        assert state["turns"][-1]["decision"] == "escalate"
-        assert len(state["open_tickets"]) == 1
-    path = "/api/operator/tickets"
-    assert stand.get(path).status_code == 401
-    [entry] = stand.get(path, auth=OPERATOR).json()
-    ticket = entry["ticket"]
-    assert ticket["session_id"] == sid and ticket["reason"] == "customer_request"
-    assert ticket["collected_params"]["products"] == []
-    assert len([m for m in entry["messages"] if m["role"] == "client"]) == 2
-    assert stand.post(f"{path}/{ticket['id']}/reply", auth=OPERATOR, json={"text": "Помогу здесь."}).is_success
-    assert stand.get(f"/api/sessions/{sid}").json()["messages"][-1]["text"] == "Помогу здесь."
+def say(api, cid, text, **extra):
+    response = api.say(cid, text, **extra)
+    assert response.status_code == 202, response.text
+    api.idle()
+    return rows(api, cid)
 
 
-def test_concurrent_button_clicks_share_one_ticket(stand_client):  # noqa: F811
-    stand = stand_client
-    sid = stand.post("/api/sessions", json={}).json()["id"]
-    path = f"/api/sessions/{sid}"
-    together = Barrier(4)
+def queue(api):
+    response = api.call("manager", "GET", "/api/v1/manager/handoffs")
+    assert response.status_code == 200, response.text
+    return response.json()["items"]
 
-    def click():
-        together.wait(timeout=5)
-        return stand.post(path + "/messages", json={"text": "Позвать оператора"}).status_code
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        clicks = [pool.submit(click) for _ in range(4)]
-        statuses = [result.result() for result in clicks]
-    assert 202 in statuses and set(statuses) <= {202, 409}
-    wait_for(lambda: not stand.get(path).json()["busy"])
-    [entry] = stand.get("/api/operator/tickets", auth=OPERATOR).json()
-    assert entry["ticket"]["session_id"] == sid
+def publish_product(api, cid, price):
+    # Same journal event the server persists for a successful product selection (T07).
+    product = Product.from_catalog("19576", "MDaemon", "https://store.softline.ru/test/19576/", True, price)
+    event = ProductsData(products=[product]).model_dump(mode="json")
+    api.client.portal.call(repository.append_events, cid, "selection", [event])
+    return product.model_dump(mode="json")
 
 
 @pytest.mark.parametrize(
-    ("question", "expected"),
+    ("question", "reason", "price"),
     [
-        ("Требуется комплект документов для тендера", "tender"),
-        ("Сколько стоит лицензия?", "price_request"),
-        ("Какой срок действия лицензии?", "insufficient_evidence"),
+        ("Закупка тендерная, нужны документы", "tender", "77556"),
+        ("Есть ли цена этой лицензии?", "price_request", None),
+        ("Нужна анкета поставщика", "special_terms", "77556"),
+        ("Запросите у партнёра", "outside_catalog", "77556"),
+        ("Соедините с менеджером", "customer_request", "77556"),
     ],
 )
-def test_product_and_question_reach_operator(stand_client, question, expected):  # noqa: F811
-    stand = stand_client
-    url = "https://store.softline.ru/test/example-100/"
+def test_customer_and_manager_share_handoff(stand_api, question, reason, price):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    product = publish_product(api, cid, price)
+    api.login()
+    data = say(api, cid, question)
+    [h] = [r["handoff"] for r in data if r["type"] == "handoff"]
+    assert h["reason"] == reason and h["products"] == [product] and h["question"] == question
+    say(api, cid, question)
+    assert queue(api) == [h]
+    hid = h["handoffId"]
+    url = f"/api/v1/manager/handoffs/{hid}/resolution"
+    assert api.call("manager", "POST", url, json={"type": "reply", "reply": "Уточните реквизиты"}).status_code == 202
+    say(api, cid, "Уточнил", handoffId=hid)
+    assert api.call("manager", "POST", url, json={"type": "close", "reply": "Отправил документы"}).status_code == 202
+    assert queue(api) == []
+    manager = api.events(cid, role="manager")
+    assert manager == api.events(cid)
+    assert [e["data"].get("text") for e in manager if e["data"].get("handoffId") == hid] == [
+        "Уточните реквизиты",
+        "Уточнил",
+        "Отправил документы",
+    ]
 
-    async def seed():
-        async with get_db().tx() as conn:
-            await conn.execute("INSERT INTO offers(offer_id,name,url) VALUES(?,?,?)", ("100", "Example", url))
 
-    stand.portal.call(seed)
-    sid = stand.post("/api/sessions", json={"client_context": {"page": url, "price": 1}}).json()["id"]
-    state = send(stand, sid, question)
-    if expected == "insufficient_evidence":
-        assert not state["open_tickets"] and state["messages"][-1]["text"] == OFFER_HELP
-        send(stand, sid, "Да, пожалуйста")
-    [entry] = stand.get("/api/operator/tickets", auth=OPERATOR).json()
-    ticket = entry["ticket"]
-    assert ticket["reason"] == expected
-    assert ticket["collected_params"]["question"] == question
-    [product] = ticket["collected_params"]["products"]
-    assert product["offerId"] == "100" and product["source"]["url"] == url
-    assert product["priceState"] == "on_request" and product["unitPriceKopecks"] is None
+def test_insufficient_evidence_requires_consent_and_keeps_question(stand_api):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    api.login()
+    product = publish_product(api, cid, "77556")
+    question = "Какой срок действия лицензии?"
+    assert say(api, cid, question)[-1]["text"] == OFFER_HELP
+    assert queue(api) == []
+    say(api, cid, "Да, пожалуйста")
+    [h] = queue(api)
+    assert (h["reason"], h["question"], h["products"]) == ("insufficient_evidence", question, [product])
 
 
-def test_product_from_dialog_takes_precedence_over_entry_page(stand_client):  # noqa: F811
-    stand = stand_client
-    entry = "https://store.softline.ru/entry/"
-    selected = "https://store.softline.ru/alt-n-technologies-ltd/-19576/"
-    sid = stand.post("/api/sessions", json={"client_context": {"page": entry}}).json()["id"]
+def test_parallel_t09_button_retries_create_one_receipt_and_handoff(stand_api):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    path = f"/api/v1/conversations/{cid}/actions"
+    together = Barrier(4)
+    cookie = "support_session=" + api.tokens["customer"]
 
-    async def seed():
-        async with get_db().tx() as conn:
-            await conn.executemany(
-                "INSERT INTO offers(offer_id,name,url,available,has_price,price) VALUES(?,?,?,?,?,?)",
-                [("entry", "Другая позиция", entry, 0, 0, None), ("19576", "MDaemon", selected, 1, 1, 77556)],
-            )
-        await repository.add_message(sid, "client", "Нужна почта на 20 пользователей")
-        await repository.add_message(sid, "agent", "Нашёл MDaemon на 20 пользователей.", sources=[selected])
+    def click(key):
+        together.wait(timeout=5)
+        return api.client.post(
+            path, json={"type": "request_operator"}, headers={"Idempotency-Key": key, "Cookie": cookie}
+        )
 
-    stand.portal.call(seed)
-    send(stand, sid, "Теперь нужны документы для тендера")
-    [card] = stand.get("/api/operator/tickets", auth=OPERATOR).json()
-    ticket = card["ticket"]
-    assert ticket["reason"] == "tender"
-    assert ticket["collected_params"]["question"] == "Теперь нужны документы для тендера"
-    [product] = ticket["collected_params"]["products"]
-    assert (product["offerId"], product["unitPriceKopecks"], product["priceState"]) == ("19576", 7755600, "listed")
-    assert card["messages"][0]["text"] == "Нужна почта на 20 пользователей"
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        replies = list(pool.map(click, ["t09-a", "t09-a", "t09-b", "t09-c"]))
+    assert all(r.status_code == 202 and r.json() == replies[0].json() for r in replies)
+    [h] = [r["handoff"] for r in rows(api, cid) if r["type"] == "handoff"]
+    assert h["reason"] == "customer_request" and h["products"] == []
+    api.login()
+    assert queue(api) == [h]
