@@ -133,8 +133,8 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
         reason="insufficient_evidence", question=(reply.text or "Нужна помощь оператора.")[:8000]
     )
     datas = _reply_events(reply)
-    existing = await repository.find_open_handoff(cid, request.reason)
     async with get_db().tx() as conn:
+        existing = await repository.find_open_handoff(cid, request.reason)
         if existing is None:
             handoff = await repository.create_handoff(
                 cid,

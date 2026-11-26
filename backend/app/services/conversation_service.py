@@ -163,12 +163,12 @@ async def _customer_message(conv: repository.Conversation, action: MessageAction
 async def _request_operator(conv: repository.Conversation) -> Result:
     """Кнопка «Позвать оператора»: повтор при открытом обращении возвращает исходную квитанцию."""
     cid = conv.session.id
-    existing = await repository.find_open_handoff(cid, "customer_request")
-    if existing is not None:
-        return 202, receipt(cid, existing.action_id)
-    action_id = repository.new_id("a")
-    products = await repository.last_products(cid)
     async with get_db().tx() as conn:
+        existing = await repository.find_open_handoff(cid, "customer_request")
+        if existing is not None:
+            return 202, receipt(cid, existing.action_id)
+        action_id = repository.new_id("a")
+        products = await repository.last_products(cid)
         handoff = await repository.create_handoff(
             cid, action_id, "customer_request", OPERATOR_QUESTION, products, conn=conn
         )
