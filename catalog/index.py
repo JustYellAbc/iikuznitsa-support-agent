@@ -34,6 +34,8 @@ def insert_offer(db, node, categories):
     params = defaultdict(list)
     for item in node.findall("param"):
         value = (item.text or "").strip()
+        if item.get("name") == "Срок действия" and value.casefold() in {"не определено", "мес."}:
+            continue
         if value and value.casefold() not in {"другое или отсутствует", "не указано", "нет данных"}:
             params[item.attrib["name"]].append(value)
     details = {child.tag: child.text.strip() for child in node
