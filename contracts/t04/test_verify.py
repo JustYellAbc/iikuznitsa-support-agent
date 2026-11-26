@@ -4,6 +4,7 @@ import unittest
 from copy import deepcopy
 
 import yaml
+from jsonschema.exceptions import ValidationError
 
 from verify import Contract, HERE, check_scenario
 
@@ -22,6 +23,20 @@ class TraceTests(unittest.TestCase):
     def assert_invalid(self, case, message):
         with self.assertRaisesRegex(ValueError, message):
             check_scenario(self.contract, case)
+
+    def test_admission_errors_match_http_status_and_allow_retry(self):
+        for code, status in (("rate_limited", 429), ("agent_busy", 409)):
+            with self.subTest(code=code):
+                steps = self.tender["steps"]
+                rejected = next(step for step in steps if step["response"].get("code") == code)
+                self.assertEqual(rejected["status"], status)
+                accepted = next(step for step in steps[steps.index(rejected) + 1:] if step.get("key") == rejected["key"])
+                self.assertEqual(accepted["status"], 202)
+                self.assertEqual(accepted["body"], rejected["body"])
+                self.contract.check_exchange(rejected)
+                for wrong_status in ({409, 422, 429} - {status}):
+                    with self.subTest(wrong_status=wrong_status), self.assertRaises(ValidationError):
+                        self.contract.check_exchange({**rejected, "status": wrong_status})
 
     def test_independent_readers_observe_one_history(self):
         reads = [step for step in self.tender["steps"] if step["operationId"] == "readEvents"]

@@ -12,6 +12,16 @@
         "response": {"conversationId":"c-tender"}
       },
       {
+        "label": "Временный лимит стенда отклоняет первое сообщение до принятия",
+        "role": "customer",
+        "operationId": "submitAction",
+        "params": {"conversationId":"c-tender"},
+        "key": "message1",
+        "body": {"type":"message","text":"Нужен Мдеймон для 20 человек. Покупатель — юрлицо."},
+        "status": 429,
+        "response": {"code":"rate_limited","message":"Слишком много запросов. Попробуйте чуть позже."}
+      },
+      {
         "label": "Покупатель называет семейство",
         "role": "customer",
         "operationId": "submitAction",
@@ -20,6 +30,16 @@
         "body": {"type":"message","text":"Нужен Мдеймон для 20 человек. Покупатель — юрлицо."},
         "status": 202,
         "response": {"conversationId":"c-tender","actionId":"a1"}
+      },
+      {
+        "label": "Вторая реплика приходит во время первого хода и остаётся у покупателя для повтора",
+        "role": "customer",
+        "operationId": "submitAction",
+        "params": {"conversationId":"c-tender"},
+        "key": "message2",
+        "body": {"type":"message","text":"Покупаем впервые."},
+        "status": 409,
+        "response": {"code":"agent_busy","message":"Агент ещё отвечает на предыдущее сообщение."}
       },
       {
         "label": "Уточнение, которое влияет на выбор",

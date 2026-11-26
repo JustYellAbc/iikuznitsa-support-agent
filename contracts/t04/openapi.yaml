@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Softline · чат покупателя и кабинет оператора
-  version: 0.2.0
+  version: 0.3.0
   description: Контракт команды для T04. Сервер определяет роль и область доступа по сессии стенда.
 servers:
   - url: /api/v1
@@ -17,6 +17,7 @@ paths:
         '201':
           description: Созданный диалог. Повтор с тем же ключом возвращает тот же ID.
           content: {application/json: {schema: {$ref: '#/components/schemas/ConversationRef'}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
         default: {$ref: '#/components/responses/Error'}
   /conversations/{conversationId}/actions:
     parameters: [{$ref: '#/components/parameters/ConversationId'}]
@@ -32,6 +33,15 @@ paths:
           description: При новом запросе уже выданного документа сервер немедленно возвращает существующий файл.
           content: {application/json: {schema: {$ref: '#/components/schemas/Document'}}}
         '202': {$ref: '#/components/responses/Accepted'}
+        '409':
+          description: agent_busy — предыдущий ход ещё выполняется. Остальные коды описывают конфликт ключа, обращения или условий сделки.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+                properties:
+                  code: {enum: [agent_busy, key_conflict, stale_revision, terms_pending, confirmation_required, already_resolved]}
+        '429': {$ref: '#/components/responses/RateLimited'}
         default: {$ref: '#/components/responses/Error'}
   /conversations/{conversationId}/events:
     parameters: [{$ref: '#/components/parameters/ConversationId'}]
@@ -47,6 +57,7 @@ paths:
         '200':
           description: До 100 событий. При hasMore=true сразу читать следующую страницу с nextAfter.
           content: {application/json: {schema: {$ref: '#/components/schemas/EventPage'}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
         default: {$ref: '#/components/responses/Error'}
   /manager/handoffs:
     get:
@@ -87,6 +98,7 @@ paths:
         '200':
           description: PDF. Отдавать с Content-Disposition attachment.
           content: {application/pdf: {schema: {type: string, format: binary}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
         default: {$ref: '#/components/responses/Error'}
 components:
   securitySchemes:
@@ -100,7 +112,22 @@ components:
       content: {application/json: {schema: {$ref: '#/components/schemas/Receipt'}}}
     Error:
       description: 401 — нужна сессия, 403 — требуется роль, 404 — объект отсутствует или вне области доступа, 409 — конфликт состояния, 422 — некорректные входные данные.
-      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+            properties: {code: {not: {enum: [agent_busy, rate_limited]}}}
+    RateLimited:
+      description: Превышен лимит публичного стенда. Запрос отклонён до выполнения.
+      headers:
+        Retry-After:
+          description: Для временного ограничения сервер может указать задержку в секундах.
+          schema: {type: integer, minimum: 1}
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+            properties: {code: {const: rate_limited}}
   schemas:
     Id: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'}
     Text: {type: string, minLength: 1, maxLength: 8000}
@@ -130,7 +157,7 @@ components:
       additionalProperties: false
       required: [code, message]
       properties:
-        code: {enum: [unauthenticated, forbidden, not_found, stale_revision, terms_pending, confirmation_required, key_conflict, already_resolved, invalid_input]}
+        code: {enum: [unauthenticated, forbidden, not_found, stale_revision, terms_pending, confirmation_required, key_conflict, already_resolved, invalid_input, rate_limited, agent_busy]}
         message: {$ref: '#/components/schemas/Text'}
     CustomerAction:
       oneOf:
