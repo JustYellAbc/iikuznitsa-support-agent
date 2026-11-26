@@ -11,6 +11,7 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from app.agent.product_answers import refresh_products
 from app.config import get_settings
 from app.contracts.t04 import (
     ID_PATTERN,
@@ -20,6 +21,7 @@ from app.contracts.t04 import (
     ManagerDecision,
     MessageAction,
     MessageData,
+    Product,
     ReplyDecision,
     RequestDocumentAction,
     RequestOperatorAction,
@@ -168,9 +170,20 @@ async def _request_operator(conv: repository.Conversation) -> Result:
         if existing is not None:
             return 202, receipt(cid, existing.action_id)
         action_id = repository.new_id("a")
-        products = await repository.last_products(cid)
+        saved_products = [Product.model_validate(p) for p in await repository.last_products(cid)]
+        products = await asyncio.to_thread(
+            refresh_products, get_settings().data_dir / "private" / "catalog.sqlite3", saved_products
+        )
+        question = OPERATOR_QUESTION
+        history = await repository.history_messages(cid)
+        if history and history[-1].role == "agent":
+            turns = await repository.list_turns(cid)
+            if turns and turns[-1].decision == "answer" and turns[-1].steps:
+                last_step = turns[-1].steps[-1]
+                if last_step.tool == "product_facts":
+                    question = last_step.args.get("question", question)
         handoff = await repository.create_handoff(
-            cid, action_id, "customer_request", OPERATOR_QUESTION, products, conn=conn
+            cid, action_id, "customer_request", question, [p.model_dump(mode="json") for p in products], conn=conn
         )
         written = await repository.append_events(
             cid, action_id, [HandoffData(handoff=handoff).model_dump(mode="json")], conn=conn

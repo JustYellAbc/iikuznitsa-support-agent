@@ -20,7 +20,7 @@ REQUEST_WORDS = (
     rf"(?:{CALL}|нужен|нужна|хочу|можно)(?:[ ,]+(?:меня|мне|нас|нам|пожалуйста|на|к|с|со|жив\w*|ваш\w*|"
     rf"пообщаться|поговорить|связаться|позвать|подключить)){{0,5}}[ ,]+{HUMAN}"
 )
-HUMAN_REQUEST = re.compile(rf"\b{REQUEST_WORDS}\b(?!\s+связи)")
+HUMAN_REQUEST = re.compile(rf"\b{REQUEST_WORDS}\b(?!\s+связи)", re.I)
 COURTESY = r"(?:здравствуйте|здравствуй|добрый (?:день|вечер)|доброе утро|привет|пожалуйста|спасибо)"
 BARE_REQUEST = re.compile(rf"(?:{COURTESY}[,.! ]+)*(?:{REQUEST_WORDS}|{HUMAN})(?:[,!?. ]+{COURTESY})*[,!?. ]*")
 HUMAN_DECLINED = re.compile(
@@ -130,7 +130,9 @@ def route_action(
         p = products[0]
         if PRICE.search(body) and p.priceState == "on_request":
             return Routing("price_request", text)
-        if p.priceState == "availability_check" and re.search(r"наличи|доступн|купить|поставк", body):
+        if p.priceState == "availability_check" and re.search(
+            r"наличи|доступн|купить|поставк|достав|получить .*?ключ|получить ключ|электронн\w* ключ|прид[её]т", body
+        ):
             return Routing("availability", text)
         if TERM.search(body) and p.licenseTerm is None:
             finding = "insufficient_evidence"
