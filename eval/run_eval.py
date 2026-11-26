@@ -107,6 +107,11 @@ FAKE_REGISTRY_NUMBER_RE = re.compile(
     r"реестр\w*\s*№\s*\d{3,})",
     re.IGNORECASE,
 )
+OPERATOR_HELP_OFFER_RE = re.compile(
+    r"(?:(?:подключ\w*|переда\w*|позв\w*|обрат\w*|связ\w*).{0,35}(?:оператор|менеджер|специалист)|"
+    r"(?:оператор|менеджер|специалист).{0,35}(?:помож|уточн|подключ))",
+    re.IGNORECASE,
+)
 
 
 class PriceParseError(ValueError):
@@ -164,6 +169,7 @@ class CaseResult:
     conversation_id: str | None = None
     events_count: int = 0
     turns: list[dict] = field(default_factory=list)
+    public_id: str | None = None
 
 
 def default_holdout_file() -> Path:
@@ -849,10 +855,86 @@ _PRICE_ASSERTION_KEYS = (
 )
 
 
+def _quote_events_from_history(events: list[dict]) -> list[tuple[str | None, dict]]:
+    items: list[tuple[str | None, dict]] = []
+    for event in events:
+        data = event.get("data", {})
+        if data.get("type") == "quote" and isinstance(data.get("quote"), dict):
+            aid = event.get("actionId")
+            items.append((str(aid) if aid is not None else None, data["quote"]))
+    return items
+
+
+def validate_quote_revisions(
+    events: list[dict],
+    *,
+    expected_revisions_kopecks: list[int] | None = None,
+    expected_steps: list[dict] | None = None,
+    turn_action_ids: dict[int, str] | None = None,
+) -> list[str]:
+    """Verify quote recalculation keeps the same quoteId, strictly increases revision, and matches turn/lines/total."""
+    steps: list[dict] = []
+    if expected_steps:
+        steps = list(expected_steps)
+    elif expected_revisions_kopecks:
+        steps = [{"total_kopecks": total} for total in expected_revisions_kopecks]
+    if not steps:
+        return []
+
+    quote_events = _quote_events_from_history(events)
+    by_quote_id: dict[str, list[tuple[str | None, dict]]] = {}
+    for aid, quote in quote_events:
+        qid = quote.get("quoteId")
+        if isinstance(qid, str) and qid.strip():
+            by_quote_id.setdefault(qid, []).append((aid, quote))
+
+    for chain in by_quote_id.values():
+        step_idx = 0
+        prev_rev: int | None = None
+        for aid, quote in chain:
+            rev = quote.get("revision")
+            if isinstance(rev, bool) or not isinstance(rev, int):
+                continue
+            step = steps[step_idx]
+            if quote.get("totalKopecks") != step.get("total_kopecks"):
+                continue
+            if prev_rev is not None and rev <= prev_rev:
+                continue
+            req_offer_ids = step.get("offer_ids")
+            if req_offer_ids:
+                line_ids = {str(line.get("offerId")) for line in quote.get("lines", [])}
+                if not {str(oid) for oid in req_offer_ids}.issubset(line_ids):
+                    continue
+            req_turn = step.get("turn")
+            if req_turn is not None and turn_action_ids and int(req_turn) in turn_action_ids:
+                if aid != turn_action_ids[int(req_turn)]:
+                    continue
+            prev_rev = rev
+            step_idx += 1
+            if step_idx == len(steps):
+                return []
+
+    observed = [
+        (
+            q.get("quoteId"),
+            q.get("revision"),
+            q.get("totalKopecks"),
+            [str(line.get("offerId")) for line in q.get("lines", [])],
+        )
+        for _, q in quote_events
+    ]
+    return [
+        f"Expected quote recalculation sequence {steps} on one quoteId with strictly increasing revision; "
+        f"observed {observed}"
+    ]
+
+
 def validate_case_expectations(
     events: list[dict],
     assertions: dict,
     catalog_index: dict[str, CatalogOffer] | None = None,
+    *,
+    turn_action_ids: dict[int, str] | None = None,
 ) -> list[str]:
     """Run all configured validators for a turn or full conversation."""
     errors: list[str] = []
@@ -908,6 +990,13 @@ def validate_case_expectations(
     if assertions.get("expect_clarification") and not has_clarification:
         errors.append("Expected clarifying question with purpose='clarification' from agent")
 
+    if assertions.get("expect_operator_help_offer") and not OPERATOR_HELP_OFFER_RE.search(agent_text):
+        errors.append("Expected agent to offer connecting an operator/specialist")
+
+    for pattern in assertions.get("expected_text_patterns", []):
+        if not re.search(str(pattern), agent_text, re.IGNORECASE):
+            errors.append(f"Expected pattern {pattern!r} not found in agent text")
+
     has_caveat = bool(LEGAL_ENTITY_CAVEAT_RE.search(agent_text)) or bool(_handoffs_from_events(events))
     if assertions.get("expect_legal_entity_caveat") and not has_caveat:
         errors.append("Expected legal-entity restriction caveat or operator handoff for individual buyer")
@@ -925,6 +1014,9 @@ def validate_case_expectations(
         errors.append("Unexpected document event issued")
 
     handoffs = _handoffs_from_events(events)
+    if assertions.get("forbid_handoff") and handoffs:
+        errors.append(f"Unexpected handoff event(s): {[h.get('handoffId') for h in handoffs]}")
+
     if assertions.get("expect_handoff"):
         if not handoffs:
             errors.append("Expected handoff event to operator")
@@ -946,16 +1038,32 @@ def validate_case_expectations(
         if len(open_ids) != expected_cnt:
             errors.append(f"Expected {expected_cnt} unique open handoff(s), got {len(open_ids)} ({open_ids})")
 
-    quote_totals = [q.get("totalKopecks") for q in _quotes_from_events(events)]
+    quotes = _quotes_from_events(events)
+    quote_totals = [q.get("totalKopecks") for q in quotes]
     for exp in assertions.get("expected_quote_totals_kopecks", []):
         if exp not in quote_totals:
             errors.append(f"Expected quote totalKopecks={exp} not found in {quote_totals}")
 
-    expected_revisions = assertions.get("expected_quote_revisions_kopecks", [])
-    if expected_revisions:
-        actual_totals = [t for t in quote_totals if t is not None]
-        if not all(exp in actual_totals for exp in expected_revisions):
-            errors.append(f"Expected quote totals {expected_revisions} in {actual_totals}")
+    expected_line_ids = [str(oid) for oid in assertions.get("expected_quote_line_offer_ids", [])]
+    if expected_line_ids:
+        req_ids = set(expected_line_ids)
+        req_totals = set(assertions.get("expected_quote_totals_kopecks", []))
+        matched_line_quote = any(
+            req_ids.issubset({str(line.get("offerId")) for line in q.get("lines", [])})
+            and (not req_totals or q.get("totalKopecks") in req_totals)
+            for q in quotes
+        )
+        if not matched_line_quote:
+            errors.append(f"Expected quote with line offerIds {sorted(req_ids)} not found")
+
+    errors.extend(
+        validate_quote_revisions(
+            events,
+            expected_revisions_kopecks=assertions.get("expected_quote_revisions_kopecks"),
+            expected_steps=assertions.get("expected_quote_revision_steps"),
+            turn_action_ids=turn_action_ids,
+        )
+    )
 
     return errors
 
@@ -1328,20 +1436,24 @@ def run_case(
     """
     validator = schema_validator if schema_validator is not None else get_schema_validator()
     case_id = str(case["id"])
-    sanitize_outgoing = bool(case.get("sanitize_pii")) or case.get("suite") == "holdout"
+    suite = str(case.get("suite", "open"))
+    sanitize_outgoing = bool(case.get("sanitize_pii")) or suite == "holdout"
+    # Holdout cases use a random technical alias for CLI output and never embed case_id in HTTP keys.
+    public_id = f"holdout-alias-{uuid.uuid4().hex[:8]}" if suite == "holdout" else case_id
     result = CaseResult(
         case_id=case_id,
-        suite=str(case.get("suite", "open")),
+        suite=suite,
         category=str(case.get("category", "")),
         passed=False,
         escalated=False,
         closed_by_agent=False,
+        public_id=public_id,
     )
     baseline = None
     try:
         if cost_client is not None:
             baseline = cost_client.snapshot()
-        conv_id = client.create_conversation(key=f"eval-conv-{case_id}-{uuid.uuid4().hex[:8]}")
+        conv_id = client.create_conversation(key=f"eval-conv-{uuid.uuid4().hex}")
         result.conversation_id = conv_id
         cursor = 0
         history: list[dict] = []
@@ -1353,7 +1465,7 @@ def run_case(
             assertions = turn.get("assertions", {})
             if sanitize_outgoing and action.get("type") == "message" and "text" in action:
                 action["text"] = scrub_pii(str(action["text"]))
-            action_key = f"eval-act-{case_id}-t{turn_idx}-{uuid.uuid4().hex[:8]}"
+            action_key = f"eval-act-t{turn_idx}-{uuid.uuid4().hex}"
             # Latency is measured from the moment the customer presses «Send» (before the POST), while the
             # wait deadline and the quiet window start at the 202 ack so a slow POST cannot eat the window.
             t_send = time.perf_counter()
@@ -1465,14 +1577,20 @@ def run_case(
                 f"{where}: action_failed {err.get('code', '<no code>')}: {err.get('message', '<no message>')}"
             )
 
+        turn_action_ids: dict[int, str] = {}
         for turn_idx, action_id, assertions in turn_actions:
             if action_id is None:
                 continue
+            turn_action_ids[turn_idx] = action_id
             turn_events = [ev for ev in history if ev.get("actionId") == action_id]
             result.errors.extend(
                 f"Turn {turn_idx}: {err}" for err in validate_case_expectations(turn_events, assertions, catalog_index)
             )
-        result.errors.extend(validate_case_expectations(history, case.get("assertions", {}), catalog_index))
+        result.errors.extend(
+            validate_case_expectations(
+                history, case.get("assertions", {}), catalog_index, turn_action_ids=turn_action_ids
+            )
+        )
 
         result.events_count = len(history)
         result.agent_responses = [str(m.get("text", "")) for m in _agent_messages(history)]
@@ -1573,8 +1691,9 @@ def summarize_results(
                 weighted_projected_500_rub = round(weighted_mean * 500.0, 2)
     unavailable_reasons = sorted({str(r.cost_reason) for r in results if r.cost_status != "exact" and r.cost_reason})
 
-    return {
-        "schema_version": "1.2",
+    holdout_alias_map = {(r.public_id or r.case_id): r.case_id for r in results if r.suite == "holdout"}
+    summary: dict = {
+        "schema_version": "1.3",
         "suite": suite,
         "mode": mode,
         "total_cases": total,
@@ -1598,13 +1717,16 @@ def summarize_results(
             "cost_sources": sorted({str(r.cost_source) for r in exact}),
             "unavailable_reasons": unavailable_reasons,
             "avg_cost_per_case_rub": avg_cost_rub,
-            "projected_500_cases_per_day_rub": projected_500_rub,
+            "projected_500_cases_half_year_rub": projected_500_rub,
             "weighted_avg_cost_per_case_rub": weighted_avg_cost_rub,
-            "weighted_projected_500_cases_per_day_rub": weighted_projected_500_rub,
+            "weighted_projected_500_cases_half_year_rub": weighted_projected_500_rub,
+            "load_scenario_500_cases_per_day_rub": projected_500_rub,
+            "weighted_load_scenario_500_cases_per_day_rub": weighted_projected_500_rub,
         },
         "cases": [
             {
                 "id": r.case_id,
+                "alias": r.public_id or r.case_id,
                 "suite": r.suite,
                 "category": r.category,
                 "passed": r.passed,
@@ -1623,18 +1745,26 @@ def summarize_results(
             for r in results
         ],
     }
+    if holdout_alias_map:
+        summary["holdout_alias_map"] = holdout_alias_map
+    return summary
 
 
-def format_markdown_report(summary: dict) -> str:
-    """Render concise Markdown report including actual text of every failed response."""
+def format_markdown_report(summary: dict, *, mask_holdout_ids: bool = False) -> str:
+    """Render concise Markdown report including actual text of every failed response.
+
+    When ``mask_holdout_ids=True`` (used for console stdout), holdout rows display only their random
+    technical alias; the alias -> source ID mapping stays strictly inside the private holdout report.
+    """
     lat = summary["latency_ms"]
     econ = summary["economics"]
     if econ["cost_status"] == "unavailable":
         cost_line = "unavailable (" + "; ".join(econ.get("unavailable_reasons") or ["no exact stand cost"]) + ")"
     else:
         cost_line = (
-            f"{econ['avg_cost_per_case_rub']} / {econ['projected_500_cases_per_day_rub']} "
-            f"(weighted 500-day: {econ['weighted_projected_500_cases_per_day_rub']}; "
+            f"{econ['avg_cost_per_case_rub']} / {econ['projected_500_cases_half_year_rub']} "
+            f"(weighted 500 / half-year: {econ['weighted_projected_500_cases_half_year_rub']}; "
+            f"separate load scenario 500/day: {econ['load_scenario_500_cases_per_day_rub']}; "
             f"{econ['cost_status']}, {econ['cases_with_exact_cost']}/{summary['total_cases']} cases, "
             f"source: {', '.join(econ['cost_sources'])})"
         )
@@ -1649,26 +1779,31 @@ def format_markdown_report(summary: dict) -> str:
         f"| Escalated | {summary['escalated_count']} ({summary['escalated_rate']:.1%}) |",
         f"| Timed out | {summary.get('timed_out_cases', 0)} |",
         f"| Latency p50 / p95 (ms) | {lat['p50']} / {lat['p95']} (samples={lat['samples']}) |",
-        f"| Avg cost / 500-day proj (RUB) | {cost_line} |",
+        f"| Avg cost / 500 cases per half-year proj (RUB) | {cost_line} |",
         "",
         "| Case ID | Status | Outcome | Latency (ms) | Cost (RUB) | Errors |",
         "|---|---|---|---|---|---|",
     ]
-    failed_items: list[dict] = []
+    failed_items: list[tuple[str, dict]] = []
     for item in summary["cases"]:
+        display_id = (
+            str(item.get("alias") or "<holdout>")
+            if mask_holdout_ids and item.get("suite") == "holdout"
+            else str(item["id"])
+        )
         status_str = "PASS" if item["passed"] else "FAIL"
         outcome = "escalated" if item["escalated"] else ("agent" if item["passed"] else "failed")
         lat_str = ", ".join(str(x) for x in item["latency_ms"]) or "-"
         cost_str = str(item["cost_rub"]) if item.get("cost_status") == "exact" else "unavailable"
         err_str = "; ".join(item["errors"]) if item["errors"] else "-"
-        lines.append(f"| {item['id']} | {status_str} | {outcome} | {lat_str} | {cost_str} | {err_str} |")
+        lines.append(f"| {display_id} | {status_str} | {outcome} | {lat_str} | {cost_str} | {err_str} |")
         if not item["passed"]:
-            failed_items.append(item)
+            failed_items.append((display_id, item))
 
     if failed_items:
         lines.extend(["", "## Failed Case Responses", ""])
-        for item in failed_items:
-            lines.append(f"### {item['id']}")
+        for display_id, item in failed_items:
+            lines.append(f"### {display_id}")
             lines.append(f"- **Errors:** {'; '.join(item['errors'])}")
             responses = item.get("agent_responses") or []
             if responses:
@@ -1866,6 +2001,118 @@ def _make_mock_t04_server() -> tuple[ThreadingHTTPServer, str]:
                                 },
                             }
                         )
+                    elif "HyperQuantum" in text:
+                        conv["offered_help"] = True
+                        push(
+                            {
+                                "type": "message",
+                                "author": "agent",
+                                "purpose": "clarification",
+                                "text": (
+                                    "В источнике нет подтверждённых сведений. "
+                                    "Подключить оператора, чтобы он уточнил ваш вопрос?"
+                                ),
+                                "sources": [],
+                            }
+                        )
+                    elif conv.get("offered_help") and "подключайте" in text.lower():
+                        push(
+                            {
+                                "type": "message",
+                                "author": "agent",
+                                "purpose": "notice",
+                                "text": "Передал вопрос оператору. Он увидит переписку и ответит в этом чате.",
+                                "sources": [],
+                            }
+                        )
+                        push(
+                            {
+                                "type": "handoff",
+                                "handoff": {
+                                    "handoffId": f"h-{conv_id}",
+                                    "conversationId": conv_id,
+                                    "reason": "insufficient_evidence",
+                                    "question": "HyperQuantum Nebula ERP 2026",
+                                    "products": [],
+                                    "status": "open",
+                                },
+                            }
+                        )
+                    elif "Мдеймон" in text:
+                        push(
+                            {
+                                "type": "message",
+                                "author": "agent",
+                                "purpose": "clarification",
+                                "text": (
+                                    "По названию нашёл в каталоге семейство «MDaemon Messaging Server». "
+                                    "На кого оформляется лицензия — на организацию или физлицо? "
+                                    "Покупаете впервые или продлеваете лицензию?"
+                                ),
+                                "sources": [],
+                            }
+                        )
+                    elif "Коммерческая компания, покупаем впервые" in text:
+                        src = {
+                            "url": "https://store.softline.ru/alt-n-technologies-ltd/-19576/",
+                            "label": "Карточка Softline",
+                        }
+                        product = {
+                            "offerId": "19576",
+                            "name": (
+                                "MDaemon Technologies, Ltd. MDaemon Messaging Server "
+                                "(лицензия с подпиской на обновления на 1 год), 20 пользователей"
+                            ),
+                            "source": src,
+                            "available": True,
+                            "priceState": "listed",
+                            "unitPriceKopecks": 7755600,
+                            "licenseTerm": "12 мес.",
+                        }
+                        push({"type": "products", "products": [product]})
+                        push(
+                            {
+                                "type": "message",
+                                "author": "agent",
+                                "purpose": "answer",
+                                "text": "MDaemon Messaging Server на 20 пользователей (новая покупка) стоит 77 556 ₽.",
+                                "sources": [src],
+                            }
+                        )
+                    elif text.strip().lower() == "позовите оператора":
+                        if conv["turn"] == 1:
+                            push(
+                                {
+                                    "type": "message",
+                                    "author": "agent",
+                                    "purpose": "clarification",
+                                    "text": "Подскажите, с каким вопросом нужна помощь?",
+                                    "sources": [],
+                                }
+                            )
+                        else:
+                            push(
+                                {
+                                    "type": "message",
+                                    "author": "agent",
+                                    "purpose": "notice",
+                                    "text": "Передал вопрос оператору. Он увидит переписку и ответит в этом чате.",
+                                    "sources": [],
+                                }
+                            )
+                            push(
+                                {
+                                    "type": "handoff",
+                                    "handoff": {
+                                        "handoffId": f"h-{conv_id}",
+                                        "conversationId": conv_id,
+                                        "reason": "customer_request",
+                                        "question": "Позовите оператора",
+                                        "products": [],
+                                        "status": "open",
+                                    },
+                                }
+                            )
                     else:
                         push(
                             {
@@ -1911,7 +2158,7 @@ def _msg_event(text: str, url: str) -> list[dict]:
 def run_mock_self_check(golden_open_path: Path) -> int:
     """Verify validators catch synthetic errors and pass valid traces over a loopback T04 mock.
 
-    Covers 3 of the open scenarios end-to-end; the full 14-case HTTP loop lives in tests/eval.
+    Covers 6 of the open scenarios end-to-end; the full 16-case HTTP loop lives in tests/eval.
     """
     catalog = load_catalog_index(golden_open_path)
     url_61557 = "https://store.softline.ru/sunrav/-61557/"
@@ -1935,7 +2182,14 @@ def run_mock_self_check(golden_open_path: Path) -> int:
     )
 
     open_data = json.loads(golden_open_path.read_text(encoding="utf-8"))
-    mock_case_ids = {"open-price-61557", "open-price-504", "open-robust-operator-button"}
+    mock_case_ids = {
+        "open-price-61557",
+        "open-price-504",
+        "open-robust-operator-button",
+        "open-robust-unknown-product",
+        "open-typo-mdaemon",
+        "open-robust-operator-twice",
+    }
     cases = [c for c in open_data.get("cases", []) if c["id"] in mock_case_ids]
 
     server, base_url = _make_mock_t04_server()
@@ -2080,7 +2334,7 @@ def main(argv: list[str] | None = None) -> int:
         code: client.rejections.count(code) for code in sorted(set(client.rejections))
     }
     json_path, md_path = write_reports(summary, args.out if args.out is not None else _default_out(args.suite))
-    print(format_markdown_report(summary))
+    print(format_markdown_report(summary, mask_holdout_ids=True))
     print(f"Reports written: {json_path}, {md_path}")
     return 0 if summary["failed_cases"] == 0 else 1
 

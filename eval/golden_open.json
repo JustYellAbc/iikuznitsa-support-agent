@@ -460,6 +460,7 @@
           },
           "assertions": {
             "expected_offer_ids": ["19576", "359841"],
+            "expected_quote_line_offer_ids": ["19576", "359841"],
             "allowed_prices_rub": ["77556", "32643", "110199"],
             "required_prices_rub": ["110199"],
             "expected_quote_totals_kopecks": [11019900],
@@ -473,6 +474,7 @@
           },
           "assertions": {
             "expected_offer_ids": ["19578", "359843"],
+            "expected_quote_line_offer_ids": ["19578", "359843"],
             "allowed_prices_rub": ["94341", "50933", "145274", "35075", "110199"],
             "required_prices_rub": ["145274"],
             "expected_quote_totals_kopecks": [14527400],
@@ -484,16 +486,20 @@
         "expected_offer_ids": ["19576", "359841", "19578", "359843"],
         "allowed_prices_rub": ["77556", "32643", "110199", "94341", "50933", "145274", "35075"],
         "expected_quote_revisions_kopecks": [11019900, 14527400],
+        "expected_quote_revision_steps": [
+          {"turn": 1, "offer_ids": ["19576", "359841"], "total_kopecks": 11019900},
+          {"turn": 2, "offer_ids": ["19578", "359843"], "total_kopecks": 14527400}
+        ],
         "require_sources_on_answer": true
       }
     },
     {
       "id": "open-robust-unknown-product",
-      "title": "Надёжность: запрос несуществующего продукта -> эскалация без выдумывания цены",
+      "title": "Надёжность: запрос несуществующего продукта (HyperQuantum) -> предложение помощи, затем 1 передача после согласия",
       "suite": "open",
       "category": "Прочее (покупка)",
       "modes": ["mvp", "full"],
-      "tags": ["robustness", "outside_catalog", "handoff"],
+      "tags": ["robustness", "outside_catalog", "handoff", "t03"],
       "turns": [
         {
           "action": {
@@ -502,8 +508,22 @@
           },
           "assertions": {
             "allowed_prices_rub": [],
+            "expect_operator_help_offer": true,
+            "forbid_handoff": true,
+            "expect_unique_open_handoff_count": 0,
+            "forbid_document": true
+          }
+        },
+        {
+          "action": {
+            "type": "message",
+            "text": "Да, подключайте."
+          },
+          "assertions": {
+            "allowed_prices_rub": [],
             "expect_handoff": true,
             "allowed_handoff_reasons": ["outside_catalog", "insufficient_evidence", "customer_request"],
+            "expect_unique_open_handoff_count": 1,
             "forbid_document": true
           }
         }
@@ -512,6 +532,7 @@
         "allowed_prices_rub": [],
         "expect_handoff": true,
         "allowed_handoff_reasons": ["outside_catalog", "insufficient_evidence", "customer_request"],
+        "expect_unique_open_handoff_count": 1,
         "forbid_document": true
       }
     },
@@ -704,6 +725,88 @@
         "allowed_prices_rub": ["77556"],
         "expect_legal_entity_caveat": true,
         "forbid_document": true
+      }
+    },
+    {
+      "id": "open-typo-mdaemon",
+      "title": "Опечатка «Мдеймон» -> уточнение семейства MDaemon -> подбор 19576",
+      "suite": "open",
+      "category": "Просто цена конкретного товара",
+      "modes": ["mvp", "full"],
+      "tags": ["branch_a", "typo", "clarification", "t03"],
+      "turns": [
+        {
+          "action": {
+            "type": "message",
+            "text": "Нужен Мдеймон на 20 пользователей."
+          },
+          "assertions": {
+            "expect_clarification": true,
+            "expected_text_patterns": ["mdaemon"],
+            "forbid_handoff": true,
+            "allowed_prices_rub": ["77556", "38778"]
+          }
+        },
+        {
+          "action": {
+            "type": "message",
+            "text": "Коммерческая компания, покупаем впервые."
+          },
+          "assertions": {
+            "expected_offer_ids": ["19576"],
+            "allowed_prices_rub": ["77556", "38778"],
+            "required_prices_rub": ["77556"],
+            "required_urls": ["https://store.softline.ru/alt-n-technologies-ltd/-19576/"],
+            "require_sources_on_answer": true
+          }
+        }
+      ],
+      "assertions": {
+        "expected_offer_ids": ["19576"],
+        "allowed_prices_rub": ["77556", "38778"],
+        "require_sources_on_answer": true
+      }
+    },
+    {
+      "id": "open-robust-operator-twice",
+      "title": "Две текстовые просьбы «Позовите оператора» в пустом чате: уточнение темы (0 передач) -> 1 карточка",
+      "suite": "open",
+      "category": "Прочее (покупка)",
+      "modes": ["mvp", "full"],
+      "tags": ["robustness", "handoff", "clarification", "t03"],
+      "turns": [
+        {
+          "action": {
+            "type": "message",
+            "text": "Позовите оператора"
+          },
+          "assertions": {
+            "allowed_prices_rub": [],
+            "expect_clarification": true,
+            "forbid_handoff": true,
+            "expect_unique_open_handoff_count": 0
+          }
+        },
+        {
+          "action": {
+            "type": "message",
+            "text": "Позовите оператора"
+          },
+          "assertions": {
+            "allowed_prices_rub": [],
+            "expect_handoff": true,
+            "allowed_handoff_reasons": ["customer_request"],
+            "expect_empty_handoff_products": true,
+            "expect_unique_open_handoff_count": 1
+          }
+        }
+      ],
+      "assertions": {
+        "allowed_prices_rub": [],
+        "expect_handoff": true,
+        "allowed_handoff_reasons": ["customer_request"],
+        "expect_empty_handoff_products": true,
+        "expect_unique_open_handoff_count": 1
       }
     }
   ]

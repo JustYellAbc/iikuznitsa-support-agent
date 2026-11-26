@@ -163,6 +163,7 @@ def test_split_summary_is_safe_and_isolation_guards_exist(monkeypatch: pytest.Mo
     # Holdout default path lives outside the repo and outside /tmp; the seed comes only from EVAL_SPLIT_SEED.
     monkeypatch.delenv("EVAL_HOLDOUT_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     default_dir = split_chats.default_holdout_dir()
     assert default_dir == tmp_path / "home/.local/share/iikuznitsa-eval-private"
@@ -607,8 +608,9 @@ def test_metrics_latency_economics_and_failed_case_accounting() -> None:
     assert summary["closed_by_agent_count"] == 1  # c3 failed, so NOT credited to agent
     assert summary["escalated_count"] == 1
     assert summary["economics"]["avg_cost_per_case_rub"] == 0.6
-    assert summary["economics"]["projected_500_cases_per_day_rub"] == 300.0
-    assert summary["economics"]["weighted_projected_500_cases_per_day_rub"] is not None
+    assert summary["economics"]["projected_500_cases_half_year_rub"] == 300.0
+    assert summary["economics"]["weighted_projected_500_cases_half_year_rub"] is not None
+    assert summary["economics"]["load_scenario_500_cases_per_day_rub"] == 300.0
     assert summary["economics"]["cost_status"] == "exact"
 
     # Without exact stand costs the report says "unavailable" instead of estimating.
@@ -620,6 +622,8 @@ def test_metrics_latency_economics_and_failed_case_accounting() -> None:
     assert "unavailable" in run_eval.format_markdown_report(no_cost)
 
     md = run_eval.format_markdown_report(summary)
+    assert "500 cases per half-year" in md
+    assert "separate load scenario 500/day" in md
     assert "## Failed Case Responses" in md
     assert "Неверный ответ агента" in md
 
@@ -1055,8 +1059,33 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path, monkeypatch: pyt
                             [p40["source"], pc40["source"]],
                         )
                     elif "HyperQuantum" in text:
-                        msg("notice", "Продукт не найден в каталоге, передаю запрос менеджеру.", [])
-                        push(make_handoff(cid, "outside_catalog", "HyperQuantum Nebula ERP 2026", []))
+                        conv["offered_help"] = True
+                        msg(
+                            "clarification",
+                            "В источнике нет подтверждённых сведений. "
+                            "Подключить оператора, чтобы он уточнил ваш вопрос?",
+                            [],
+                        )
+                    elif conv.get("offered_help") and "подключайте" in text.lower():
+                        msg("notice", "Передал вопрос оператору. Он увидит переписку и ответит в этом чате.", [])
+                        push(make_handoff(cid, "insufficient_evidence", "HyperQuantum Nebula ERP 2026", []))
+                    elif "Мдеймон" in text:
+                        msg(
+                            "clarification",
+                            "По названию нашёл в каталоге семейство «MDaemon Messaging Server». "
+                            "На кого оформляется лицензия и покупаете впервые или продлеваете?",
+                            [],
+                        )
+                    elif "Коммерческая компания, покупаем впервые" in text:
+                        p20 = prod_obj("19576")
+                        push({"type": "products", "products": [p20]})
+                        msg("answer", "Новая покупка MDaemon на 20 пользователей — 77 556 ₽.", [p20["source"]])
+                    elif text.strip().lower() == "позовите оператора":
+                        if conv["turn"] == 1:
+                            msg("clarification", "Подскажите, с каким вопросом нужна помощь?", [])
+                        else:
+                            msg("notice", "Передал вопрос оператору.", [])
+                            push(make_handoff(cid, "customer_request", "Позовите оператора", []))
                     elif "живого менеджера" in text:
                         msg("notice", "Переключаю диалог на оператора.", [])
                         push(make_handoff(cid, "customer_request", "Запрос менеджера", []))
@@ -1099,8 +1128,8 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path, monkeypatch: pyt
 
     assert rc == 0
     report = json.loads((tmp_path / "eval_out.json").read_text(encoding="utf-8"))
-    assert report["total_cases"] == 14
-    assert report["passed_cases"] == 14
+    assert report["total_cases"] == 16
+    assert report["passed_cases"] == 16
     assert report["failed_cases"] == 0
     assert state["logins"] == 1
     econ = report["economics"]
@@ -1112,7 +1141,7 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path, monkeypatch: pyt
     assert by_id["open-tender-repeat"]["cost_source"] == "trace"
     assert by_id["open-price-61557"]["cost_rub"] == 0.25
     assert by_id["open-price-61557"]["cost_source"] == "telemetry"
-    assert econ["avg_cost_per_case_rub"] == round(sum(c["cost_rub"] for c in report["cases"]) / 14, 4)
+    assert econ["avg_cost_per_case_rub"] == round(sum(c["cost_rub"] for c in report["cases"]) / 16, 4)
     assert (tmp_path / "eval_out.md").is_file()
 
 
