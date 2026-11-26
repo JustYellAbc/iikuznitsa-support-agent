@@ -5,8 +5,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import routes_manager, routes_public
+from app.api import routes_manager, routes_public, routes_v1
 from app.config import get_settings
+from app.core.errors import install_error_handlers
 from app.core.llm import close_http_client
 from app.core.security import RateLimitMiddleware
 from app.db.database import close_db, init_db
@@ -45,9 +46,12 @@ def create_app() -> FastAPI:
         allow_origins=origins,
         allow_credentials="*" not in origins,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_headers=["Content-Type", "Idempotency-Key"],
+        expose_headers=["Retry-After"],
     )
+    install_error_handlers(app)
     app.include_router(routes_public.router)
+    app.include_router(routes_v1.router)
     app.include_router(routes_manager.router)
     return app
 

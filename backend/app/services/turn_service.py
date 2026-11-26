@@ -1,33 +1,36 @@
-"""Оркестрация хода: реплика клиента -> agent/runner.py -> сообщение / черновик / эскалация + SSE."""
+"""Ход агента: реплика покупателя -> agent/runner.py -> события журнала T04, черновик или обращение."""
 
 import asyncio
 import logging
 import time
+from typing import Any
 
 from app.agent import runner
 from app.config import get_settings
-from app.contracts.schemas import AgentReply, AgentTurn, Message, Mode, Session, StepTrace, Ticket
+from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Mode, Session, StepTrace
+from app.contracts.t04 import HandoffData, MessageData, ProductsData
 from app.core import events
 from app.core.llm import BudgetExceededError
 from app.db import repository
+from app.db.database import get_db
 
 log = logging.getLogger(__name__)
 
-HANDOFF_TEXT = "Передал ваш вопрос менеджеру — он ответит здесь же, в этом чате."
-PILOT_TEXT = "Готовлю ответ, менеджер проверит его и пришлёт сюда."
+HANDOFF_TEXT = "Передал ваш вопрос оператору — он ответит здесь же, в этом чате."
+PILOT_TEXT = "Готовлю ответ, оператор проверит его и пришлёт сюда."
 
 _busy: set[str] = set()
 _tasks: set[asyncio.Task] = set()
 
 
-def is_busy(session_id: str) -> bool:
-    return session_id in _busy
+def is_busy(conversation_id: str) -> bool:
+    return conversation_id in _busy
 
 
-def start_turn(session: Session, client_msg: Message) -> None:
-    """Запускает ход в фоне. Вызывающий обязан проверить is_busy() до сохранения реплики."""
+def start_turn(session: Session, action_id: str, text: str, history: list[Message]) -> None:
+    """Запускает ход в фоне. Вызывающий проверяет is_busy() под локом приёма команд."""
     _busy.add(session.id)
-    task = asyncio.create_task(_run(session, client_msg))
+    task = asyncio.create_task(_run(session, action_id, text, history))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
 
@@ -38,31 +41,35 @@ async def wait_idle() -> None:
         await asyncio.gather(*list(_tasks), return_exceptions=True)
 
 
-async def _run(session: Session, client_msg: Message) -> None:
+async def default_mode() -> Mode:
+    """Режим для новых диалогов: переключатель /api/v1/manager/mode, иначе DEFAULT_MODE из .env."""
+    value = await repository.get_setting("default_mode")
+    return value if value in ("autopilot", "pilot") else get_settings().default_mode
+
+
+async def _run(session: Session, action_id: str, text: str, history: list[Message]) -> None:
     started = time.perf_counter()
     steps: list[StepTrace] = []
 
     async def emit_step(step: StepTrace) -> None:
         steps.append(step)
-        events.publish(session.id, "step_trace", step)
 
     try:
-        history = [m for m in await repository.list_messages(session.id) if m.id != client_msg.id]
         try:
-            reply = await runner.run_turn(session, history, client_msg.text, emit_step)
-        except BudgetExceededError as e:
-            reply = _fallback(session, steps, started, "budget_exceeded", str(e))
-        except Exception as e:
-            log.exception("Agent turn failed for session %s", session.id)
-            reply = _fallback(session, steps, started, "agent_error", f"{type(e).__name__}: {e}")
-        await _apply(session, client_msg, reply)
+            reply = await runner.run_turn(session, history, text, emit_step)
+        except BudgetExceededError:
+            reply = _fallback(session, steps, started, "budget_exceeded", text)
+        except Exception:
+            log.exception("Agent turn failed for conversation %s", session.id)
+            reply = _fallback(session, steps, started, "agent_error", text)
+        await _apply(session, action_id, reply)
     except Exception:
-        log.exception("Failed to persist turn for session %s", session.id)
+        log.exception("Failed to persist turn for conversation %s", session.id)
     finally:
         _busy.discard(session.id)
 
 
-def _fallback(session: Session, steps: list[StepTrace], started: float, reason: str, detail: str) -> AgentReply:
+def _fallback(session: Session, steps: list[StepTrace], started: float, reason: str, question: str) -> AgentReply:
     turn = AgentTurn(
         turn_id=repository.new_id("turn"),
         session_id=session.id,
@@ -72,69 +79,93 @@ def _fallback(session: Session, steps: list[StepTrace], started: float, reason: 
         total_cost_rub=round(sum(s.cost_rub for s in steps), 6),
         total_latency_ms=int((time.perf_counter() - started) * 1000),
     )
-    return AgentReply(turn=turn, text=HANDOFF_TEXT, ticket_summary=detail)
+    # question видят обе роли: только вопрос покупателя, без внутренних причин
+    return AgentReply(
+        turn=turn,
+        text=HANDOFF_TEXT,
+        purpose="notice",
+        handoff=HandoffRequest(reason="technical", question=question[:8000]),
+    )
 
 
-async def _apply(session: Session, client_msg: Message, reply: AgentReply) -> None:
+def _reply_events(reply: AgentReply) -> list[dict[str, Any]]:
+    datas: list[dict[str, Any]] = []
+    if reply.products:
+        datas.append(ProductsData(products=reply.products).model_dump(mode="json"))
+    if reply.text.strip():
+        datas.append(
+            MessageData(
+                author="agent", purpose=reply.purpose, text=reply.text.strip(), sources=reply.sources
+            ).model_dump(mode="json")
+        )
+    return datas
+
+
+async def _publish(conversation_id: str, action_id: str, datas: list[dict[str, Any]]) -> None:
+    if datas:
+        written = await repository.append_events(conversation_id, action_id, datas)
+        events.publish(conversation_id, written)
+
+
+async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
+    cid = session.id
     turn = reply.turn
-    current = await repository.get_session(session.id) or session
-    if turn.decision == "answer" and current.mode == "pilot":
+    current = await repository.get_conversation(cid)
+    if turn.decision == "answer" and current is not None and current.session.mode == "pilot":
         turn = turn.model_copy(update={"decision": "draft"})
     await repository.save_turn(turn)
 
     if turn.decision == "answer":
-        await _agent_message(session.id, reply.text, reply)
+        await _publish(cid, action_id, _reply_events(reply))
         return
 
     if turn.decision == "draft":
-        ticket = await repository.create_ticket(
-            session.id,
-            "draft",
-            reason="pilot_review",
-            summary=reply.ticket_summary or client_msg.text[:500],
-            collected_params=reply.collected_params,
-            draft_answer=reply.text,
+        await repository.create_draft(cid, action_id, _reply_events(reply))
+        await _publish(
+            cid,
+            action_id,
+            [MessageData(author="agent", purpose="notice", text=PILOT_TEXT, sources=[]).model_dump(mode="json")],
         )
-        await _ticket_created(ticket)
-        await _agent_message(session.id, PILOT_TEXT)
         return
 
-    # escalate: одно открытое обращение на диалог, повторная эскалация дополняет его
-    reason = turn.escalation_reason or "agent_escalation"
-    summary = reply.ticket_summary or client_msg.text[:500]
-    existing = await repository.find_open_ticket(session.id, "escalation")
-    if existing:
-        await repository.update_ticket(
-            existing.id,
-            summary=f"{existing.summary}\n\n{summary}",
-            collected_params={**existing.collected_params, **reply.collected_params},
-        )
-    else:
-        ticket = await repository.create_ticket(
-            session.id, "escalation", reason=reason, summary=summary, collected_params=reply.collected_params
-        )
-        await _ticket_created(ticket)
-    await _agent_message(session.id, reply.text or HANDOFF_TEXT, reply)
-
-
-async def _agent_message(session_id: str, text: str, reply: AgentReply | None = None) -> None:
-    msg = await repository.add_message(
-        session_id,
-        "agent",
-        text,
-        sources=reply.sources if reply else [],
-        quote_id=reply.quote_id if reply else None,
+    # escalate: одно открытое обращение на причину; повтор не создаёт новую карточку
+    request = reply.handoff or HandoffRequest(
+        reason="insufficient_evidence", question=(reply.text or "Нужна помощь оператора.")[:8000]
     )
-    events.publish(session_id, "message_done", msg)
+    datas = _reply_events(reply)
+    existing = await repository.find_open_handoff(cid, request.reason)
+    async with get_db().tx() as conn:
+        if existing is None:
+            handoff = await repository.create_handoff(
+                cid,
+                action_id,
+                request.reason,
+                request.question,
+                [p.model_dump(mode="json") for p in request.products],
+                conn=conn,
+            )
+            datas.append(HandoffData(handoff=handoff).model_dump(mode="json"))
+        written = await repository.append_events(cid, action_id, datas, conn=conn) if datas else []
+    events.publish(cid, written)
 
 
-async def _ticket_created(ticket: Ticket) -> None:
-    # SSE-поток сессии видит клиент: внутренние поля (черновик, сводка, параметры) не отдаём
-    public = ticket.model_copy(update={"summary": "", "collected_params": {}, "draft_answer": None})
-    events.publish(ticket.session_id, "ticket_created", public)
+async def send_draft(draft_id: str, text: str | None) -> list[dict[str, Any]] | None:
+    """Отправка черновика менеджером: события уходят в журнал под исходной квитанцией.
 
-
-async def default_mode() -> Mode:
-    """Режим для новых сессий: переключатель из /api/admin/mode, иначе DEFAULT_MODE из .env."""
-    value = await repository.get_setting("default_mode")
-    return value if value in ("autopilot", "pilot") else get_settings().default_mode
+    None — черновика нет или он уже отправлен.
+    """
+    draft = await repository.get_draft(draft_id)
+    if draft is None or draft.status != "pending":
+        return None
+    datas = [dict(d) for d in draft.events]
+    if text is not None:
+        for d in datas:
+            if d.get("type") == "message":
+                d["text"] = text
+        if not any(d.get("type") == "message" for d in datas):
+            datas.append(MessageData(author="agent", purpose="answer", text=text, sources=[]).model_dump(mode="json"))
+    async with get_db().tx() as conn:
+        await repository.mark_draft_sent(draft_id, conn=conn)
+        written = await repository.append_events(draft.conversation_id, draft.action_id, datas, conn=conn)
+    events.publish(draft.conversation_id, written)
+    return written

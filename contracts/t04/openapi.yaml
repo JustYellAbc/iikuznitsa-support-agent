@@ -1,0 +1,340 @@
+openapi: 3.1.0
+info:
+  title: Softline · чат покупателя и кабинет оператора
+  version: 0.3.0
+  description: Контракт команды для T04. Сервер определяет роль и область доступа по сессии стенда.
+servers:
+  - url: /api/v1
+security:
+  - session: []
+paths:
+  /conversations:
+    post:
+      operationId: createConversation
+      summary: Покупатель открывает диалог
+      parameters: [{$ref: '#/components/parameters/Key'}]
+      responses:
+        '201':
+          description: Созданный диалог. Повтор с тем же ключом возвращает тот же ID.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ConversationRef'}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        default: {$ref: '#/components/responses/Error'}
+  /conversations/{conversationId}/actions:
+    parameters: [{$ref: '#/components/parameters/ConversationId'}]
+    post:
+      operationId: submitAction
+      summary: Реплика, вызов оператора, подтверждение расчёта или запрос документа
+      parameters: [{$ref: '#/components/parameters/Key'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CustomerAction'}}}
+      responses:
+        '200':
+          description: При новом запросе уже выданного документа сервер немедленно возвращает существующий файл.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Document'}}}
+        '202': {$ref: '#/components/responses/Accepted'}
+        '409':
+          description: agent_busy — предыдущий ход ещё выполняется. Остальные коды описывают конфликт ключа, обращения или условий сделки.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+                properties:
+                  code: {enum: [agent_busy, key_conflict, stale_revision, terms_pending, confirmation_required, already_resolved]}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        default: {$ref: '#/components/responses/Error'}
+  /conversations/{conversationId}/events:
+    parameters: [{$ref: '#/components/parameters/ConversationId'}]
+    get:
+      operationId: readEvents
+      summary: История для владельца диалога или оператора с доступом к обращению
+      parameters:
+        - in: query
+          name: after
+          description: Курсор конкретного читателя. Ноль позволяет независимо прочитать историю с начала. Повтор страницы возвращает ранее записанные события с теми же seq.
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        '200':
+          description: До 100 событий. При hasMore=true сразу читать следующую страницу с nextAfter.
+          content: {application/json: {schema: {$ref: '#/components/schemas/EventPage'}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        default: {$ref: '#/components/responses/Error'}
+  /manager/handoffs:
+    get:
+      operationId: listHandoffs
+      summary: Очередь открытых обращений в области доступа оператора
+      responses:
+        '200':
+          description: Новые обращения первыми
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Handoff'}}
+        default: {$ref: '#/components/responses/Error'}
+  /manager/handoffs/{handoffId}/resolution:
+    parameters:
+      - {in: path, name: handoffId, required: true, schema: {$ref: '#/components/schemas/Id'}}
+    post:
+      operationId: resolveHandoff
+      summary: Задать вопрос в открытом обращении, завершить обращение ответом или согласовать цену строки
+      parameters: [{$ref: '#/components/parameters/Key'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ManagerDecision'}}}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /documents/{documentId}:
+    parameters:
+      - {in: path, name: documentId, required: true, schema: {$ref: '#/components/schemas/Id'}}
+    get:
+      operationId: downloadDocument
+      summary: Скачать готовый файл с проверкой доступа к связанному диалогу
+      responses:
+        '200':
+          description: PDF. Отдавать с Content-Disposition attachment.
+          content: {application/pdf: {schema: {type: string, format: binary}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: support_session}
+  parameters:
+    ConversationId: {in: path, name: conversationId, required: true, schema: {$ref: '#/components/schemas/Id'}}
+    Key: {in: header, name: Idempotency-Key, required: true, schema: {$ref: '#/components/schemas/Id'}}
+  responses:
+    Accepted:
+      description: Команда надёжно принята. Результат появится в событиях диалога. Повтор возвращает исходную квитанцию.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Receipt'}}}
+    Error:
+      description: 401 — нужна сессия, 403 — требуется роль, 404 — объект отсутствует или вне области доступа, 409 — конфликт состояния, 422 — некорректные входные данные.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+            properties: {code: {not: {enum: [agent_busy, rate_limited]}}}
+    RateLimited:
+      description: Превышен лимит публичного стенда. Запрос отклонён до выполнения.
+      headers:
+        Retry-After:
+          description: Для временного ограничения сервер может указать задержку в секундах.
+          schema: {type: integer, minimum: 1}
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+            properties: {code: {const: rate_limited}}
+  schemas:
+    Id: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'}
+    Text: {type: string, minLength: 1, maxLength: 8000}
+    Revision: {type: integer, minimum: 1}
+    Kopecks: {type: integer, minimum: 1}
+    Source:
+      type: object
+      additionalProperties: false
+      required: [url, label]
+      properties:
+        url: {type: string, format: uri, pattern: '^https://'}
+        label: {$ref: '#/components/schemas/Text'}
+    ConversationRef:
+      type: object
+      additionalProperties: false
+      required: [conversationId]
+      properties: {conversationId: {$ref: '#/components/schemas/Id'}}
+    Receipt:
+      type: object
+      additionalProperties: false
+      required: [conversationId, actionId]
+      properties:
+        conversationId: {$ref: '#/components/schemas/Id'}
+        actionId: {$ref: '#/components/schemas/Id'}
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code: {enum: [unauthenticated, forbidden, not_found, stale_revision, terms_pending, confirmation_required, key_conflict, already_resolved, invalid_input, rate_limited, agent_busy]}
+        message: {$ref: '#/components/schemas/Text'}
+    CustomerAction:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, text]
+          properties:
+            type: {const: message}
+            text: {$ref: '#/components/schemas/Text'}
+            handoffId: {$ref: '#/components/schemas/Id', description: При ответе оператору указывает открытое обращение этого диалога.}
+        - type: object
+          additionalProperties: false
+          required: [type]
+          properties: {type: {const: request_operator}}
+        - type: object
+          additionalProperties: false
+          required: [type, quoteId, revision]
+          properties:
+            type: {const: confirm_quote}
+            quoteId: {$ref: '#/components/schemas/Id'}
+            revision: {$ref: '#/components/schemas/Revision'}
+        - type: object
+          additionalProperties: false
+          required: [type, quoteId, revision, kind]
+          properties:
+            type: {const: request_document}
+            quoteId: {$ref: '#/components/schemas/Id'}
+            revision: {$ref: '#/components/schemas/Revision'}
+            kind: {enum: [quote_pdf, demo_invoice]}
+    ManagerDecision:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, reply]
+          properties:
+            type: {enum: [reply, close], description: reply продолжает переписку. close отправляет итоговый ответ и закрывает обращение.}
+            reply: {$ref: '#/components/schemas/Text'}
+        - type: object
+          additionalProperties: false
+          required: [type, quoteId, revision, offerId, unitPriceKopecks]
+          properties:
+            type: {const: approve_line_price}
+            quoteId: {$ref: '#/components/schemas/Id'}
+            revision: {$ref: '#/components/schemas/Revision'}
+            offerId: {$ref: '#/components/schemas/Id'}
+            unitPriceKopecks: {$ref: '#/components/schemas/Kopecks'}
+    Product:
+      type: object
+      additionalProperties: false
+      required: [offerId, name, source, available, priceState, unitPriceKopecks, licenseTerm]
+      properties:
+        offerId: {$ref: '#/components/schemas/Id'}
+        name: {$ref: '#/components/schemas/Text'}
+        source: {$ref: '#/components/schemas/Source'}
+        available: {type: boolean}
+        priceState: {enum: [listed, availability_check, on_request]}
+        unitPriceKopecks: {oneOf: [{$ref: '#/components/schemas/Kopecks'}, {type: 'null'}]}
+        licenseTerm: {type: [string, 'null'], minLength: 1}
+      oneOf:
+        - properties: {priceState: {const: listed}, available: {const: true}, unitPriceKopecks: {$ref: '#/components/schemas/Kopecks'}}
+        - properties: {priceState: {const: availability_check}, available: {const: false}, unitPriceKopecks: {$ref: '#/components/schemas/Kopecks'}}
+        - properties: {priceState: {const: on_request}, unitPriceKopecks: {type: 'null'}}
+    Handoff:
+      type: object
+      additionalProperties: false
+      required: [handoffId, conversationId, reason, question, products, status]
+      properties:
+        handoffId: {$ref: '#/components/schemas/Id'}
+        conversationId: {$ref: '#/components/schemas/Id'}
+        reason: {enum: [customer_request, tender, price_request, availability, outside_catalog, special_terms, technical, insufficient_evidence]}
+        question: {$ref: '#/components/schemas/Text'}
+        products: {type: array, items: {$ref: '#/components/schemas/Product'}}
+        status: {enum: [open, resolved]}
+        quoteLine:
+          type: object
+          additionalProperties: false
+          required: [quoteId, revision, offerId]
+          properties: {quoteId: {$ref: '#/components/schemas/Id'}, revision: {$ref: '#/components/schemas/Revision'}, offerId: {$ref: '#/components/schemas/Id'}}
+    QuoteLine:
+      type: object
+      additionalProperties: false
+      required: [offerId, name, source, packages, unitPriceKopecks]
+      properties:
+        offerId: {$ref: '#/components/schemas/Id'}
+        name: {$ref: '#/components/schemas/Text', description: Название конкретной лицензии на момент расчёта.}
+        source: {$ref: '#/components/schemas/Source'}
+        packages: {type: integer, minimum: 1}
+        unitPriceKopecks: {oneOf: [{$ref: '#/components/schemas/Kopecks'}, {type: 'null'}]}
+    CommercialTerms:
+      type: object
+      description: Условия конкретной ревизии. Null означает, что условие ещё уточняется.
+      additionalProperties: false
+      required: [taxNote, payment, delivery, validUntil]
+      properties:
+        taxNote: {type: [string, 'null'], minLength: 1}
+        payment: {type: [string, 'null'], minLength: 1}
+        delivery: {type: [string, 'null'], minLength: 1}
+        validUntil: {type: [string, 'null'], format: date}
+    Quote:
+      type: object
+      additionalProperties: false
+      required: [quoteId, revision, state, lines, knownSubtotalKopecks, totalKopecks, terms]
+      properties:
+        quoteId: {$ref: '#/components/schemas/Id'}
+        revision: {$ref: '#/components/schemas/Revision'}
+        state: {enum: [needs_review, ready, confirmed]}
+        terms: {$ref: '#/components/schemas/CommercialTerms'}
+        lines: {type: array, minItems: 1, items: {$ref: '#/components/schemas/QuoteLine'}}
+        knownSubtotalKopecks: {type: integer, minimum: 0}
+        totalKopecks: {oneOf: [{$ref: '#/components/schemas/Kopecks'}, {type: 'null'}]}
+      oneOf:
+        - properties: {state: {const: needs_review}, totalKopecks: {type: 'null'}}
+        - properties:
+            state: {enum: [ready, confirmed]}
+            terms:
+              properties:
+                taxNote: {type: string}
+                payment: {type: string}
+                delivery: {type: string}
+                validUntil: {type: string}
+            lines: {items: {properties: {unitPriceKopecks: {$ref: '#/components/schemas/Kopecks'}}}}
+            totalKopecks: {$ref: '#/components/schemas/Kopecks'}
+    Document:
+      type: object
+      additionalProperties: false
+      required: [documentId, quoteId, revision, kind, url]
+      properties:
+        documentId: {$ref: '#/components/schemas/Id'}
+        quoteId: {$ref: '#/components/schemas/Id'}
+        revision: {$ref: '#/components/schemas/Revision'}
+        kind: {enum: [quote_pdf, demo_invoice]}
+        url: {type: string, pattern: '^/api/v1/documents/[A-Za-z0-9._-]+$'}
+    Event:
+      type: object
+      additionalProperties: false
+      required: [seq, at, actionId, data]
+      properties:
+        seq: {type: integer, minimum: 1}
+        at: {type: string, format: date-time}
+        actionId: {$ref: '#/components/schemas/Id'}
+        data:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [type, author, purpose, text, sources]
+              properties:
+                type: {const: message}
+                author: {enum: [customer, agent, manager]}
+                purpose: {enum: [input, greeting, clarification, answer, notice]}
+                text: {$ref: '#/components/schemas/Text'}
+                sources: {type: array, items: {$ref: '#/components/schemas/Source'}}
+                handoffId: {$ref: '#/components/schemas/Id', description: Связывает вопрос или ответ с открытым обращением.}
+            - type: object
+              additionalProperties: false
+              required: [type, products]
+              properties: {type: {const: products}, products: {type: array, minItems: 1, items: {$ref: '#/components/schemas/Product'}}}
+            - type: object
+              additionalProperties: false
+              required: [type, handoff]
+              properties: {type: {const: handoff}, handoff: {$ref: '#/components/schemas/Handoff'}}
+            - type: object
+              additionalProperties: false
+              required: [type, quote]
+              properties: {type: {const: quote}, quote: {$ref: '#/components/schemas/Quote'}}
+            - type: object
+              additionalProperties: false
+              required: [type, document]
+              properties: {type: {const: document}, document: {$ref: '#/components/schemas/Document'}}
+            - type: object
+              additionalProperties: false
+              required: [type, error]
+              properties: {type: {const: action_failed}, error: {$ref: '#/components/schemas/Error'}}
+    EventPage:
+      type: object
+      additionalProperties: false
+      required: [events, nextAfter, hasMore]
+      properties:
+        events: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/Event'}}
+        nextAfter: {type: integer, minimum: 0}
+        hasMore: {type: boolean}

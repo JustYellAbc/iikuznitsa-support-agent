@@ -14,27 +14,63 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS sessions (
+-- Диалоги и сессии входа (cookie support_session хранится только хэшем)
+CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
-    client_context TEXT NOT NULL DEFAULT '{}',
+    owner_id TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'autopilot',
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_conversations_owner ON conversations(owner_id);
 
-CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id),
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token_hash TEXT PRIMARY KEY,
     role TEXT NOT NULL,
-    text TEXT NOT NULL,
-    sources TEXT NOT NULL DEFAULT '[]',
-    quote_id TEXT,
-    created_at TEXT NOT NULL
+    principal TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_messages_session ON messages(session_id, created_at);
+
+-- Журнал T04: seq растёт на 1 внутри диалога
+CREATE TABLE IF NOT EXISTS events (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    seq INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS handoffs (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    action_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    question TEXT NOT NULL,
+    products TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_handoffs_status ON handoffs(status, created_at);
+CREATE INDEX IF NOT EXISTS ix_handoffs_conversation ON handoffs(conversation_id);
+
+-- Idempotency-Key: результат принятой команды в области пользователя, метода и пути
+CREATE TABLE IF NOT EXISTS idempotency (
+    principal TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (principal, method, path, key)
+);
 
 CREATE TABLE IF NOT EXISTS turns (
     turn_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id),
+    session_id TEXT NOT NULL REFERENCES conversations(id),
     steps TEXT NOT NULL DEFAULT '[]',
     decision TEXT NOT NULL,
     escalation_reason TEXT,
@@ -44,25 +80,20 @@ CREATE TABLE IF NOT EXISTS turns (
 );
 CREATE INDEX IF NOT EXISTS ix_turns_session ON turns(session_id, created_at);
 
-CREATE TABLE IF NOT EXISTS tickets (
+-- Черновики режима pilot: события ждут отправки менеджером
+CREATE TABLE IF NOT EXISTS drafts (
     id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id),
-    type TEXT NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    action_id TEXT NOT NULL,
+    events TEXT NOT NULL,
     status TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    collected_params TEXT NOT NULL DEFAULT '{}',
-    draft_answer TEXT,
-    operator_answer TEXT,
-    suggested_patch_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_tickets_status ON tickets(status, created_at);
 
 CREATE TABLE IF NOT EXISTS kb_patches (
     id TEXT PRIMARY KEY,
-    ticket_id TEXT,
+    handoff_id TEXT,
     question TEXT NOT NULL,
     answer TEXT NOT NULL,
     scope TEXT NOT NULL DEFAULT 'general',
@@ -83,16 +114,6 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     latency_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_llm_calls_ts ON llm_calls(ts);
-
-CREATE TABLE IF NOT EXISTS quotes (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    data TEXT NOT NULL,
-    pdf_path TEXT,
-    created_at TEXT NOT NULL
-);
 
 -- Каталог (заполняет scripts/ingest_feed.py)
 CREATE TABLE IF NOT EXISTS categories (
