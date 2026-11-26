@@ -2,6 +2,9 @@ const { after, before, test } = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const { chromium } = require("playwright");
+const { spawn } = require("node:child_process");
+const { createInterface } = require("node:readline");
+const { once } = require("node:events");
 const cases = require("../../contracts/t04/examples.json");
 
 const script = cases.find(item => item.id === "c-tender").steps;
@@ -14,6 +17,53 @@ const api = "/api/v1/conversations";
 let browser;
 before(async () => { browser = await chromium.launch({ channel: process.env.T09_BROWSER_CHANNEL }); });
 after(async () => { await browser?.close(); });
+
+test("Вызов человека в интерфейсе Т09", async t => {
+  const preview = spawn(process.env.PYTHON || "python", [path.join(__dirname, "../preview.py"), "--port", "0"],
+    { windowsHide: true, stdio: ["ignore", "pipe", "inherit"] });
+  const lines = createInterface({ input: preview.stdout });
+  t.after(() => { lines.close(); preview.kill(); });
+  const [url] = await Promise.race([
+    once(lines, "line"),
+    once(preview, "exit").then(() => { throw new Error("Предпросмотр завершился до запуска"); }),
+  ]);
+  for (const [name, turns] of [
+    ["Повтор после ответа", [
+      ["Позовите оператора.", "Подскажите, с каким вопросом нужна помощь?"],
+      ["Как найти нужную лицензию?", "Попробуйте поиск по названию продукта в каталоге."],
+      ["Это не помогло, соедините с человеком.", "Обращение передано оператору"],
+    ]],
+    ["Повтор сразу после уточнения", [
+      ["Позовите оператора.", "Подскажите, с каким вопросом нужна помощь?"],
+      ["Позовите оператора.", "Обращение передано оператору"],
+    ]],
+    ["Тендер сразу", [["Это тендер. Нужны документы.", "Обращение передано оператору"]]],
+    ["Предложение помощи", [["Можно перенести эту лицензию на другой сервер?", "Позвать оператора"]]],
+  ]) {
+    await t.test(name, async t => {
+      const page = await browser.newPage();
+      t.after(() => page.close());
+      await page.goto(url);
+      await page.locator("#launch").click();
+      await page.getByText("Какой продукт ищете или что хотите решить?").waitFor();
+      const button = page.locator("#operator");
+      assert.equal(await button.isVisible(), false);
+      for (const [input, output] of turns) {
+        await page.locator("#message").fill(input);
+        await page.locator("#send").click();
+        await page.getByText(output, { exact: true }).first().waitFor();
+        assert.equal(await button.isVisible(), output === "Позвать оператора");
+      }
+      if (await button.isVisible()) {
+        await page.reload();
+        await page.locator("#launch").click();
+        await button.click();
+        await page.getByText("Обращение передано оператору", { exact: true }).waitFor();
+        assert.equal(await button.isVisible(), false);
+      }
+    });
+  }
+});
 
 for (const toOperator of [true, false]) {
   for (const eventFirst of [true, false]) {

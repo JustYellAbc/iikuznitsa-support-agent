@@ -28,11 +28,11 @@
     <header class="chatbar"><div><span class="wordmark">softline</span><h2 id="chat-title">Поддержка магазина</h2></div>
       <button id="close" class="icon" aria-label="Свернуть чат">−</button></header>
     <div class="scroller" id="scroller">
-      <div id="welcome"><h3>Чем помочь?</h3><p>Спросите о лицензии, цене или условиях покупки.</p></div>
+      <div id="welcome"><h3>Какой продукт ищете или что хотите решить?</h3></div>
       <div id="log" role="log" aria-label="История диалога" aria-live="polite" aria-relevant="additions"></div>
     </div>
     <footer>
-      <div class="actions"><button id="operator" type="button">Позвать оператора</button></div>
+      <div class="actions"><button id="operator" type="button" hidden>Позвать оператора</button></div>
       <label id="target-label" hidden>Обращение <select id="target"></select></label>
       <form id="compose"><textarea id="message" rows="2" maxlength="8000" aria-label="Ваше сообщение" placeholder="Ваше сообщение"></textarea><button id="send" class="icon" aria-label="Отправить сообщение">↑</button></form>
       <div id="feedback" role="status"></div><button id="retry" hidden>Повторить</button>

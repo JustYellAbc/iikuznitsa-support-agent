@@ -11,6 +11,9 @@ try { state = JSON.parse(sessionStorage.getItem(storageKey)) || {}; } catch { st
 function save() { sessionStorage.setItem(storageKey, JSON.stringify(state)); }
 const openHandoffs = new Map();
 const completedActions = new Set();
+// T12's OFFER_HELP is delivered as a clarification in the current T04 wire format.
+const operatorOffer = "В источнике нет подтверждённых сведений. Подключить оператора, чтобы он уточнил ваш вопрос?";
+let operatorOffered = false;
 let cursor = 0, posting = false, polling = false, denied = false, waitUntil = 0;
 let timer, wake, actionError = "", historyError = "";
 message.value = state.pending?.body.text || "";
@@ -36,7 +39,8 @@ async function request(path, key, body) {
 function sync() {
   const locked = posting || denied || !state.id || Date.now() < waitUntil;
   byId("send").disabled = locked || !message.value.trim();
-  operator.disabled = locked || openHandoffs.size > 0;
+  operator.hidden = denied || !operatorOffered || openHandoffs.size > 0;
+  operator.disabled = locked || operator.hidden || Boolean(state.receipt);
   // After an ambiguous network error only replay the exact original command.
   message.readOnly = posting || Boolean(state.pending?.uncertain);
   if (state.pending?.uncertain) {
@@ -88,6 +92,11 @@ function display(event) {
   cursor = event.seq;
   if (event.data.type === "handoff") updateHandoffs(event.data.handoff);
   const { type, author, purpose, handoffId } = event.data;
+  if (type === "message") {
+    operatorOffered = author === "agent" && purpose === "clarification" && event.data.text === operatorOffer;
+  } else if (type === "handoff" || type === "products") {
+    operatorOffered = false;
+  }
   // A reply to an operator finishes on delivery. The manager answers with a separate actionId.
   const deliveredToOperator = type === "message" && author === "customer" && purpose === "input" && Boolean(handoffId);
   if (deliveredToOperator || type !== "message" || (purpose !== "input" && purpose !== "greeting")) {

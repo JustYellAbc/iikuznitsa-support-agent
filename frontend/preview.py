@@ -29,7 +29,44 @@ def load_script(case):
     return actions, [events[seq] for seq in sorted(events)]
 
 
-SCRIPTS = [load_script(case) for case in EXAMPLES if case["id"] in {"c-help", "c-tender", "c-need", "c-price"}]
+def operator_ui_example(turns):
+    """Scripted UI preview only; live routing belongs to the agent."""
+    actions, events = [], []
+    question = ""
+    for number, (body, reply) in enumerate(turns, 1):
+        action_id = f"demo-{number}"
+        actions.append((body, action_id))
+        batch = []
+        if body["type"] == "message":
+            batch.append(dict(type="message", author="customer", purpose="input", text=body["text"], sources=[]))
+        if isinstance(reply, tuple):
+            purpose, text = reply
+            batch.append(dict(type="message", author="agent", purpose=purpose, text=text, sources=[]))
+            question = body["text"]
+        else:
+            batch.append(dict(type="handoff", handoff=dict(handoffId="demo-help", reason=reply,
+                              question=question or body["text"], products=[], status="open")))
+        for data in batch:
+            events.append(dict(seq=len(events) + 1, actionId=action_id, at="2026-11-26T15:00:00Z", data=data))
+    return actions, events
+
+
+SCRIPTS = [load_script(case) for case in EXAMPLES if case["id"] in {"c-tender", "c-need", "c-price"}]
+ASK_ISSUE = ({"type": "message", "text": "Позовите оператора."}, ("clarification", "Подскажите, с каким вопросом нужна помощь?"))
+SCRIPTS.extend([
+    operator_ui_example([
+        ASK_ISSUE,
+        ({"type": "message", "text": "Как найти нужную лицензию?"}, ("answer", "Попробуйте поиск по названию продукта в каталоге.")),
+        ({"type": "message", "text": "Это не помогло, соедините с человеком."}, "customer_request"),
+    ]),
+    operator_ui_example([ASK_ISSUE, ({"type": "message", "text": "Позовите оператора."}, "customer_request")]),
+    operator_ui_example([({"type": "message", "text": "Это тендер. Нужны документы."}, "tender")]),
+    operator_ui_example([
+        ({"type": "message", "text": "Можно перенести эту лицензию на другой сервер?"},
+         ("clarification", "В источнике нет подтверждённых сведений. Подключить оператора, чтобы он уточнил ваш вопрос?")),
+        ({"type": "request_operator"}, "customer_request"),
+    ]),
+])
 API = "/api/v1/conversations"
 FILES = {"index.html": "text/html", "chat.css": "text/css", "chat.js": "text/javascript", "render.js": "text/javascript"}
 
@@ -78,7 +115,7 @@ class Preview(BaseHTTPRequestHandler):
             return self.respond(status, result)
         if self.path == API:
             cid = uuid4().hex
-            self.conversations[cid] = {"script": None, "position": 0, "events": []}
+            self.conversations[cid] = {"scripts": SCRIPTS, "position": 0, "events": []}
             status, result = 201, {"conversationId": cid}
         else:
             match = re.fullmatch(API + r"/([a-f0-9]+)/actions", self.path)
@@ -86,11 +123,11 @@ class Preview(BaseHTTPRequestHandler):
                 return self.send_error(404)
             cid = match[1]
             chat = self.conversations[cid]
-            script = chat["script"] or next((s for s in SCRIPTS if s[0][0][0] == body), None)
             pos = chat["position"]
-            if not script or pos >= len(script[0]) or script[0][pos][0] != body:
+            matching = [s for s in chat["scripts"] if pos < len(s[0]) and s[0][pos][0] == body]
+            if not matching:
                 return self.respond(422, {"code": "invalid_input", "message": "Локальный пример ожидает реплику из сценария Т04."})
-            actions, events = script
+            actions, events = matching[0]
             action_id = actions[pos][1]
             next_id = actions[pos + 1][1] if pos + 1 < len(actions) else None
             cutoff = next((e["seq"] for e in events if e["actionId"] == next_id), float("inf"))
@@ -98,7 +135,7 @@ class Preview(BaseHTTPRequestHandler):
             for event in visible:
                 if event["data"]["type"] == "handoff":
                     event["data"]["handoff"]["conversationId"] = cid
-            chat.update(script=script, position=pos + 1, events=visible)
+            chat.update(scripts=matching, position=pos + 1, events=visible)
             status, result = 202, {"conversationId": cid, "actionId": action_id}
         self.requests_by_key[cache_key] = body, status, result
         self.respond(status, result)
@@ -108,5 +145,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8099)
     port = parser.parse_args().port
-    print(f"http://127.0.0.1:{port}/chat/", flush=True)
-    HTTPServer(("127.0.0.1", port), Preview).serve_forever()
+    with HTTPServer(("127.0.0.1", port), Preview) as server:
+        print(f"http://127.0.0.1:{server.server_port}/chat/", flush=True)
+        server.serve_forever()
