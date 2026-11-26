@@ -199,7 +199,8 @@ async def last_products(conversation_id: str) -> list[dict[str, Any]]:
         """WITH searches AS (
                SELECT json_extract(s.value, '$.args.journal_action_id') AS action_id, t.decision
                FROM turns t, json_each(t.steps) s
-               WHERE t.session_id = ? AND json_extract(s.value, '$.tool') = 'catalog_search'
+               WHERE t.session_id = ? AND (json_extract(s.value, '$.tool') = 'catalog_search'
+                    OR json_extract(s.value, '$.args.replaces_products') = 1)
            ), latest AS (
                SELECT action_id FROM events WHERE conversation_id = ? AND (
                    json_extract(data, '$.type') = 'products' OR

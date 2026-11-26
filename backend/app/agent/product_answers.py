@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from app.agent.catalog_selection import CODE, LATIN, MDAEMON, NAMED, Selection, named_request, offer_product, result
+from app.agent.catalog_selection import CODE, LATIN, MDAEMON, Selection, named_request, offer_product, result
 from app.agent.handoff import OFFER_HELP, PRICE
 from app.contracts.t04 import Product, Source
 
@@ -30,6 +30,26 @@ ELECTRONIC_ARTICLE = "Как получить электронный ключ и
 BOX_ARTICLE = "Доставка оборудования и коробочного ПО"
 DELIVERY_GUIDE = "https://store.softline.ru/delivery_info/"
 UNKNOWN = {"не определено", "другое или отсутствует", "не указано", "нет данных", "мес."}
+PRODUCT_OBJECT = re.compile(
+    r"(?=\b(?:у|про|для|по продукту|по товару|лицензи\w* на|сколько (?:стоит|стоят)|нужен|нужна)\s+"
+    r"([а-яё][\w.-]*(?:\s+[\w.-]+){0,6}))",
+    re.I,
+)
+GENERIC_WORDS = set(
+    "и ли он она оно они мы мне нас вас него неё нее её ее его них меня себя всех мой моя моё мое мои моей "
+    "моего моих моему моим моими мою кого чего как когда где сколько сама сам на от до по в с без за "
+    "двух троих это эта эти эту этом этого одной одного".split()
+)
+# Inflections of common buyers, transactions and references to the selected item.
+# Limit stems to actual endings so «Новатор» remains distinct from «новой лицензии».
+GENERIC_NOUN = re.compile(
+    r"(?:покупател|пользовател)(?:ь|я|ей|ям)|(?:сотрудник|товар|продукт|ключ)(?:а|у|ов|ей|и)?|"
+    r"(?:компани|организаци|предприяти|лицензи|редакци|позици|верси)(?:я|е|ю|и|й|ям)|"
+    r"(?:юр|физ)лиц(?:о|а|у)?|(?:покуп|подпис|достав|постав)к(?:а|у|и|е)|"
+    r"(?:нов|действующ|физическ|юридическ|выбранн|текущ|электронн|данн|так|эт|ваш|наш|одн)"
+    r"(?:ая|яя|ой|ей|ого|его|ом|ем|ую|юю|ые|ие|их|ых|а|е|и|о)?|"
+    r"продлени(?:е|я|ю|и)|оформлени(?:е|я|ю|и)"
+)
 
 
 def topics_for(text: str, has_products: bool) -> set[str]:
@@ -48,7 +68,7 @@ def topics_for(text: str, has_products: bool) -> set[str]:
         topics.add("order_status")
     if "rights" in topics:
         topics.add("term")
-    if topics and PRICE.search(body):
+    if PRICE.search(body):
         topics.add("price")
     if (
         not has_products
@@ -62,17 +82,23 @@ def topics_for(text: str, has_products: bool) -> set[str]:
 
 def question_target(text: str) -> Selection | None:
     """A fact about a newly named product must never be taken from an earlier offer."""
-    if CODE.search(text) or MDAEMON.search(text) or LATIN.search(text) or NAMED.search(text) or "«" in text:
-        if COMPATIBILITY_TARGET.search(text) and not (CODE.search(text) or MDAEMON.search(text) or NAMED.search(text)):
-            prefix = COMPATIBILITY_TARGET.split(text, maxsplit=1)[0]
-            return named_request(prefix) if LATIN.search(prefix) else None
-        target = named_request(text)
-        if target and re.match(r"^(?:этот|эта|это|эту|этой|он|она|оно|его|е[её]|выбранн\w*)\b", target.name, re.I):
-            return None
-        return target
-    target = re.search(r"\b(?:у|для|про)\s+(.+?)(?:[?,!]|$)", text, re.I)
-    if target and not re.match(r"(?:него|не[её]|эт\w*|данн\w*|выбранн\w*|этого|этой|лицензии)\b", target[1], re.I):
-        return named_request("Нужен " + target[1])
+    subject = COMPATIBILITY_TARGET.split(text, maxsplit=1)[0]
+    code = CODE.search(subject)
+    if code:
+        return Selection(code[1].rstrip("."), code=True)
+    quoted = re.search(r'[«"]([^»"]{2,100})[»"]', subject)
+    if quoted or MDAEMON.search(subject):
+        return named_request(subject)
+    # Customers type brands in lower case too. A change of subject supersedes the
+    # prior SKU; buyer attributes and references to the current license do not.
+    for match in PRODUCT_OBJECT.finditer(subject):
+        name = re.split(r"\s+(?:и|на|для|како\w*|сколько)\b", match[1], maxsplit=1, flags=re.I)[0].strip(" .")
+        word = name.casefold().split()[0] if name else ""
+        if word and word not in GENERIC_WORDS and not GENERIC_NOUN.fullmatch(word):
+            return Selection(name)
+    latin = LATIN.search(subject)
+    if latin:
+        return Selection(latin[0].strip(" ."))
     return None
 
 
@@ -83,6 +109,24 @@ def delivery_article(db: sqlite3.Connection, title: str) -> tuple[str, Source] |
     if not row or not row[0].strip():
         return None
     return row[0].strip(), Source(url=DELIVERY_GUIDE, label=title)
+
+
+def current_offer(db: sqlite3.Connection, product: Product) -> dict | None:
+    row = db.execute(
+        "SELECT id,name,params,available,price,currency,source,price_state FROM offers WHERE id=? AND source=?",
+        (product.offerId, product.source.url),
+    ).fetchone()
+    if row and row["currency"] in {"RUB", "RUR"}:
+        return {**row, "params": json.loads(row["params"])}
+    return None
+
+
+def refresh_products(index: Path, products: list[Product]) -> list[Product]:
+    if not products or not index.is_file():
+        return products
+    with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        return [offer_product(row) for p in products if (row := current_offer(db, p))]
 
 
 def answer_facts(index: Path, text: str, topics: set[str], products: list[Product]):
@@ -105,16 +149,12 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
             if "order_status" in topics:
                 return result(OFFER_HELP)
             return result("Назовите товар или его артикул, чтобы я проверил условия по карточке.")
-        p = products[0]
         db.row_factory = sqlite3.Row
-        row = db.execute(
-            "SELECT id,name,params,available,price,currency,source,price_state FROM offers WHERE id=? AND source=?",
-            (p.offerId, p.source.url),
-        ).fetchone()
-        if not row or row["currency"] not in {"RUB", "RUR"}:
+        row = current_offer(db, products[0])
+        if not row:
             return result(OFFER_HELP)
-        name, params = row["name"], json.loads(row["params"])
-        p = offer_product({**row, "params": params})
+        name, params = row["name"], row["params"]
+        p = offer_product(row)
         facts = []
         unknown = []
         refs = []
@@ -169,6 +209,8 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
                 rub, kop = divmod(p.unitPriceKopecks, 100)
                 money = f"{rub:,}".replace(",", " ") + (f",{kop:02}" if kop else "")
                 facts.append(f"Цена по снимку — {money} ₽.")
+        if p.priceState == "availability_check":
+            facts.append("Наличие требует подтверждения.")
         if unknown:
             # The T09/T12 offer opens the operator button. Show the sourced partial answer
             # alongside it, even when one detail requires the manager.

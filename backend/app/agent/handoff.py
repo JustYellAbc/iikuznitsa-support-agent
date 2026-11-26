@@ -130,7 +130,9 @@ def route_action(
         p = products[0]
         if PRICE.search(body) and p.priceState == "on_request":
             return Routing("price_request", text)
-        if p.priceState == "availability_check" and re.search(r"наличи|доступн|купить|поставк", body):
+        if p.priceState == "availability_check" and re.search(
+            r"наличи|доступн|купить|поставк|достав|получить .*?ключ|получить ключ|электронн\w* ключ|прид[её]т", body
+        ):
             return Routing("availability", text)
         if TERM.search(body) and p.licenseTerm is None:
             finding = "insufficient_evidence"

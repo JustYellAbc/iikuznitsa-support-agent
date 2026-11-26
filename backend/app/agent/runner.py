@@ -24,7 +24,7 @@ import asyncio
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 from app.agent.catalog_selection import Selection, named_request, select, selection_for
 from app.agent.handoff import (
@@ -37,7 +37,7 @@ from app.agent.handoff import (
     handoff_reason,
     route_action,
 )
-from app.agent.product_answers import answer_facts, question_target, topics_for
+from app.agent.product_answers import answer_facts, question_target, refresh_products, topics_for
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Session, StepTrace
 from app.contracts.t04 import Product
@@ -71,6 +71,8 @@ async def run_turn(
     started = time.perf_counter()
     if products is None:
         products = [Product.model_validate(p) for p in await last_products(session.id)]
+    original_products = products
+    index = get_settings().data_dir / "private" / "catalog.sqlite3"
     bare = bare_request(user_text.casefold())
     route = route_action(history, user_text, products if bare else [], action_type=action_type, finding=finding)
     search_text = user_text
@@ -85,10 +87,13 @@ async def run_turn(
     suggestion = ""
     options = []
     pending_question = ""
-    if history and search_text:
+    if history:
         turns = await list_turns(session.id)
         if turns and turns[-1].decision == "answer" and turns[-1].steps:
-            pending_question = turns[-1].steps[-1].args.get("awaiting_product_for", "")
+            last_step = turns[-1].steps[-1]
+            pending_question = last_step.args.get("awaiting_product_for", "")
+            if route and (bare or route.reason == "insufficient_evidence") and last_step.tool == "product_facts":
+                route = replace(route, question=last_step.args.get("question", route.question))
         for turn in reversed(turns):
             if not turn.steps:
                 break
@@ -97,17 +102,28 @@ async def run_turn(
                 continue
             if step.tool == "catalog_search":
                 args = step.args
-                previous = Selection(**args["selection"])
+                previous = Selection(**args.get("followup_selection", args["selection"]))
                 suggestion = args.get("suggested_name", "")
                 options = args.get("options", [])
             break
 
     topics = topics_for(user_text, bool(products)) if not route else set()
-    selected = selection_for(search_text, previous, suggestion, options) if search_text else None
+    awaiting_seats = bool(history and history[-1].role == "agent" and "На сколько пользователей" in history[-1].text)
+    selected = (
+        selection_for(search_text, previous, suggestion, options, awaiting_seats=awaiting_seats)
+        if search_text
+        else None
+    )
     if topics:
         target = question_target(user_text)
         if target is None:
             selected = None
+            if previous:
+                updated = previous.qualifiers(user_text, followup=True)
+                # A question about post-expiry rights describes the current offer.
+                updated.perpetual = previous.perpetual
+                if updated != previous:
+                    selected = updated
         elif selected is None or selected.name.casefold() != target.name.casefold():
             selected = target.qualifiers(user_text, followup=False)
     fact_question = user_text
@@ -116,7 +132,6 @@ async def run_turn(
         topics = topics_for(fact_question, True)
     hit = None
     steps = []
-    index = get_settings().data_dir / "private" / "catalog.sqlite3"
     if selected:
         hit = await asyncio.to_thread(select, index, selected)
         steps.append(
@@ -128,31 +143,45 @@ async def run_turn(
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
         )
+        if hit.followup:
+            steps[-1].args["followup_selection"] = asdict(hit.followup)
         products = [] if route and hit.purpose != "answer" else hit.products
-    # Price/availability decisions must use products from the current search when present.
-    if not route and (not hit or hit.purpose == "answer"):
-        route = route_action(history, user_text, products, action_type=action_type, finding=finding)
-    if topics and (not hit or hit.purpose == "answer") and (not route or route.offer_help):
+    if topics and (not hit or hit.purpose == "answer") and not route:
+        prior_offers = products
         hit = await asyncio.to_thread(answer_facts, index, fact_question, topics, products)
-        route = None
+        if len(products) == 1 and index.is_file():
+            products = hit.products
+        policy = route_action(history, fact_question, products, action_type=action_type, finding=finding)
+        if policy and not policy.offer_help:
+            route = policy
         steps.append(
             StepTrace(
                 tool="product_facts",
-                args={"topics": sorted(topics), "offers": [p.offerId for p in products]},
+                args={
+                    "topics": sorted(topics),
+                    "offers": [p.offerId for p in prior_offers],
+                    "question": fact_question,
+                    "replaces_products": prior_offers != products,
+                },
                 source_ref=hit.evidence.source_ref,
                 result_summary=hit.text if not hit.sources else f"{hit.text} {hit.sources[0].label}"[:450],
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
         )
-        if hit.purpose == "clarification" and not hit.sources and len(products) != 1:
+        if hit.purpose == "clarification" and hit.text != OFFER_HELP and not hit.sources and len(products) != 1:
             steps[-1].args["awaiting_product_for"] = fact_question
     elif topics and hit and hit.purpose == "clarification" and hit.text != OFFER_HELP and not route:
         steps[-1].args["awaiting_product_for"] = fact_question
+    elif not hit or hit.purpose == "answer":
+        if not selected:
+            products = await asyncio.to_thread(refresh_products, index, products)
+        if not route:
+            route = route_action(history, user_text, products, action_type=action_type, finding=finding)
     if route:
         steps.append(
             StepTrace(
                 tool="handoff_policy",
-                args={"reason": route.reason},
+                args={"reason": route.reason, "replaces_products": products != original_products},
                 result_summary=route.clarification or "Передача оператору",
             )
         )
@@ -160,9 +189,16 @@ async def run_turn(
         for step in steps:
             await emit_step(step)
         escalate = route is not None and not route.clarification
-        published_products = []
-        if hit and (selected or hit.products != products):
-            published_products = products if route else hit.products
+        published_products = products if selected or products != original_products else []
+        reply_text = hit.text if hit else ""
+        if route:
+            reply_text = route.clarification or CONFIRMED
+            if escalate and hit and topics:
+                if route.reason == "availability":
+                    detail = hit.sources[0].label if hit.text == OFFER_HELP and hit.sources else hit.text
+                    reply_text = f"{detail} {CONFIRMED}"
+                elif route.reason == "price_request":
+                    reply_text = f"Цена по запросу. {CONFIRMED}"
         return AgentReply(
             turn=AgentTurn(
                 turn_id=new_id("turn"),
@@ -173,7 +209,7 @@ async def run_turn(
                 total_cost_rub=0,
                 total_latency_ms=int((time.perf_counter() - started) * 1000),
             ),
-            text=(route.clarification or CONFIRMED) if route else hit.text,
+            text=reply_text,
             purpose=("notice" if escalate else "clarification") if route else hit.purpose,
             products=published_products,
             sources=hit.sources if hit else [],

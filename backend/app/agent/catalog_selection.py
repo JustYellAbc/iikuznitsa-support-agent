@@ -15,7 +15,7 @@ from app.contracts.t04 import Product, Source
 WORD = re.compile(r"[^\W_]+")
 MDAEMON = re.compile(r"\b(?:mda?e?mo?n|mdeamon|мд[еэ]й?мон|мдаймон|эмдеймон)\b", re.I)
 SEATS = re.compile(r"\b(\d{1,9})\s*[- ]?\s*(?:пользоват|человек|сотрудник|рабочи[хе] мест|мест|users?|seats?)", re.I)
-CODE = re.compile(r"\b(?:артикул|offerid|sku|код товара|id)\s*[:#№-]?\s*([\w.-]+)", re.I)
+CODE = re.compile(r"\b(?:артикул(?:а|у|е|ом)?\b|offerid|sku|код(?:а|у|е|ом)? товара\b|id)\s*[:#№-]?\s*([\w.-]+)", re.I)
 NAMED = re.compile(r"\b(?:ищу|найти|нуж(?:ен|на|но)|подберите|купить|купим|интересует|сколько стоит)\s+", re.I)
 LATIN = re.compile(r"\b[a-z][a-z0-9.+-]*(?:\s+[a-z][a-z0-9.+-]*)*", re.I | re.ASCII)
 STOP_NAME = re.compile(
@@ -44,6 +44,7 @@ class Selection:
     months: int | None = None
     organization: str = ""
     edition: str = ""
+    group_id: str | None = None
 
     def qualifiers(self, text: str, *, followup: bool) -> "Selection":
         updated = replace(self)
@@ -92,7 +93,7 @@ class Selection:
 
 def named_request(text: str) -> Selection | None:
     code = CODE.search(text)
-    if code or re.fullmatch(r"\d{4,12}", text.strip()):
+    if code or re.fullmatch(r"\d{3,12}", text.strip()):
         return Selection(code[1].rstrip(".") if code else text.strip(), code=True)
     match = MDAEMON.search(text)
     if match:
@@ -164,7 +165,9 @@ def named_request(text: str) -> Selection | None:
     return Selection(name)
 
 
-def selection_for(text: str, previous: Selection | None, suggestion: str = "", options=()) -> Selection | None:
+def selection_for(
+    text: str, previous: Selection | None, suggestion: str = "", options=(), *, awaiting_seats: bool = False
+) -> Selection | None:
     found = named_request(text)
     if previous:
         updated = previous.qualifiers(text, followup=True)
@@ -174,9 +177,14 @@ def selection_for(text: str, previous: Selection | None, suggestion: str = "", o
         if ordinal and options:
             i = ("перв", "втор", "трет").index(ordinal[1])
             if i < len(options):
-                return replace(updated, name=options[i], code=True)
+                return replace(updated, name=options[i], code=True, group_id=None)
         if found and found.code and found.name in options:
-            return replace(updated, name=found.name, code=True)
+            # A numeric option identifies a SKU, even when a previous enquiry included a seat count.
+            return replace(previous.qualifiers(text, followup=False), name=found.name, code=True, group_id=None)
+        if found and found.code:
+            if awaiting_seats and text.strip().isdecimal() and len(text.strip()) <= 9:
+                return updated
+            return found.qualifiers(text, followup=False)
         if found and not found.code and all(TRANSACTION_ONLY.fullmatch(w) for w in WORD.findall(found.name.casefold())):
             return updated
         if found and SEATS.match(found.name):
@@ -206,6 +214,7 @@ class Result:
     sources: list[Source]
     evidence: ToolResult
     suggestion: str = ""
+    followup: Selection | None = None
 
 
 def result(text: str, purpose: str = "clarification", products=(), *, sources=()) -> Result:
@@ -217,7 +226,7 @@ def result(text: str, purpose: str = "clarification", products=(), *, sources=()
 
 def _lookup(db: sqlite3.Connection, selection: Selection) -> tuple[list, str]:
     fields = (
-        "o.id,o.name,o.source,o.available,o.currency,o.price,o.price_state,o.params,o.edition,"
+        "o.id,o.group_id,o.name,o.source,o.available,o.currency,o.price,o.price_state,o.params,o.edition,"
         "json_extract(o.details,'$.sales_notes') AS sales_notes"
     )
     if selection.code or re.fullmatch(r"(?=\S*\d)[a-zA-Z0-9.-]+", selection.name):
@@ -228,6 +237,11 @@ def _lookup(db: sqlite3.Connection, selection: Selection) -> tuple[list, str]:
         exact = rows.fetchall()
         if exact or selection.code:
             return exact, ""
+    if selection.group_id:
+        return db.execute(
+            f"SELECT {fields} FROM offers o WHERE o.group_id=? ORDER BY o.id LIMIT ?",
+            (selection.group_id, LIMIT + 1),
+        ).fetchall(), ""
     words = WORD.findall(selection.name.casefold())
     if not words or len(words) > 12:
         return [], ""
@@ -266,6 +280,35 @@ def offer_product(row) -> Product:
         row["available"] == 1,
         None if row["price_state"] == "request_price" else row["price"],
         terms[0] if len(terms) == 1 else None,
+    )
+
+
+def _followup_from_sku(selection: Selection, row: dict) -> Selection:
+    """A direct article identifies both today's offer and the feed family for a later change of terms."""
+    params = row["params"]
+
+    def single(key: str) -> str:
+        values = {v for v in params.get(key, []) if v.casefold() not in {"не определено", "не указано"}}
+        return values.pop() if len(values) == 1 else ""
+
+    count = single(CAPACITY)
+    duration = re.fullmatch(r"(\d+)\s*мес\.?", single("Срок действия"), re.I)
+    kind = selection.kind or single(KIND)
+    expired = selection.expired
+    if expired is None and kind == "Продление":
+        expired = "просроч" in row["name"].casefold()
+    return replace(
+        selection,
+        name=row["name"].split(" (", 1)[0] if row["group_id"] else selection.name,
+        code=not bool(row["group_id"]),
+        group_id=row["group_id"],
+        seats=selection.seats if selection.seats is not None else (int(count) if count.isdecimal() else None),
+        buyer=selection.buyer or single(BUYER),
+        kind=kind,
+        expired=expired,
+        organization=selection.organization or single("Тип организации"),
+        months=selection.months if selection.months is not None else (int(duration[1]) if duration else None),
+        edition=selection.edition or (row["edition"] or "").casefold(),
     )
 
 
@@ -309,7 +352,10 @@ def select(index: Path, selection: Selection) -> Result:
         rows = [r for r in rows if selection.organization in r["params"].get("Тип организации", [])]
     if selection.edition:
         rows = [
-            r for r in rows if selection.edition in WORD.findall(((r["edition"] or "") + " " + r["name"]).casefold())
+            r
+            for r in rows
+            if selection.edition == (r["edition"] or "").casefold()
+            or selection.edition in WORD.findall(((r["edition"] or "") + " " + r["name"]).casefold())
         ]
     if selection.months is not None:
         rows = [
@@ -410,4 +456,7 @@ def select(index: Path, selection: Selection) -> Result:
     if selection.perpetual:
         parts.append(f"Срок по карточке: {p.licenseTerm}." if p.licenseTerm else "Срок в карточке не указан.")
         parts.append("Право использования после окончания подписки требует проверки условий лицензии.")
-    return result(" ".join(parts), "answer", products)
+    answer = result(" ".join(parts), "answer", products)
+    if selection.code:
+        answer.followup = _followup_from_sku(selection, rows[0])
+    return answer

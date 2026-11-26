@@ -114,7 +114,7 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
     if turn.decision == "answer" and current is not None and current.session.mode == "pilot":
         turn = turn.model_copy(update={"decision": "draft"})
     for step in turn.steps:
-        if step.tool == "catalog_search":
+        if step.tool == "catalog_search" or step.args.get("replaces_products"):
             step.args["journal_action_id"] = action_id
     await repository.save_turn(turn)
 
