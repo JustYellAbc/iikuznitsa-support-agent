@@ -1,18 +1,25 @@
 """Download customer-facing Softline help into a local JSON snapshot (requires bs4)."""
+
 import argparse
 import json
 from pathlib import Path
 from urllib.request import urlopen
 
 from bs4 import BeautifulSoup
-
 from index import KNOWLEDGE
-
 
 ARTICLES = {
     "id": ["login", "password", "authorization-data", "registration"],
-    "lk": ["create-order", "invoices", "unpaid-invoices", "fulfillment",
-           "view-statuses", "closing-documents", "renewal", "order-contact"],
+    "lk": [
+        "create-order",
+        "invoices",
+        "unpaid-invoices",
+        "fulfillment",
+        "view-statuses",
+        "closing-documents",
+        "renewal",
+        "order-contact",
+    ],
 }
 
 

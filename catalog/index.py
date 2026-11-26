@@ -1,15 +1,16 @@
 """Build and query the local Softline search index (Python 3.11+, SQLite FTS5)."""
+
 import argparse
-from collections import defaultdict
-from contextlib import closing
-from decimal import Decimal, InvalidOperation
 import json
 import os
-from pathlib import Path
 import re
 import sqlite3
 import tempfile
 import xml.etree.ElementTree as ET
+from collections import defaultdict
+from contextlib import closing
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 KNOWLEDGE = Path(__file__).with_name("knowledge.json")
 SCHEMA = """
@@ -40,8 +41,9 @@ def insert_offer(db, node, categories):
             continue
         if value and value.casefold() not in {"другое или отсутствует", "не указано", "нет данных"}:
             params[item.attrib["name"]].append(value)
-    details = {child.tag: child.text.strip() for child in node
-               if child.tag != "param" and child.text and child.text.strip()}
+    details = {
+        child.tag: child.text.strip() for child in node if child.tag != "param" and child.text and child.text.strip()
+    }
     details["raw_params"] = raw_params
     available = {"true": 1, "false": 0}.get(node.get("available"))
     price = field("price")
@@ -57,16 +59,37 @@ def insert_offer(db, node, categories):
     else:
         state = "verify_availability"
     edition = " / ".join(params.get("Версия", [])) or None
-    row = db.execute("INSERT INTO offers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-        node.attrib["id"], field("vendorCode") or None, node.get("group_id"), field("name"),
-        field("vendor"), edition, field("categoryId") or None, available, price or None,
-        field("currencyId"), state, field("url"), json.dumps(details, ensure_ascii=False),
-        json.dumps(params, ensure_ascii=False)))
-    features = " ".join([field("vendor"), field("description"), field("sales_notes"),
-                         *(v for values in params.values() for v in values)])
-    db.execute("INSERT INTO products(rowid,name,vendor_code,category,features) VALUES(?,?,?,?,?)",
-               (row.lastrowid, field("name"), field("vendorCode"),
-                categories.get(field("categoryId"), ""), features))
+    row = db.execute(
+        "INSERT INTO offers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            node.attrib["id"],
+            field("vendorCode") or None,
+            node.get("group_id"),
+            field("name"),
+            field("vendor"),
+            edition,
+            field("categoryId") or None,
+            available,
+            price or None,
+            field("currencyId"),
+            state,
+            field("url"),
+            json.dumps(details, ensure_ascii=False),
+            json.dumps(params, ensure_ascii=False),
+        ),
+    )
+    features = " ".join(
+        [
+            field("vendor"),
+            field("description"),
+            field("sales_notes"),
+            *(v for values in params.values() for v in values),
+        ]
+    )
+    db.execute(
+        "INSERT INTO products(rowid,name,vendor_code,category,features) VALUES(?,?,?,?,?)",
+        (row.lastrowid, field("name"), field("vendorCode"), categories.get(field("categoryId"), ""), features),
+    )
 
 
 def build(feed, destination, knowledge):
@@ -94,8 +117,7 @@ def build(feed, destination, knowledge):
                 if node.tag == "category" and stack[-1].tag == "categories":
                     key = node.attrib["id"]
                     categories[key] = (node.text or "").strip()
-                    db.execute("INSERT INTO categories VALUES(?,?,?)",
-                               (key, node.get("parentId"), categories[key]))
+                    db.execute("INSERT INTO categories VALUES(?,?,?)", (key, node.get("parentId"), categories[key]))
                     stack[-1].remove(node)
                 elif node.tag == "offer" and stack[-1].tag == "offers":
                     insert_offer(db, node, categories)
@@ -144,8 +166,11 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None):
     with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
         if scope == "knowledge":
-            rows = db.execute("SELECT title,body,source FROM knowledge WHERE knowledge MATCH ? "
-                              "ORDER BY bm25(knowledge,4,1,0) LIMIT ?", (expression, limit))
+            rows = db.execute(
+                "SELECT title,body,source FROM knowledge WHERE knowledge MATCH ? "
+                "ORDER BY bm25(knowledge,4,1,0) LIMIT ?",
+                (expression, limit),
+            )
         else:
             filters = ["products MATCH ?"]
             bindings = [catalog_lookup(query, expression) if named_family else expression]
@@ -168,12 +193,15 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None):
                                           WHERE value = ?)""")
                 bindings.append(license_type)
             ordering.extend(["bm25(products,8,10,3,1)", "o.id"])
-            rows = db.execute(f"""
+            rows = db.execute(
+                f"""
                 SELECT o.id,o.vendor_code,o.name,o.edition,o.price,o.currency,o.available,
                        o.price_state,o.source,o.params,o.details FROM products
                 JOIN offers o ON o.rowid=products.rowid WHERE {" AND ".join(filters)}
                 ORDER BY {", ".join(ordering)} LIMIT ?
-            """, [*bindings, limit])
+            """,
+                [*bindings, limit],
+            )
         result = [dict(r) for r in rows]
         for item in result:
             if "params" in item:
@@ -195,6 +223,9 @@ if __name__ == "__main__":
     query_cmd.add_argument("--scope", choices=["catalog", "knowledge"], default="catalog")
     query_cmd.add_argument("--license-type", choices=["Полная версия", "Продление"])
     args = parser.parse_args()
-    result = (build(args.feed, args.index, args.knowledge) if args.command == "build"
-              else search(args.index, args.query, args.scope, license_type=args.license_type))
+    result = (
+        build(args.feed, args.index, args.knowledge)
+        if args.command == "build"
+        else search(args.index, args.query, args.scope, license_type=args.license_type)
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
