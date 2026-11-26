@@ -17,7 +17,7 @@
         "operationId": "submitAction",
         "params": {"conversationId":"c-tender"},
         "key": "message1",
-        "body": {"type":"message","text":"Нужен Мдеймон для 20 человек."},
+        "body": {"type":"message","text":"Нужен Мдеймон для 20 человек. Покупатель — юрлицо."},
         "status": 202,
         "response": {"conversationId":"c-tender","actionId":"a1"}
       },
@@ -29,7 +29,7 @@
         "status": 200,
         "response": {
           "events": [
-            {"seq":1,"at":"2026-11-26T09:00:01.000Z","actionId":"a1","data":{"type":"message","author":"customer","purpose":"input","text":"Нужен Мдеймон для 20 человек.","sources":[]}},
+            {"seq":1,"at":"2026-11-26T09:00:01.000Z","actionId":"a1","data":{"type":"message","author":"customer","purpose":"input","text":"Нужен Мдеймон для 20 человек. Покупатель — юрлицо.","sources":[]}},
             {"seq":2,"at":"2026-11-26T09:00:02.000Z","actionId":"a1","data":{"type":"message","author":"agent","purpose":"clarification","text":"Покупаете новую лицензию или продлеваете подписку на обновления?","sources":[]}}
           ],
           "nextAfter": 2,
@@ -95,7 +95,27 @@
         "response": {"items":[{"handoffId":"h-tender","conversationId":"c-tender","reason":"tender","question":"Какой пакет документов требуется для закупки?","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}],"status":"open"}]}
       },
       {
-        "label": "Ответ в исходный диалог",
+        "label": "Оператор впервые открывает историю со своего курсора",
+        "role": "manager",
+        "operationId": "readEvents",
+        "params": {"conversationId":"c-tender","after":0},
+        "status": 200,
+        "response": {
+          "events": [
+            {"seq":1,"at":"2026-11-26T09:00:01.000Z","actionId":"a1","data":{"type":"message","author":"customer","purpose":"input","text":"Нужен Мдеймон для 20 человек. Покупатель — юрлицо.","sources":[]}},
+            {"seq":2,"at":"2026-11-26T09:00:02.000Z","actionId":"a1","data":{"type":"message","author":"agent","purpose":"clarification","text":"Покупаете новую лицензию или продлеваете подписку на обновления?","sources":[]}},
+            {"seq":3,"at":"2026-11-26T09:00:03.000Z","actionId":"a2","data":{"type":"message","author":"customer","purpose":"input","text":"Покупаем впервые.","sources":[]}},
+            {"seq":4,"at":"2026-11-26T09:00:04.000Z","actionId":"a2","data":{"type":"products","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}]}},
+            {"seq":5,"at":"2026-11-26T09:00:05.000Z","actionId":"a2","data":{"type":"message","author":"agent","purpose":"answer","text":"Упаковка для 20 пользователей стоит 77 556 ₽ по снимку. Включён год обновлений.","sources":[{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"}]}},
+            {"seq":6,"at":"2026-11-26T09:00:06.000Z","actionId":"a3","data":{"type":"message","author":"customer","purpose":"input","text":"Это тендер. Нужны документы.","sources":[]}},
+            {"seq":7,"at":"2026-11-26T09:00:07.000Z","actionId":"a3","data":{"type":"handoff","handoff":{"handoffId":"h-tender","conversationId":"c-tender","reason":"tender","question":"Какой пакет документов требуется для закупки?","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}],"status":"open"}}}
+          ],
+          "nextAfter": 7,
+          "hasMore": false
+        }
+      },
+      {
+        "label": "Оператор уточняет состав пакета и продолжает вести обращение",
         "role": "manager",
         "operationId": "resolveHandoff",
         "params": {"handoffId":"h-tender"},
@@ -105,19 +125,98 @@
         "response": {"conversationId":"c-tender","actionId":"a4"}
       },
       {
-        "label": "Покупатель видит ответ оператора",
+        "label": "Покупатель видит уточнение оператора",
         "role": "customer",
         "operationId": "readEvents",
         "params": {"conversationId":"c-tender","after":7},
         "status": 200,
         "response": {
           "events": [
-            {"seq":8,"at":"2026-11-26T09:00:08.000Z","actionId":"a4","data":{"type":"message","author":"manager","purpose":"answer","text":"Пришлите перечень документов из извещения.","sources":[]}},
-            {"seq":9,"at":"2026-11-26T09:00:09.000Z","actionId":"a4","data":{"type":"handoff","handoff":{"handoffId":"h-tender","conversationId":"c-tender","reason":"tender","question":"Какой пакет документов требуется для закупки?","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}],"status":"resolved"}}}
+            {"seq":8,"at":"2026-11-26T09:00:08.000Z","actionId":"a4","data":{"type":"message","author":"manager","purpose":"clarification","text":"Пришлите перечень документов из извещения.","sources":[],"handoffId":"h-tender"}}
+          ],
+          "nextAfter": 8,
+          "hasMore": false
+        }
+      },
+      {
+        "label": "После уточнения обращение остаётся в очереди",
+        "role": "manager",
+        "operationId": "listHandoffs",
+        "status": 200,
+        "response": {"items":[{"handoffId":"h-tender","conversationId":"c-tender","reason":"tender","question":"Какой пакет документов требуется для закупки?","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}],"status":"open"}]}
+      },
+      {
+        "label": "Покупатель отвечает в открытое обращение",
+        "role": "customer",
+        "operationId": "submitAction",
+        "params": {"conversationId":"c-tender"},
+        "key": "customer-reply",
+        "body": {"type":"message","text":"Уточнил у закупок: для этого этапа нужна только ссылка на выбранную лицензию.","handoffId":"h-tender"},
+        "status": 202,
+        "response": {"conversationId":"c-tender","actionId":"a5"}
+      },
+      {
+        "label": "Оператор видит ответ покупателя в том же обращении",
+        "role": "manager",
+        "operationId": "readEvents",
+        "params": {"conversationId":"c-tender","after":7},
+        "status": 200,
+        "response": {
+          "events": [
+            {"seq":8,"at":"2026-11-26T09:00:08.000Z","actionId":"a4","data":{"type":"message","author":"manager","purpose":"clarification","text":"Пришлите перечень документов из извещения.","sources":[],"handoffId":"h-tender"}},
+            {"seq":9,"at":"2026-11-26T09:00:09.000Z","actionId":"a5","data":{"type":"message","author":"customer","purpose":"input","text":"Уточнил у закупок: для этого этапа нужна только ссылка на выбранную лицензию.","sources":[],"handoffId":"h-tender"}}
           ],
           "nextAfter": 9,
           "hasMore": false
         }
+      },
+      {
+        "label": "Оператор отвечает и завершает обращение",
+        "role": "manager",
+        "operationId": "resolveHandoff",
+        "params": {"handoffId":"h-tender"},
+        "key": "close",
+        "body": {"type":"close","reply":"Для этой закупки выбрана лицензия MDaemon на 20 пользователей: https://store.softline.ru/alt-n-technologies-ltd/-19576/"},
+        "status": 202,
+        "response": {"conversationId":"c-tender","actionId":"a6"}
+      },
+      {
+        "label": "Покупатель видит итог и закрытие обращения",
+        "role": "customer",
+        "operationId": "readEvents",
+        "params": {"conversationId":"c-tender","after":8},
+        "status": 200,
+        "response": {
+          "events": [
+            {"seq":9,"at":"2026-11-26T09:00:09.000Z","actionId":"a5","data":{"type":"message","author":"customer","purpose":"input","text":"Уточнил у закупок: для этого этапа нужна только ссылка на выбранную лицензию.","sources":[],"handoffId":"h-tender"}},
+            {"seq":10,"at":"2026-11-26T09:00:10.000Z","actionId":"a6","data":{"type":"message","author":"manager","purpose":"answer","text":"Для этой закупки выбрана лицензия MDaemon на 20 пользователей: https://store.softline.ru/alt-n-technologies-ltd/-19576/","sources":[{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"}],"handoffId":"h-tender"}},
+            {"seq":11,"at":"2026-11-26T09:00:11.000Z","actionId":"a6","data":{"type":"handoff","handoff":{"handoffId":"h-tender","conversationId":"c-tender","reason":"tender","question":"Какой пакет документов требуется для закупки?","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}],"status":"resolved"}}}
+          ],
+          "nextAfter": 11,
+          "hasMore": false
+        }
+      },
+      {
+        "label": "Оператор получает те же итоговые события",
+        "role": "manager",
+        "operationId": "readEvents",
+        "params": {"conversationId":"c-tender","after":9},
+        "status": 200,
+        "response": {
+          "events": [
+            {"seq":10,"at":"2026-11-26T09:00:10.000Z","actionId":"a6","data":{"type":"message","author":"manager","purpose":"answer","text":"Для этой закупки выбрана лицензия MDaemon на 20 пользователей: https://store.softline.ru/alt-n-technologies-ltd/-19576/","sources":[{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"}],"handoffId":"h-tender"}},
+            {"seq":11,"at":"2026-11-26T09:00:11.000Z","actionId":"a6","data":{"type":"handoff","handoff":{"handoffId":"h-tender","conversationId":"c-tender","reason":"tender","question":"Какой пакет документов требуется для закупки?","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}],"status":"resolved"}}}
+          ],
+          "nextAfter": 11,
+          "hasMore": false
+        }
+      },
+      {
+        "label": "Завершённое обращение вышло из очереди",
+        "role": "manager",
+        "operationId": "listHandoffs",
+        "status": 200,
+        "response": {"items":[]}
       }
     ]
   },
@@ -253,7 +352,7 @@
         "operationId": "submitAction",
         "params": {"conversationId":"c-docs"},
         "key": "order",
-        "body": {"type":"message","text":"Выбрали MDaemon и коннектор Outlook для 20 пользователей. Нужен расчёт."},
+        "body": {"type":"message","text":"Выбрали MDaemon и коннектор Outlook для 20 пользователей. Нужен расчёт. Покупатель — юрлицо."},
         "status": 202,
         "response": {"conversationId":"c-docs","actionId":"d1"}
       },
@@ -265,9 +364,9 @@
         "status": 200,
         "response": {
           "events": [
-            {"seq":1,"at":"2026-11-26T09:00:01.000Z","actionId":"d1","data":{"type":"message","author":"customer","purpose":"input","text":"Выбрали MDaemon и коннектор Outlook для 20 пользователей. Нужен расчёт.","sources":[]}},
-            {"seq":2,"at":"2026-11-26T09:00:02.000Z","actionId":"d1","data":{"type":"quote","quote":{"quoteId":"q1","revision":1,"state":"needs_review","lines":[{"offerId":"19576","packages":1,"unitPriceKopecks":7755600},{"offerId":"359841","packages":1,"unitPriceKopecks":null}],"knownSubtotalKopecks":7755600,"totalKopecks":null,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}},
-            {"seq":3,"at":"2026-11-26T09:00:03.000Z","actionId":"d1","data":{"type":"handoff","handoff":{"handoffId":"h-line","conversationId":"c-docs","reason":"price_request","question":"Согласуйте цену одной упаковки коннектора для 20 пользователей.","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}],"status":"open","quoteLine":{"quoteId":"q1","revision":1,"offerId":"359841"}}}}
+            {"seq":1,"at":"2026-11-26T09:00:01.000Z","actionId":"d1","data":{"type":"message","author":"customer","purpose":"input","text":"Выбрали MDaemon и коннектор Outlook для 20 пользователей. Нужен расчёт. Покупатель — юрлицо.","sources":[]}},
+            {"seq":2,"at":"2026-11-26T09:00:02.000Z","actionId":"d1","data":{"type":"quote","quote":{"quoteId":"q1","revision":1,"state":"needs_review","lines":[{"offerId":"19576","packages":1,"unitPriceKopecks":7755600,"name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"}},{"offerId":"359841","packages":1,"unitPriceKopecks":null,"name":"MDaemon Connector for Outlook · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-359841/","label":"Карточка Softline"}}],"knownSubtotalKopecks":7755600,"totalKopecks":null,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}},
+            {"seq":3,"at":"2026-11-26T09:00:03.000Z","actionId":"d1","data":{"type":"handoff","handoff":{"handoffId":"h-line","conversationId":"c-docs","reason":"price_request","question":"Согласуйте цену одной упаковки коннектора для 20 пользователей.","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."},{"offerId":"359841","name":"MDaemon Connector for Outlook · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-359841/","label":"Карточка Softline"},"available":true,"priceState":"on_request","unitPriceKopecks":null,"licenseTerm":"12 мес."}],"status":"open","quoteLine":{"quoteId":"q1","revision":1,"offerId":"359841"}}}}
           ],
           "nextAfter": 3,
           "hasMore": false
@@ -301,8 +400,8 @@
         "status": 200,
         "response": {
           "events": [
-            {"seq":4,"at":"2026-11-26T09:00:04.000Z","actionId":"d2","data":{"type":"quote","quote":{"quoteId":"q1","revision":2,"state":"ready","lines":[{"offerId":"19576","packages":1,"unitPriceKopecks":7755600},{"offerId":"359841","packages":1,"unitPriceKopecks":3264300}],"knownSubtotalKopecks":11019900,"totalKopecks":11019900,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}},
-            {"seq":5,"at":"2026-11-26T09:00:05.000Z","actionId":"d2","data":{"type":"handoff","handoff":{"handoffId":"h-line","conversationId":"c-docs","reason":"price_request","question":"Согласуйте цену одной упаковки коннектора для 20 пользователей.","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}],"status":"resolved","quoteLine":{"quoteId":"q1","revision":1,"offerId":"359841"}}}}
+            {"seq":4,"at":"2026-11-26T09:00:04.000Z","actionId":"d2","data":{"type":"quote","quote":{"quoteId":"q1","revision":2,"state":"ready","lines":[{"offerId":"19576","packages":1,"unitPriceKopecks":7755600,"name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"}},{"offerId":"359841","packages":1,"unitPriceKopecks":3264300,"name":"MDaemon Connector for Outlook · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-359841/","label":"Карточка Softline"}}],"knownSubtotalKopecks":11019900,"totalKopecks":11019900,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}},
+            {"seq":5,"at":"2026-11-26T09:00:05.000Z","actionId":"d2","data":{"type":"handoff","handoff":{"handoffId":"h-line","conversationId":"c-docs","reason":"price_request","question":"Согласуйте цену одной упаковки коннектора для 20 пользователей.","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."},{"offerId":"359841","name":"MDaemon Connector for Outlook · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-359841/","label":"Карточка Softline"},"available":true,"priceState":"on_request","unitPriceKopecks":null,"licenseTerm":"12 мес."}],"status":"resolved","quoteLine":{"quoteId":"q1","revision":1,"offerId":"359841"}}}}
           ],
           "nextAfter": 5,
           "hasMore": false
@@ -350,7 +449,7 @@
         "status": 200,
         "response": {
           "events": [
-            {"seq":7,"at":"2026-11-26T09:00:07.000Z","actionId":"d4","data":{"type":"quote","quote":{"quoteId":"q1","revision":2,"state":"confirmed","lines":[{"offerId":"19576","packages":1,"unitPriceKopecks":7755600},{"offerId":"359841","packages":1,"unitPriceKopecks":3264300}],"knownSubtotalKopecks":11019900,"totalKopecks":11019900,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}}
+            {"seq":7,"at":"2026-11-26T09:00:07.000Z","actionId":"d4","data":{"type":"quote","quote":{"quoteId":"q1","revision":2,"state":"confirmed","lines":[{"offerId":"19576","packages":1,"unitPriceKopecks":7755600,"name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"}},{"offerId":"359841","packages":1,"unitPriceKopecks":3264300,"name":"MDaemon Connector for Outlook · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-359841/","label":"Карточка Softline"}}],"knownSubtotalKopecks":11019900,"totalKopecks":11019900,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}}
           ],
           "nextAfter": 7,
           "hasMore": false
@@ -375,7 +474,7 @@
         "response": {
           "events": [
             {"seq":8,"at":"2026-11-26T09:00:08.000Z","actionId":"d5","data":{"type":"message","author":"customer","purpose":"input","text":"Теперь нужно 40 мест для обоих продуктов.","sources":[]}},
-            {"seq":9,"at":"2026-11-26T09:00:09.000Z","actionId":"d5","data":{"type":"quote","quote":{"quoteId":"q1","revision":3,"state":"ready","lines":[{"offerId":"19578","packages":1,"unitPriceKopecks":9434100},{"offerId":"359843","packages":1,"unitPriceKopecks":5093300}],"knownSubtotalKopecks":14527400,"totalKopecks":14527400,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}}
+            {"seq":9,"at":"2026-11-26T09:00:09.000Z","actionId":"d5","data":{"type":"quote","quote":{"quoteId":"q1","revision":3,"state":"ready","lines":[{"offerId":"19578","packages":1,"unitPriceKopecks":9434100,"name":"MDaemon Messaging Server · 40 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19578/","label":"Карточка Softline"}},{"offerId":"359843","packages":1,"unitPriceKopecks":5093300,"name":"MDaemon Connector for Outlook · 40 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-359843/","label":"Карточка Softline"}}],"knownSubtotalKopecks":14527400,"totalKopecks":14527400,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}}
           ],
           "nextAfter": 9,
           "hasMore": false
@@ -390,6 +489,14 @@
         "body": {"type":"request_document","kind":"demo_invoice","quoteId":"q1","revision":2},
         "status": 409,
         "response": {"code":"stale_revision","message":"Откройте текущую ревизию."}
+      },
+      {
+        "label": "Ранее выданное КП доступно владельцу по сохранённой ссылке",
+        "role": "customer",
+        "operationId": "downloadDocument",
+        "params": {"documentId":"pdf-kp2"},
+        "status": 200,
+        "mediaType": "application/pdf"
       },
       {
         "label": "Новая ревизия ещё не подтверждена",
@@ -419,7 +526,7 @@
         "status": 200,
         "response": {
           "events": [
-            {"seq":10,"at":"2026-11-26T09:00:10.000Z","actionId":"d6","data":{"type":"quote","quote":{"quoteId":"q1","revision":3,"state":"confirmed","lines":[{"offerId":"19578","packages":1,"unitPriceKopecks":9434100},{"offerId":"359843","packages":1,"unitPriceKopecks":5093300}],"knownSubtotalKopecks":14527400,"totalKopecks":14527400,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}}
+            {"seq":10,"at":"2026-11-26T09:00:10.000Z","actionId":"d6","data":{"type":"quote","quote":{"quoteId":"q1","revision":3,"state":"confirmed","lines":[{"offerId":"19578","packages":1,"unitPriceKopecks":9434100,"name":"MDaemon Messaging Server · 40 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19578/","label":"Карточка Softline"}},{"offerId":"359843","packages":1,"unitPriceKopecks":5093300,"name":"MDaemon Connector for Outlook · 40 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-359843/","label":"Карточка Softline"}}],"knownSubtotalKopecks":14527400,"totalKopecks":14527400,"terms":{"taxNote":"Условие тестовой сделки: налог включён в сумму строк.","payment":"Предоплата по условиям тестовой сделки.","delivery":"Электронная поставка в срок, согласованный для демо: 3 рабочих дня.","validUntil":"2026-12-10"}}}}
           ],
           "nextAfter": 10,
           "hasMore": false
@@ -446,6 +553,16 @@
         "response": {"conversationId":"c-docs","actionId":"d7"}
       },
       {
+        "label": "Конкурентный запрос с новым ключом присоединяется к тому же выпуску",
+        "role": "customer",
+        "operationId": "submitAction",
+        "params": {"conversationId":"c-docs"},
+        "key": "bill-parallel",
+        "body": {"type":"request_document","kind":"demo_invoice","quoteId":"q1","revision":3},
+        "status": 202,
+        "response": {"conversationId":"c-docs","actionId":"d7"}
+      },
+      {
         "label": "Доступен документ текущей ревизии",
         "role": "customer",
         "operationId": "readEvents",
@@ -458,6 +575,34 @@
           "nextAfter": 11,
           "hasMore": false
         }
+      },
+      {
+        "label": "Новый ключ после выдачи сразу возвращает прежний файл",
+        "role": "customer",
+        "operationId": "submitAction",
+        "params": {"conversationId":"c-docs"},
+        "key": "get-existing-invoice",
+        "body": {"type":"request_document","kind":"demo_invoice","quoteId":"q1","revision":3},
+        "status": 200,
+        "response": {"documentId":"pdf-bill3","quoteId":"q1","revision":3,"kind":"demo_invoice","url":"/api/v1/documents/pdf-bill3"}
+      },
+      {
+        "label": "Первоначальный ключ после выдачи воспроизводит исходную квитанцию",
+        "role": "customer",
+        "operationId": "submitAction",
+        "params": {"conversationId":"c-docs"},
+        "key": "bill",
+        "body": {"type":"request_document","kind":"demo_invoice","quoteId":"q1","revision":3},
+        "status": 202,
+        "response": {"conversationId":"c-docs","actionId":"d7"}
+      },
+      {
+        "label": "Повторная выдача оставила историю без дублей",
+        "role": "customer",
+        "operationId": "readEvents",
+        "params": {"conversationId":"c-docs","after":11},
+        "status": 200,
+        "response": {"events":[],"nextAfter":11,"hasMore":false}
       },
       {
         "label": "Чужая сессия по прямому URL",
@@ -495,7 +640,7 @@
         "operationId": "submitAction",
         "params": {"conversationId":"c-need"},
         "key": "need",
-        "body": {"type":"message","text":"Нужен почтовый сервер для 20 человек на собственном Windows-сервере, покупка впервые, электронная поставка."},
+        "body": {"type":"message","text":"Нужен почтовый сервер для 20 человек на собственном Windows-сервере, покупка впервые, электронная поставка. Покупатель — юрлицо."},
         "status": 202,
         "response": {"conversationId":"c-need","actionId":"n1"}
       },
@@ -507,7 +652,7 @@
         "status": 200,
         "response": {
           "events": [
-            {"seq":1,"at":"2026-11-26T09:00:01.000Z","actionId":"n1","data":{"type":"message","author":"customer","purpose":"input","text":"Нужен почтовый сервер для 20 человек на собственном Windows-сервере, покупка впервые, электронная поставка.","sources":[]}},
+            {"seq":1,"at":"2026-11-26T09:00:01.000Z","actionId":"n1","data":{"type":"message","author":"customer","purpose":"input","text":"Нужен почтовый сервер для 20 человек на собственном Windows-сервере, покупка впервые, электронная поставка. Покупатель — юрлицо.","sources":[]}},
             {"seq":2,"at":"2026-11-26T09:00:02.000Z","actionId":"n1","data":{"type":"products","products":[{"offerId":"19576","name":"MDaemon Messaging Server · 20 пользователей","source":{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"},"available":true,"priceState":"listed","unitPriceKopecks":7755600,"licenseTerm":"12 мес."}]}},
             {"seq":3,"at":"2026-11-26T09:00:03.000Z","actionId":"n1","data":{"type":"message","author":"agent","purpose":"answer","text":"Для собственного Windows-сервера подходит электронная лицензия MDaemon на 20 пользователей. Нужна одна упаковка.","sources":[{"url":"https://store.softline.ru/alt-n-technologies-ltd/-19576/","label":"Карточка Softline"}]}}
           ],

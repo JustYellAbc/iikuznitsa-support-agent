@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Softline · чат покупателя и кабинет оператора
-  version: 0.1.0
+  version: 0.2.0
   description: Контракт команды для T04. Сервер определяет роль и область доступа по сессии стенда.
 servers:
   - url: /api/v1
@@ -28,6 +28,9 @@ paths:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/CustomerAction'}}}
       responses:
+        '200':
+          description: При новом запросе уже выданного документа сервер немедленно возвращает существующий файл.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Document'}}}
         '202': {$ref: '#/components/responses/Accepted'}
         default: {$ref: '#/components/responses/Error'}
   /conversations/{conversationId}/events:
@@ -38,7 +41,7 @@ paths:
       parameters:
         - in: query
           name: after
-          description: Вернуть события после этого seq по возрастанию. Ноль открывает историю с начала.
+          description: Курсор конкретного читателя. Ноль позволяет независимо прочитать историю с начала. Повтор страницы возвращает ранее записанные события с теми же seq.
           schema: {type: integer, minimum: 0, default: 0}
       responses:
         '200':
@@ -66,7 +69,7 @@ paths:
       - {in: path, name: handoffId, required: true, schema: {$ref: '#/components/schemas/Id'}}
     post:
       operationId: resolveHandoff
-      summary: Ответить покупателю или согласовать цену строки конкретной ревизии
+      summary: Задать вопрос в открытом обращении, завершить обращение ответом или согласовать цену строки
       parameters: [{$ref: '#/components/parameters/Key'}]
       requestBody:
         required: true
@@ -134,7 +137,10 @@ components:
         - type: object
           additionalProperties: false
           required: [type, text]
-          properties: {type: {const: message}, text: {$ref: '#/components/schemas/Text'}}
+          properties:
+            type: {const: message}
+            text: {$ref: '#/components/schemas/Text'}
+            handoffId: {$ref: '#/components/schemas/Id', description: При ответе оператору указывает открытое обращение этого диалога.}
         - type: object
           additionalProperties: false
           required: [type]
@@ -159,7 +165,9 @@ components:
         - type: object
           additionalProperties: false
           required: [type, reply]
-          properties: {type: {const: reply}, reply: {$ref: '#/components/schemas/Text'}}
+          properties:
+            type: {enum: [reply, close], description: reply продолжает переписку. close отправляет итоговый ответ и закрывает обращение.}
+            reply: {$ref: '#/components/schemas/Text'}
         - type: object
           additionalProperties: false
           required: [type, quoteId, revision, offerId, unitPriceKopecks]
@@ -204,9 +212,11 @@ components:
     QuoteLine:
       type: object
       additionalProperties: false
-      required: [offerId, packages, unitPriceKopecks]
+      required: [offerId, name, source, packages, unitPriceKopecks]
       properties:
         offerId: {$ref: '#/components/schemas/Id'}
+        name: {$ref: '#/components/schemas/Text', description: Название конкретной лицензии на момент расчёта.}
+        source: {$ref: '#/components/schemas/Source'}
         packages: {type: integer, minimum: 1}
         unitPriceKopecks: {oneOf: [{$ref: '#/components/schemas/Kopecks'}, {type: 'null'}]}
     CommercialTerms:
@@ -272,6 +282,7 @@ components:
                 purpose: {enum: [input, greeting, clarification, answer, notice]}
                 text: {$ref: '#/components/schemas/Text'}
                 sources: {type: array, items: {$ref: '#/components/schemas/Source'}}
+                handoffId: {$ref: '#/components/schemas/Id', description: Связывает вопрос или ответ с открытым обращением.}
             - type: object
               additionalProperties: false
               required: [type, products]
