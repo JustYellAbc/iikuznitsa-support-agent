@@ -31,8 +31,10 @@ def insert_offer(db, node, categories):
     def field(tag):
         return (node.findtext(tag) or "").strip()
 
+    raw_params = defaultdict(list)
     params = defaultdict(list)
     for item in node.findall("param"):
+        raw_params[item.attrib["name"]].append(item.text or "")
         value = (item.text or "").strip()
         if item.get("name") == "Срок действия" and value.casefold() in {"не определено", "мес."}:
             continue
@@ -40,6 +42,7 @@ def insert_offer(db, node, categories):
             params[item.attrib["name"]].append(value)
     details = {child.tag: child.text.strip() for child in node
                if child.tag != "param" and child.text and child.text.strip()}
+    details["raw_params"] = raw_params
     available = {"true": 1, "false": 0}.get(node.get("available"))
     price = field("price")
     try:
@@ -120,7 +123,7 @@ def catalog_lookup(query, expression):
     for name, marker in (
         ("connector for outlook", r"outlook|коннектор|connector"),
         ("activesync", r"activesync"),
-        ("security gateway", r"security gateway"),
+        ("security gateway", r"security\s*gateway"),
         ("antivirus", r"antivirus|антивирус"),
     ):
         if re.search(r"\b(?:" + marker + r")\b", query, re.IGNORECASE):
