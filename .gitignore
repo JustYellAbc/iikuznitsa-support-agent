@@ -23,3 +23,18 @@ __pycache__/
 .pytest_cache/
 .next/
 /dist/
+
+# Runtime data, databases, partner feeds and generated documents
+/data/
+/data_raw/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+*.xml
+*.xml.gz
+*.gz
+*.zip
+*.pdf
+*.egg-info/
+.ruff_cache/

@@ -1,0 +1,17 @@
+.git
+.venv
+.env
+.env.*
+data
+data_raw
+frontend
+docs
+tests
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+*.db
+*.xml
+*.gz
+*.zip
+*.pdf
