@@ -256,7 +256,7 @@ def _lookup(db: sqlite3.Connection, selection: Selection) -> tuple[list, str]:
     return (candidates(near), near[0]) if near else ([], "")
 
 
-def _product(row) -> Product:
+def offer_product(row) -> Product:
     params = row["params"]
     terms = params.get("Срок действия", [])
     return Product.from_catalog(
@@ -379,7 +379,7 @@ def select(index: Path, selection: Selection) -> Result:
             questions.append("Подписка ещё действует или уже истекла?")
     if questions:
         return result(prefix + " ".join(questions), sources=[source])
-    products = [_product(r) for r in rows[:3]]
+    products = [offer_product(r) for r in rows[:3]]
     if len(rows) != 1:
         options = "; ".join(f"{p.name} (ID {p.offerId})" for p in products)
         return result(

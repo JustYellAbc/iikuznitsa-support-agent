@@ -45,6 +45,8 @@ def index(tmp_path):
             "Тип лицензии": kind,
             "Пользователь": "Юрлицо",
             "Срок действия": "12 мес.",
+            "Версия": "Pro 9" if code == "desk" else None,
+            "Способ доставки": "Электронный" if code == "desk" else None,
         }.items():
             if value:
                 ET.SubElement(row, "param", name=key).text = value
@@ -72,9 +74,9 @@ def test_selection_survives_multiple_turns_and_reaches_manager(stand_api, index)
     _, cards, answer = say(api, cid, "Покупаем впервые")
     [p] = cards["products"]
     assert (p["offerId"], p["unitPriceKopecks"], p["licenseTerm"]) == ("new20", 123456, "12 мес.")
-    assert (
-        answer["sources"] == [p["source"]] and "1 234,56 ₽" in answer["text"] and "проверки условий" in answer["text"]
-    )
+    assert answer["text"] == OFFER_HELP
+    [ref] = answer["sources"]
+    assert ref["url"] == p["source"]["url"] and "12 мес" in ref["label"] and "право использования" in ref["label"]
     say(api, cid, "Закупка тендерная, нужны документы")
     api.login()
     [handoff] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]

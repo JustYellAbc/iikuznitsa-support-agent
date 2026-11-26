@@ -1,0 +1,90 @@
+import sqlite3
+
+import pytest
+from tests.conftest import api as stand_api  # noqa: F401
+from tests.conftest import client as client
+from tests.conftest import env as env
+
+from app.agent.handoff import OFFER_HELP
+from app.agent.product_answers import DELIVERY_GUIDE
+from app.agent.test_catalog_selection import index as index
+from app.agent.test_catalog_selection import say
+
+
+def test_known_facts_follow_the_selected_offer_and_keep_selection(stand_api, index):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    question = "Какая версия и как доставляется лицензия?"
+    assert "артикул" in say(api, cid, question)[-1]["text"]
+    answer = say(api, cid, "SKU desk")[-1]
+    assert answer["purpose"] == "answer"
+    assert all(word in answer["text"] for word in ("Pro 9", "Электронный", "электронной почте"))
+    assert [s["url"] for s in answer["sources"]] == ["https://example.org/store/desk", DELIVERY_GUIDE]
+    changed = say(api, cid, "Какая версия у Widget Server?")[-1]
+    assert changed["text"] == OFFER_HELP and "Pro 9" not in str(changed)
+    assert changed["sources"][0]["url"].endswith("/verify")
+
+
+def test_partial_answer_offers_real_handoff_and_preserves_original_question(stand_api, index):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    say(api, cid, "Нужен MDaemon на 20 пользователей")
+    say(api, cid, "Для компании, впервые")
+    question = "Что точно входит на год? Можно ли пользоваться после?"
+    answer = say(api, cid, question)[-1]
+    assert answer["text"] == OFFER_HELP
+    [ref] = answer["sources"]
+    assert "12 мес" in ref["label"] and "право использования" in ref["label"] and ref["url"].endswith("/new20")
+    api.login()
+    assert api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] == []
+    say(api, cid, "Да")
+    [card] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+    assert (card["question"], card["reason"], card["products"][0]["offerId"]) == (
+        question,
+        "insufficient_evidence",
+        "new20",
+    )
+
+
+def test_fact_questions_do_not_reset_the_purchase_parameters(stand_api, index):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    say(api, cid, "Нужен MDaemon на 20 пользователей")
+    say(api, cid, "Для компании, впервые")
+    answer = say(api, cid, "Какой тип лицензии?")[-1]
+    assert "Полная версия" in answer["text"]
+    changed = say(api, cid, "Продлеваем, подписка действует. Позовите оператора.")[-1]["handoff"]
+    assert [p["offerId"] for p in changed["products"]] == ["renew"]
+
+
+@pytest.mark.parametrize(
+    "question,fragment",
+    [
+        ("Как получить электронный ключ?", "электронной почте"),
+        ("Как происходит доставка оборудования?", "адрес"),
+    ],
+)
+def test_general_delivery_uses_the_matching_article(stand_api, index, question, fragment):  # noqa: F811
+    cid = stand_api.new_conversation()
+    response = say(stand_api, cid, question)[-1]
+    assert response["purpose"] == "answer" and fragment in response["text"]
+    assert [s["url"] for s in response["sources"]] == [DELIVERY_GUIDE]
+
+
+def test_compatibility_and_order_status_cannot_be_inferred_from_delivery_method(stand_api, index):  # noqa: F811
+    cid = stand_api.new_conversation()
+    say(stand_api, cid, "SKU desk")
+    for question, label in [("Совместим ли с Windows?", "совместимость"), ("Когда придёт мой заказ?", "состояние")]:
+        msg = say(stand_api, cid, question)[-1]
+        assert msg["text"] == OFFER_HELP
+        assert msg["sources"][0]["url"].endswith("/desk") and label in msg["sources"][0]["label"]
+
+
+def test_missing_knowledge_article_does_not_supply_delivery_instructions(stand_api, index):  # noqa: F811
+    with sqlite3.connect(index) as db:
+        db.execute("DELETE FROM knowledge WHERE source = ?", (DELIVERY_GUIDE,))
+    cid = stand_api.new_conversation()
+    say(stand_api, cid, "SKU desk")
+    msg = say(stand_api, cid, "Как доставляется лицензия?")[-1]
+    assert "Электронный" in msg["text"] and "почте" not in str(msg)
+    assert [ref["url"] for ref in msg["sources"]] == ["https://example.org/store/desk"]

@@ -30,12 +30,14 @@ from app.agent.catalog_selection import Selection, named_request, select, select
 from app.agent.handoff import (
     CONFIRMED,
     HUMAN_REQUEST,
+    OFFER_HELP,
     ActionType,
     SearchFinding,
     bare_request,
     handoff_reason,
     route_action,
 )
+from app.agent.product_answers import answer_facts, question_target, topics_for
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Session, StepTrace
 from app.contracts.t04 import Product
@@ -82,19 +84,40 @@ async def run_turn(
     previous = None
     suggestion = ""
     options = []
+    pending_question = ""
     if history and search_text:
         turns = await list_turns(session.id)
-        if turns and turns[-1].steps and turns[-1].steps[0].tool == "catalog_search":
-            args = turns[-1].steps[0].args
-            previous = Selection(**args["selection"])
-            suggestion = args.get("suggested_name", "")
-            options = args.get("options", [])
+        if turns and turns[-1].decision == "answer" and turns[-1].steps:
+            pending_question = turns[-1].steps[-1].args.get("awaiting_product_for", "")
+        for turn in reversed(turns):
+            if not turn.steps:
+                break
+            step = turn.steps[0]
+            if step.tool == "product_facts" and turn.decision == "answer":
+                continue
+            if step.tool == "catalog_search":
+                args = step.args
+                previous = Selection(**args["selection"])
+                suggestion = args.get("suggested_name", "")
+                options = args.get("options", [])
+            break
 
+    topics = topics_for(user_text, bool(products)) if not route else set()
     selected = selection_for(search_text, previous, suggestion, options) if search_text else None
+    if topics:
+        target = question_target(user_text)
+        if target is None:
+            selected = None
+        elif selected is None or selected.name.casefold() != target.name.casefold():
+            selected = target.qualifiers(user_text, followup=False)
+    fact_question = user_text
+    if pending_question and selected and not route and not topics:
+        fact_question = pending_question
+        topics = topics_for(fact_question, True)
     hit = None
     steps = []
+    index = get_settings().data_dir / "private" / "catalog.sqlite3"
     if selected:
-        index = get_settings().data_dir / "private" / "catalog.sqlite3"
         hit = await asyncio.to_thread(select, index, selected)
         steps.append(
             StepTrace(
@@ -109,6 +132,22 @@ async def run_turn(
     # Price/availability decisions must use products from the current search when present.
     if not route and (not hit or hit.purpose == "answer"):
         route = route_action(history, user_text, products, action_type=action_type, finding=finding)
+    if topics and (not hit or hit.purpose == "answer") and (not route or route.offer_help):
+        hit = await asyncio.to_thread(answer_facts, index, fact_question, topics, products)
+        route = None
+        steps.append(
+            StepTrace(
+                tool="product_facts",
+                args={"topics": sorted(topics), "offers": [p.offerId for p in products]},
+                source_ref=hit.evidence.source_ref,
+                result_summary=hit.text if not hit.sources else f"{hit.text} {hit.sources[0].label}"[:450],
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        )
+        if hit.purpose == "clarification" and not hit.sources and len(products) != 1:
+            steps[-1].args["awaiting_product_for"] = fact_question
+    elif topics and hit and hit.purpose == "clarification" and hit.text != OFFER_HELP and not route:
+        steps[-1].args["awaiting_product_for"] = fact_question
     if route:
         steps.append(
             StepTrace(
@@ -121,6 +160,9 @@ async def run_turn(
         for step in steps:
             await emit_step(step)
         escalate = route is not None and not route.clarification
+        published_products = []
+        if hit and (selected or hit.products != products):
+            published_products = products if route else hit.products
         return AgentReply(
             turn=AgentTurn(
                 turn_id=new_id("turn"),
@@ -133,7 +175,7 @@ async def run_turn(
             ),
             text=(route.clarification or CONFIRMED) if route else hit.text,
             purpose=("notice" if escalate else "clarification") if route else hit.purpose,
-            products=products if hit else [],
+            products=published_products,
             sources=hit.sources if hit else [],
             handoff=HandoffRequest(reason=route.reason, question=route.question, products=products)
             if escalate
