@@ -22,6 +22,19 @@ cd backend && ../.venv/bin/uvicorn app.main:app --reload   # .env читаетс
 
 С `MOCK_LLM=true` стенд работает без ключа и без трат: ответ модели заменяет заглушка, токены оцениваются по длине текста, стоимость считается по прайсу из `.env`.
 
+## Деплой стенда
+
+Стенд: https://139-100-217-243.sslip.io (Selectel ru-1, код в `/opt/stand`). Деплой `main` запускается вручную: Actions → **Deploy stand** → Run workflow. Workflow прогоняет `ruff check` и `pytest`, затем по SSH делает в `/opt/stand` `git fetch origin main && git checkout main && git reset --hard origin/main` и `docker compose up -d --build --remove-orphans`, после чего проверяет `/health`. `git clean` не выполняется: `.env` и `./data` переживают деплой.
+
+Секреты репозитория (Settings → Secrets and variables → Actions):
+
+| Секрет | Значение |
+|---|---|
+| `DEPLOY_HOST` | `139.100.217.243` |
+| `DEPLOY_USER` | `deploy` — отдельный пользователь в группе `docker`, ключ в `authorized_keys` с `restrict` |
+| `DEPLOY_SSH_KEY` | приватный ключ ed25519, выпущенный только для GitHub Actions |
+| `DEPLOY_KNOWN_HOSTS` | строка `ssh-keyscan -t ed25519 139.100.217.243` (необязательно, без неё ключ хоста принимается при первом подключении) |
+
 ## Архитектура
 
 ```
