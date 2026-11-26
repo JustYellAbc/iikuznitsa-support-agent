@@ -1,6 +1,10 @@
 "use strict";
 
 const $ = id => document.getElementById(id);
+function newKey() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+}
 const reasons = {
   customer_request: "Запрос оператора", tender: "Тендерная закупка", price_request: "Запрос цены",
   availability: "Проверка доступности", outside_catalog: "Вне каталога", special_terms: "Особые условия",
@@ -205,7 +209,7 @@ $("login").onsubmit = async e => {
   button.disabled = true;
   $("login-error").textContent = "";
   try {
-    await request("/auth/manager/login", Object.fromEntries(new FormData(form)), crypto.randomUUID());
+    await request("/auth/manager/login", Object.fromEntries(new FormData(form)), newKey());
     form.reset();
     await refresh();
   } catch (error) {
@@ -225,7 +229,7 @@ $("compose").onsubmit = async e => {
   if (!selected) return;
   const id = selected.handoffId, state = draft(id);
   if (state.busy || !state.text.trim()) return;
-  state.pending ??= { key: crypto.randomUUID(), body: { type: e.submitter?.value || "reply", reply: state.text.trim() } };
+  state.pending ??= { key: newKey(), body: { type: e.submitter?.value || "reply", reply: state.text.trim() } };
   state.busy = true;
   state.notice = "Отправка…";
   showComposer();

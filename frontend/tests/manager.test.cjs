@@ -15,7 +15,11 @@ import socket, sys, uvicorn
 from pathlib import Path
 sys.path.insert(0, str(Path("backend").resolve()))
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from app.main import app
+@app.get("/manager")
+def manager_without_redirect():
+    return FileResponse("frontend/manager/index.html")
 app.mount("/manager", StaticFiles(directory="frontend/manager", html=True))
 app.mount("/chat", StaticFiles(directory="frontend/chat", html=True))
 sock = socket.socket()
@@ -46,6 +50,7 @@ test("Менеджер уточняет и закрывает обращение
   t.after(() => browser.close());
   const customer = await browser.newContext({ baseURL });
   const manager = await browser.newContext({ baseURL });
+  await manager.addInitScript(() => Object.defineProperty(crypto, "randomUUID", { value: undefined }));
   const page = await manager.newPage();
   const chat = await customer.newPage();
   const errorLog = [];
@@ -59,7 +64,9 @@ test("Менеджер уточняет и закрывает обращение
   await message.fill("Закупка тендерная, нужны документы");
   await sendMessage.click();
   await chatHistory.getByText("Обращение передано оператору", { exact: true }).waitFor();
-  await page.goto("/manager/");
+  await page.goto("/manager");
+  assert.equal(new URL(page.url()).pathname, "/manager");
+  assert.equal(await page.locator('link[rel="stylesheet"]').evaluate(link => Boolean(link.sheet)), true);
   await page.getByLabel("Логин").fill("manager");
   await page.getByLabel("Пароль").fill(password);
   await page.getByRole("button", { name: "Войти" }).click();
