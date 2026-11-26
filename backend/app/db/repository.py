@@ -193,12 +193,26 @@ async def count_agent_inputs(conversation_id: str) -> int:
 
 
 async def last_products(conversation_id: str) -> list[dict[str, Any]]:
-    value = await get_db().fetchval(
-        "SELECT data FROM events WHERE conversation_id = ? AND json_extract(data, '$.type') = 'products' "
-        "ORDER BY seq DESC LIMIT 1",
-        (conversation_id,),
+    # A published new search supersedes the old selection even when it only asks a question.
+    # A pending pilot draft has no published answer/clarification and does not change it.
+    row = await get_db().fetchone(
+        """WITH searches AS (
+               SELECT json_extract(s.value, '$.args.journal_action_id') AS action_id
+               FROM turns t, json_each(t.steps) s
+               WHERE t.session_id = ? AND json_extract(s.value, '$.tool') = 'catalog_search'
+           ), latest AS (
+               SELECT action_id FROM events WHERE conversation_id = ? AND (
+                   json_extract(data, '$.type') = 'products' OR
+                   (action_id IN (SELECT action_id FROM searches)
+                    AND json_extract(data, '$.author') = 'agent'
+                    AND json_extract(data, '$.purpose') IN ('answer','clarification'))
+               ) ORDER BY seq DESC LIMIT 1
+           )
+           SELECT data FROM events WHERE conversation_id = ? AND action_id = (SELECT action_id FROM latest)
+           AND json_extract(data, '$.type') = 'products' ORDER BY seq DESC LIMIT 1""",
+        (conversation_id, conversation_id, conversation_id),
     )
-    return json.loads(value)["products"] if value else []
+    return json.loads(row["data"])["products"] if row else []
 
 
 _ROLE_BY_AUTHOR = {"customer": "client", "agent": "agent", "manager": "operator"}

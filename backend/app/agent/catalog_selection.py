@@ -1,0 +1,398 @@
+"""Named-product selection against the private SQLite index built by T06."""
+
+import json
+import re
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass, replace
+from difflib import get_close_matches
+from pathlib import Path
+
+from app.agent.handoff import AFFIRMATIVE, OFFER_HELP
+from app.contracts.schemas import ToolResult
+from app.contracts.t04 import Product, Source
+
+WORD = re.compile(r"[^\W_]+")
+MDAEMON = re.compile(r"\b(?:mda?e?mo?n|mdeamon|мд[еэ]й?мон|мдаймон|эмдеймон)\b", re.I)
+SEATS = re.compile(r"\b(\d{1,9})\s*[- ]?\s*(?:пользоват|человек|сотрудник|рабочи[хе] мест|мест|users?|seats?)", re.I)
+CODE = re.compile(r"\b(?:артикул|offerid|sku|код товара|id)\s*[:#№-]?\s*([\w.-]+)", re.I)
+NAMED = re.compile(r"\b(?:ищу|найти|нуж(?:ен|на|но)|подберите|купить|купим|интересует|сколько стоит)\s+", re.I)
+LATIN = re.compile(r"\b[a-z][a-z0-9.+-]*(?:\s+[a-z][a-z0-9.+-]*)*", re.I | re.ASCII)
+STOP_NAME = re.compile(
+    r"[,;!?]|\.\s|\s+(?:на|для|в редакции|по цене|лицензи\w*|купить|сколько|покупа\w*|продл\w*)\b", re.I
+)
+BUYER = "Пользователь"
+KIND = "Тип лицензии"
+CAPACITY = "К-во пользователей до"
+LIMIT = 200
+
+
+@dataclass
+class Selection:
+    name: str
+    code: bool = False
+    standard: bool = False
+    seats: int | None = None
+    buyer: str = ""
+    kind: str = ""
+    expired: bool | None = None
+    perpetual: bool = False
+    months: int | None = None
+    organization: str = ""
+    edition: str = ""
+
+    def qualifiers(self, text: str, *, followup: bool) -> "Selection":
+        updated = replace(self)
+        s = text.casefold()
+        edition = re.search(r"\b(?:в редакции|редакция|редакцию)\s+[«\"]?([\w.-]+)", s)
+        if edition and not (updated.standard and edition[1] in {"standard", "стандарт"}):
+            updated.edition = edition[1].strip(".")
+        count = SEATS.search(s)
+        if count:
+            updated.seats = int(count[1])
+        elif followup and re.fullmatch(r"\s*\d{1,9}[.! ]*", s):
+            updated.seats = int(s.strip(" .!"))
+        if re.search(r"физ\s*лиц|физическ\w* лиц|частн\w* лиц|для себя", s):
+            updated.buyer = "Физлицо"
+        elif re.search(r"юр[. ]*лиц|юридическ\w* лиц|организаци|компани|предприяти|\bооо\b", s):
+            updated.buyer = "Юрлицо"
+        for pattern, category in (
+            (r"некоммерческ|\bнко\b", "Некоммерческая"),
+            (r"учебн|академич|образовательн", "Академическая"),
+            (r"государственн|госучрежден|госорганизац", "Государственная"),
+            (r"коммерческ", "Коммерческая"),
+        ):
+            if re.search(pattern, s):
+                updated.organization = category
+                break
+        duration = re.search(r"\b(\d{1,3})\s*(мес(?:яц(?:а|ев|ы)?)?\.?|года?|лет)\b", s)
+        if duration:
+            updated.months = int(duration[1]) * (1 if duration[2].startswith("мес") else 12)
+        elif re.search(r"\bна год\b", s):
+            updated.months = 12
+        if re.search(r"впервые|в первый раз|нов(?:ая|ую) (?:покупк|лицензи)|полная версия|перв(?:ая|ую) покупк", s):
+            updated.kind = "Полная версия"
+        elif re.search(r"продл(?:ить|ить бы|ев|ен|ён|ять)|продле", s):
+            updated.kind = "Продление"
+        elif followup and re.fullmatch(r"(?:новая|новую|первичная|первый раз)[.! ]*", s):
+            updated.kind = "Полная версия"
+        if re.search(r"не (?:истек|истёк|истекла|просроч)|ещ[её] действ|\bдействует\b|действующ|активная", s):
+            updated.expired = False
+        elif re.search(r"просроч|истек|истёк|закончилась|истекла", s):
+            updated.expired = True
+        updated.perpetual |= bool(re.search(r"навсегда|бессроч|после окончани", s))
+        return updated
+
+
+def named_request(text: str) -> Selection | None:
+    code = CODE.search(text)
+    if code or re.fullmatch(r"\d{4,12}", text.strip()):
+        return Selection(code[1].rstrip(".") if code else text.strip(), code=True)
+    match = MDAEMON.search(text)
+    if match:
+        suffix = text[match.end() :].strip(" ,.-")
+        standard = bool(re.search(r"\b(?:standard|стандарт)\b", text, re.I))
+        name = "MDaemon Messaging Server"
+        for pattern, product in (
+            (r"security\s*gateway|почтов\w* шлюз", "Security Gateway"),
+            (r"outlook|коннектор|connector", "Connector for Outlook"),
+            (r"activesync", "ActiveSync"),
+            (r"antivirus|антивирус", "Antivirus"),
+        ):
+            if re.search(pattern, text, re.I):
+                name = "MDaemon " + product
+                break
+        else:
+            # An explicitly different edition/version must survive lookup.
+            suffix = re.sub(r"^(?:messaging server|standard|стандарт)\b", "", suffix, flags=re.I).lstrip()
+            tail = re.match(r"([a-z][a-z0-9.-]*|v?\d+\.\d+)\b", suffix, re.I | re.ASCII)
+            if tail:
+                name += " " + tail[1]
+        return Selection(name, standard=standard)
+    quoted = re.search(r'[«"]([^»"]{2,100})[»"]', text)
+    intent = NAMED.search(text)
+    request_name = re.sub(r"^лицензи[яюи]\s+(?:на|для)\s+", "", text[intent.end() :], flags=re.I) if intent else ""
+    head = STOP_NAME.split(request_name, maxsplit=1)[0].strip(" .") if intent else text.strip(" .")
+    latin = LATIN.search(head)
+    if quoted:
+        name = quoted[1]
+    elif re.search(r"[а-яё]-?\d", head, re.I) and len(head) <= 80:
+        name = head
+    elif latin:
+        name = latin[0].strip(" .")
+    elif intent:
+        name = head
+    elif re.fullmatch(r"[а-яё][а-яё-]{3,}", head, re.I) and not re.fullmatch(
+        r"здравствуйте|привет|спасибо|оператор|менеджер|повтор|впервые|конечно|нет|согласен|помогите", head, re.I
+    ):
+        name = text.strip()
+    else:
+        return None
+    if (
+        not name
+        or len(name) > 100
+        or name.casefold()
+        in {
+            "по",
+            "помощь",
+            "счёт",
+            "счет",
+            "лицензия",
+            "что-то",
+            "программа",
+            "решение",
+            "почтовый сервер",
+            "корпоративная почта",
+            "антивирус",
+            "защита почты",
+        }
+    ):
+        return None
+    return Selection(name)
+
+
+def selection_for(text: str, previous: Selection | None, suggestion: str = "", options=()) -> Selection | None:
+    found = named_request(text)
+    if previous:
+        updated = previous.qualifiers(text, followup=True)
+        ordinal = re.fullmatch(
+            r"(?:бер[её]м\s+)?(перв|втор|трет)[а-яё]*(?:\s+(?:вариант|позицию))?[.! ]*", text.strip().casefold()
+        )
+        if ordinal and options:
+            i = ("перв", "втор", "трет").index(ordinal[1])
+            if i < len(options):
+                return replace(updated, name=options[i], code=True)
+        if found and found.code and found.name in options:
+            return replace(updated, name=found.name, code=True)
+        if found and SEATS.match(found.name):
+            return updated
+        if re.fullmatch(r"v\d+(?:\.\d+)*", text.strip(), re.I):
+            return replace(updated, edition=text.strip().casefold())
+        if suggestion and AFFIRMATIVE.fullmatch(text.strip().casefold()):
+            return replace(updated, name=suggestion)
+        if found is None or found.name.casefold() == previous.name.casefold():
+            if updated != previous or found or re.fullmatch(r"\s*\d{1,9}[.! ]*", text):
+                if found:
+                    updated.standard |= found.standard
+                return updated
+        # A standalone answer such as «Компания» can resemble a Russian product name.
+        if Selection("").qualifiers(text, followup=True) != Selection("") and not (
+            MDAEMON.search(text) or LATIN.search(text) or CODE.search(text) or NAMED.search(text)
+        ):
+            return updated
+    return found.qualifiers(text, followup=False) if found else None
+
+
+@dataclass
+class Result:
+    text: str
+    purpose: str
+    products: list[Product]
+    sources: list[Source]
+    evidence: ToolResult
+    suggestion: str = ""
+
+
+def result(text: str, purpose: str = "clarification", products=(), *, sources=()) -> Result:
+    products = list(products)
+    refs = list(sources) or [p.source for p in products]
+    evidence = ToolResult(ok=bool(refs), source_ref=refs[0].url if refs else None, data=[p.offerId for p in products])
+    return Result(text, purpose, products, refs, evidence)
+
+
+def _lookup(db: sqlite3.Connection, selection: Selection) -> tuple[list, str]:
+    fields = (
+        "o.id,o.name,o.source,o.available,o.currency,o.price,o.price_state,o.params,o.edition,"
+        "json_extract(o.details,'$.sales_notes') AS sales_notes"
+    )
+    if selection.code or re.fullmatch(r"(?=\S*\d)[a-zA-Z0-9.-]+", selection.name):
+        rows = db.execute(
+            f"SELECT {fields} FROM offers o WHERE o.id=? OR o.vendor_code=? LIMIT ?",
+            (selection.name, selection.name, LIMIT + 1),
+        )
+        exact = rows.fetchall()
+        if exact or selection.code:
+            return exact, ""
+    words = WORD.findall(selection.name.casefold())
+    if not words or len(words) > 12:
+        return [], ""
+
+    def candidates(tokens):
+        expr = " AND ".join(f'name:"{token}"*' for token in tokens)
+        if selection.edition:
+            expr += "".join(f' AND "{token}"*' for token in WORD.findall(selection.edition))
+        return db.execute(
+            f"SELECT {fields} FROM products JOIN offers o ON o.rowid=products.rowid "
+            "WHERE products MATCH ? ORDER BY bm25(products),o.id LIMIT ?",
+            (expr, LIMIT + 1),
+        ).fetchall()
+
+    rows = candidates(words)
+    if rows or len(words) != 1 or len(words[0]) < 5:
+        return rows, ""
+    # Category labels are the feed's own vocabulary. A fuzzy hit is an alternative, never an exact SKU.
+    vocabulary = {
+        w
+        for row in db.execute("SELECT name FROM categories")
+        for w in WORD.findall(row[0].casefold())
+        if abs(len(w) - len(words[0])) <= 2 and w[:1] == words[0][:1]
+    }
+    near = get_close_matches(words[0], sorted(vocabulary), n=1, cutoff=0.80)
+    return (candidates(near), near[0]) if near else ([], "")
+
+
+def _product(row) -> Product:
+    params = row["params"]
+    terms = params.get("Срок действия", [])
+    return Product.from_catalog(
+        row["id"],
+        row["name"],
+        row["source"],
+        row["available"] == 1,
+        None if row["price_state"] == "request_price" else row["price"],
+        terms[0] if len(terms) == 1 else None,
+    )
+
+
+def select(index: Path, selection: Selection) -> Result:
+    if not index.is_file():
+        missing = result(OFFER_HELP)
+        missing.evidence.error = "catalog_index_missing"
+        return missing
+    with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        records, correction = _lookup(db, selection)
+    rows = []
+    for record in records:
+        row = dict(record)
+        if row["source"].startswith("https://") and row["currency"] in ("RUB", "RUR"):
+            row["params"] = json.loads(row["params"])
+            rows.append(row)
+    if not rows:
+        return result(OFFER_HELP)
+    source = Source(url=rows[0]["source"], label=rows[0]["name"])
+    if len(records) > LIMIT:
+        return result(
+            f"По названию «{selection.name}» много вариантов. Уточните название редакции или артикул из карточки.",
+            sources=[source],
+        )
+
+    def values(key):
+        return {
+            v for r in rows for v in r["params"].get(key, []) if v.casefold() not in {"не определено", "не указано"}
+        }
+
+    # Known constraints are applied before deciding what still needs clarification.
+    if selection.buyer:
+        buyers = values(BUYER)
+        if buyers and selection.buyer not in buyers:
+            source = Source(url=source.url, label="В карточках указан тип покупателя: " + ", ".join(sorted(buyers)))
+        rows = [r for r in rows if selection.buyer in r["params"].get(BUYER, [])]
+    if selection.kind:
+        rows = [r for r in rows if selection.kind in r["params"].get(KIND, [])]
+    if selection.organization:
+        rows = [r for r in rows if selection.organization in r["params"].get("Тип организации", [])]
+    if selection.edition:
+        rows = [
+            r for r in rows if selection.edition in WORD.findall(((r["edition"] or "") + " " + r["name"]).casefold())
+        ]
+    if selection.months is not None:
+        rows = [
+            r
+            for r in rows
+            if any(re.fullmatch(rf"{selection.months}\s*мес\.?", v, re.I) for v in r["params"].get("Срок действия", []))
+        ]
+    if selection.seats is not None:
+        sized = [
+            (int(v), r)
+            for r in rows
+            for v in r["params"].get(CAPACITY, [])
+            if v.isdecimal()
+            and int(v) >= selection.seats > 0
+            and all(
+                lb.isdecimal() and int(lb) <= selection.seats for lb in r["params"].get("К-во пользователей от", [])
+            )
+        ]
+        if sized:
+            smallest = min(n for n, _ in sized)
+            rows = [r for n, r in sized if n == smallest]
+        else:
+            rows = []
+    if not rows:
+        return result(OFFER_HELP, sources=[source])
+    source = Source(url=rows[0]["source"], label=rows[0]["name"])
+    if correction:
+        alternative = result(
+            f"Точного совпадения нет. Ближайшее название в каталоге — «{correction}». Это нужное семейство?",
+            sources=[source],
+        )
+        alternative.suggestion = correction
+        return alternative
+    prefix = (
+        f"По коду «{selection.name}» нашёл позицию в каталоге. "
+        if selection.code
+        else (f"По названию нашёл в каталоге семейство «{selection.name}». ")
+    )
+    if selection.standard:
+        prefix += "Карточки относятся к семейству Messaging Server. Соответствие редакции Standard не подтверждено. "
+        prefix += "Для проверки совместимости укажите версию установленной лицензии. "
+    questions = []
+    if not selection.code:
+        if selection.seats is None and len(values(CAPACITY)) > 1:
+            questions.append("На сколько пользователей нужна лицензия?")
+        if not selection.buyer and values(BUYER) and (len(rows) > 1 or selection.name.startswith("MDaemon")):
+            questions.append("На кого оформляется лицензия — на организацию или физлицо?")
+        if not selection.kind and {"Полная версия", "Продление"} <= values(KIND):
+            questions.append("Покупаете впервые или продлеваете лицензию?")
+        if not selection.organization and len(values("Тип организации")) > 1:
+            questions.append(
+                "Какой тип организации? В карточках есть варианты: "
+                + ", ".join(sorted(values("Тип организации")))
+                + "."
+            )
+        if selection.months is None and len(values("Срок действия")) > 1:
+            questions.append(
+                "Какой нужен срок лицензии? Варианты: " + ", ".join(sorted(values("Срок действия"))[:6]) + "."
+            )
+    expired = {r["id"] for r in rows if "просроч" in r["name"].casefold()}
+    if selection.kind == "Продление":
+        if selection.expired is not None:
+            rows = [r for r in rows if (r["id"] in expired) == selection.expired]
+            if not rows:
+                return result(OFFER_HELP, sources=[source])
+        elif expired and len(expired) < len(rows):
+            questions.append("Подписка ещё действует или уже истекла?")
+    if questions:
+        return result(prefix + " ".join(questions), sources=[source])
+    products = [_product(r) for r in rows[:3]]
+    if len(rows) != 1:
+        options = "; ".join(f"{p.name} (ID {p.offerId})" for p in products)
+        return result(
+            prefix + f"Подходят несколько позиций: {options}. Уточните нужный вариант или его ID.", products=products
+        )
+    p = products[0]
+    parts = [prefix + p.name.rstrip(".") + "."]
+    if selection.kind:
+        parts.append(f"Тип лицензии по карточке — «{selection.kind}».")
+    if rows[0]["edition"]:
+        parts.append(f"Редакция по карточке: {rows[0]['edition']}.")
+    bundle = selection.name.startswith("MDaemon") and not rows[0]["sales_notes"]
+    if selection.seats is not None and bundle:
+        parts.append(f"Для {selection.seats} пользователей достаточно одной упаковки по вместимости из карточки.")
+    if p.unitPriceKopecks is None:
+        parts.append("Цена по запросу.")
+    else:
+        rub, kop = divmod(p.unitPriceKopecks, 100)
+        money = f"{rub:,}".replace(",", " ") + (f",{kop:02}" if kop else "")
+        unit = " за упаковку" if bundle else ""
+        parts.append(f"Цена по снимку каталога — {money} ₽{unit}.")
+        if rows[0]["sales_notes"]:
+            parts.append("Условия количества из карточки: " + rows[0]["sales_notes"])
+    if p.priceState == "availability_check":
+        parts.append("Наличие требует подтверждения.")
+    elif p.available:
+        parts.append("В снимке позиция отмечена как доступная.")
+    if selection.perpetual:
+        parts.append(f"Срок по карточке: {p.licenseTerm}." if p.licenseTerm else "Срок в карточке не указан.")
+        parts.append("Право использования после окончания подписки требует проверки условий лицензии.")
+    return result(" ".join(parts), "answer", products)
