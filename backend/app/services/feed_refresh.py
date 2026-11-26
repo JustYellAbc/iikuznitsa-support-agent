@@ -82,6 +82,28 @@ def inspect_index(path: Path, limits: Limits) -> dict:
     return {"feed_date": date, "offers_count": total, **counts}
 
 
+def _read_current(index: Path) -> dict | None:
+    """Текущий снимок из feed_snapshot или fallback по таблицам T06 (metadata + offers)."""
+    if not index.is_file():
+        return None
+    if snapshot := read_snapshot(index):
+        return snapshot
+    with open_index(index) as db:
+        tables = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('metadata', 'offers')"
+            )
+        }
+        if tables != {"metadata", "offers"}:
+            return None
+        meta = db.execute("SELECT snapshot FROM metadata LIMIT 1").fetchone()
+        if meta is None or not meta["snapshot"]:
+            return None
+        offers_count = db.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    return {"feed_date": meta["snapshot"], "offers_count": offers_count}
+
+
 def check_against_current(stats: dict, current: dict | None, limits: Limits) -> None:
     if current is None:
         return
@@ -156,7 +178,7 @@ def refresh(feed: Path, index: Path, knowledge: Path, limits: Limits = Limits(),
     previous = index.with_name(f"{index.stem}.prev{index.suffix}")
     with _exclusive(index):
         try:
-            current = read_snapshot(index)
+            current = _read_current(index)
         except sqlite3.Error:
             current = None  # повреждённый рабочий индекс не мешает собрать новый
         had_index = index.is_file()

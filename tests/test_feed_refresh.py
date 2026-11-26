@@ -11,7 +11,7 @@ import pytest
 from catalog.index import KNOWLEDGE
 
 from app.config import get_settings
-from app.services.catalog_snapshot import read_offer, read_snapshot
+from app.services.catalog_snapshot import open_index, read_offer, read_snapshot
 from app.services.feed_refresh import FeedRejected, Limits, refresh
 from app.services.price_policy import assess
 from tests.conftest import Api
@@ -128,14 +128,64 @@ def test_older_feed_allowed_explicitly(tmp_path, live):
 
 
 def test_index_without_snapshot_metadata_is_upgraded(tmp_path):
-    """Индекс, собранный напрямую catalog/index.py build, заменяется без сверки с прежним снимком."""
+    """Индекс T06 (без feed_snapshot) обновляется свежим валидным фидом с фиксацией fallback previous."""
     from catalog.index import build
 
     index = tmp_path / "catalog.sqlite3"
     build(write_feed(tmp_path / "v1.xml", "2026-11-25 10:00"), index, KNOWLEDGE)
     assert read_snapshot(index) is None
-    refresh(write_feed(tmp_path / "v2.xml", "2026-11-26 10:00"), index, KNOWLEDGE, LIMITS)
+    report = refresh(write_feed(tmp_path / "v2.xml", "2026-11-26 10:00"), index, KNOWLEDGE, LIMITS)
+    assert report["previous"] == {"feed_date": "2026-11-25 10:00", "offers_count": 4}
     assert read_snapshot(index)["offers_count"] == 4
+
+
+def _bulk_offers(count: int) -> list[tuple[str, str, str, str]]:
+    return [(f"sku-{i}", "true", "1000", f"Лицензия ПО {i}") for i in range(count)]
+
+
+def _read_t06_state(index: Path) -> tuple[str, int]:
+    with open_index(index) as db:
+        snapshot = db.execute("SELECT snapshot FROM metadata").fetchone()["snapshot"]
+        offers_count = db.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    return snapshot, offers_count
+
+
+def test_t06_index_rejects_older_feed(tmp_path):
+    """Первое обновление поверх индекса T06 (без feed_snapshot) отклоняет более старую дату снимка."""
+    from catalog.index import build
+
+    index = tmp_path / "private" / "catalog.sqlite3"
+    offers = _bulk_offers(3000)
+    build(write_feed(tmp_path / "t06.xml", "2026-11-25 10:00", offers), index, KNOWLEDGE)
+    assert read_snapshot(index) is None
+    before = digest(index)
+
+    older = write_feed(tmp_path / "older.xml", "2026-11-24 10:00", offers)
+    with pytest.raises(FeedRejected, match="старше"):
+        refresh(older, index, KNOWLEDGE, Limits())
+
+    assert digest(index) == before
+    assert read_snapshot(index) is None
+    assert _read_t06_state(index) == ("2026-11-25 10:00", 3000)
+
+
+def test_t06_index_rejects_sharp_drop_in_offers(tmp_path):
+    """Первое обновление поверх индекса T06 (без feed_snapshot) отклоняет резкое падение числа SKU."""
+    from catalog.index import build
+
+    index = tmp_path / "private" / "catalog.sqlite3"
+    offers = _bulk_offers(3000)
+    build(write_feed(tmp_path / "t06.xml", "2026-11-25 10:00", offers), index, KNOWLEDGE)
+    assert read_snapshot(index) is None
+    before = digest(index)
+
+    shrunk = write_feed(tmp_path / "shrunk.xml", "2026-11-26 10:00", offers[:1000])
+    with pytest.raises(FeedRejected, match="падение"):
+        refresh(shrunk, index, KNOWLEDGE, Limits())
+
+    assert digest(index) == before
+    assert read_snapshot(index) is None
+    assert _read_t06_state(index) == ("2026-11-25 10:00", 3000)
 
 
 def test_cli_reports_and_exit_codes(tmp_path):
