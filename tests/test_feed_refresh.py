@@ -81,6 +81,7 @@ def test_refresh_replaces_offer_and_snapshot(tmp_path, live):
     # Прежний снимок сохранён рядом для ручного отката
     assert read_snapshot(live.with_name("catalog.prev.sqlite3")) == first
     assert report["search_probe"]
+    assert live.stat().st_mode & 0o777 == 0o644
     assert sorted(p.name for p in live.parent.iterdir()) == [
         "catalog.prev.sqlite3",
         "catalog.sqlite3",

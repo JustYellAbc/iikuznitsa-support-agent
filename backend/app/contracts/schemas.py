@@ -184,13 +184,15 @@ class CatalogSnapshot(Strict):
 
 
 class AvailabilityCheckPolicy(Strict):
-    """Правило для available=false и цены > 0 до Q&A с заказчиком (backend/app/services/price_policy.json)."""
+    """Правило для available=false и цены > 0 до Q&A с заказчиком."""
 
     show_snapshot_price_with_caveat: bool
     allow_quote_draft: bool
     allow_auto_invoice: bool
     confirmed: bool
     policy_source: str
+    loaded_from: str = Field(description="файл, из которого политика прочитана при старте")
+    overridden: bool = Field(description="true — $DATA_DIR/config/price_policy.json, false — встроенная")
 
 
 class CatalogStatus(Strict):

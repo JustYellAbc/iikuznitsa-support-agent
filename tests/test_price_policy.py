@@ -7,12 +7,14 @@ from pathlib import Path
 
 import pytest
 from catalog.index import KNOWLEDGE
+from fastapi.testclient import TestClient
 
 from app.contracts.t04 import Product
 from app.services import price_policy
 from app.services.catalog_snapshot import read_offer
 from app.services.feed_refresh import Limits, refresh
 from app.services.price_policy import OfferSnapshot, assess, classify, load_availability_rule
+from tests.conftest import Api
 
 FEED = Path(__file__).resolve().parents[1] / "data" / "raw" / "Mindbox.yml.gz.xml"
 
@@ -114,7 +116,7 @@ def test_broken_policy_file_is_rejected(tmp_path, patch):
     data["availability_check"].update(patch)
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(data), encoding="utf-8")
-    with pytest.raises(ValueError):
+    with pytest.raises(price_policy.PolicyError):
         load_availability_rule(path)
 
 
@@ -196,3 +198,59 @@ def test_real_snapshot_controls(real_index, offer_id):
     assert a.allow_auto_invoice is (state == "listed")
     assert a.allow_quote_draft is (state == "listed")
     assert a.to_product().priceState == state
+
+
+# --- Переопределение политики в $DATA_DIR без пересборки образа ------------------------------
+
+
+def manager_policy(api: Api) -> dict:
+    api.login()
+    return api.call("manager", "GET", "/api/v1/manager/catalog").json()["availability_check"]
+
+
+def write_override(data_dir: Path, text: str) -> Path:
+    path = data_dir / "config" / "price_policy.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_override_in_data_dir_applies_after_restart(tmp_path):
+    from app.main import create_app
+
+    with TestClient(create_app()) as client:
+        builtin = manager_policy(Api(client))
+    assert builtin["loaded_from"] == str(price_policy.POLICY_PATH)
+    assert (builtin["overridden"], builtin["confirmed"], builtin["allow_quote_draft"]) == (False, False, False)
+
+    data = json.loads(price_policy.POLICY_PATH.read_text(encoding="utf-8"))
+    data["availability_check"].update(allow_quote_draft=True, confirmed=True, policy_source="Q&A с заказчиком 27.11")
+    override = write_override(tmp_path, json.dumps(data, ensure_ascii=False))
+    # Без перезапуска действует политика, прочитанная при старте
+    assert not assess(snapshot(False, "100")).allow_quote_draft
+
+    with TestClient(create_app()) as client:
+        status = manager_policy(Api(client))
+        assert assess(snapshot(False, "100")).allow_quote_draft
+    assert status["loaded_from"] == str(override)
+    assert (status["overridden"], status["confirmed"], status["allow_quote_draft"]) == (True, True, True)
+    assert status["policy_source"] == "Q&A с заказчиком 27.11"
+    assert status["allow_auto_invoice"] is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "{not json",
+        "[]",
+        '{"availability_check": {"show_snapshot_price_with_caveat": "true"}}',
+        json.dumps({"availability_check": {"allow_auto_invoice": True}}),
+    ],
+)
+def test_broken_override_stops_startup(tmp_path, text):
+    from app.main import create_app
+
+    override = write_override(tmp_path, text)
+    with pytest.raises(price_policy.PolicyError, match=str(override)), TestClient(create_app()):
+        pass

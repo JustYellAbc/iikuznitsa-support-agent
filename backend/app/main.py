@@ -11,7 +11,7 @@ from app.core.errors import install_error_handlers
 from app.core.llm import close_http_client
 from app.core.security import RateLimitMiddleware
 from app.db.database import close_db, init_db
-from app.services import turn_service
+from app.services import price_policy, turn_service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -19,6 +19,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     s = get_settings()
+    policy = price_policy.activate(s.data_dir)  # битый $DATA_DIR/config/price_policy.json не даёт стартовать
+    logging.getLogger(__name__).info("Политика цены: %s", policy.path)
     s.quotes_dir.mkdir(parents=True, exist_ok=True)
     await init_db(s.db_path)
     try:

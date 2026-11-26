@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.core import security
-from app.services import turn_service
+from app.services import price_policy, turn_service
 
 OPERATOR = ("manager", "test-secret")
 
@@ -21,10 +21,12 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("DEFAULT_MODE", "autopilot")
     monkeypatch.chdir(tmp_path)  # не подхватывать локальный .env разработчика
     get_settings.cache_clear()
+    price_policy.reset()
     security.ip_limiter.reset()
     security.conversation_limiter.reset()
     yield
     get_settings.cache_clear()
+    price_policy.reset()
 
 
 @pytest.fixture

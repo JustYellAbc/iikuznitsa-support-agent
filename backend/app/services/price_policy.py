@@ -3,7 +3,8 @@
 Три состояния снимка (priceState контракта T04):
 - listed — available=true и цена > 0: цену снимка можно назвать;
 - on_request — цена 0, пустая или нечисловая: 0 ₽ не показываем, цену запрашиваем у менеджера;
-- availability_check — available=false и цена > 0: правила лежат в price_policy.json до Q&A с заказчиком.
+- availability_check — available=false и цена > 0: правила в файле политики до Q&A с заказчиком
+  ($DATA_DIR/config/price_policy.json, если он есть, иначе встроенный price_policy.json).
 
 Флаги allow_* разрешают действие только со стороны состояния цены. Условия документа и согласие
 покупателя проверяет коммерческий контур отдельно.
@@ -12,12 +13,14 @@
 import json
 from dataclasses import dataclass, fields
 from decimal import InvalidOperation
-from functools import cache
 from pathlib import Path
 
+from app.config import get_settings
 from app.contracts.t04 import HandoffReason, PriceState, Product, rub_to_kopecks
 
+# Встроенная политика; на стенде её переопределяет $DATA_DIR/config/price_policy.json без пересборки образа
 POLICY_PATH = Path(__file__).with_name("price_policy.json")
+OVERRIDE_PATH = Path("config") / "price_policy.json"
 # Значения «Срок действия», которые срок не подтверждают (как в catalog/index.py)
 UNDEFINED_TERMS = {"", "не определено", "мес."}
 PRICE_STATES: tuple[PriceState, ...] = ("listed", "availability_check", "on_request")
@@ -31,7 +34,7 @@ T06_PRICE_STATES: dict[str, PriceState] = {
 
 @dataclass(frozen=True)
 class AvailabilityCheckRule:
-    """Что разрешено при available=false и цене > 0. Меняется в price_policy.json вместе с policy_source."""
+    """Что разрешено при available=false и цене > 0. Меняется в файле политики вместе с policy_source."""
 
     show_snapshot_price_with_caveat: bool
     allow_quote_draft: bool
@@ -40,21 +43,54 @@ class AvailabilityCheckRule:
     policy_source: str
 
 
+class PolicyError(ValueError):
+    """Файл политики не читается или не проходит проверку."""
+
+
 def load_availability_rule(path: Path = POLICY_PATH) -> AvailabilityCheckRule:
-    data = json.loads(path.read_text(encoding="utf-8"))["availability_check"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PolicyError(f"{path}: не читается как JSON: {exc}") from exc
+    data = data.get("availability_check") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        raise PolicyError(f"{path}: нет объекта availability_check")
     names = {f.name for f in fields(AvailabilityCheckRule)}
     if set(data) != names:
-        raise ValueError(f"{path}: availability_check ожидает ключи {sorted(names)}")
+        raise PolicyError(f"{path}: availability_check ожидает ключи {sorted(names)}")
     if not all(isinstance(data[name], bool) for name in names - {"policy_source"}):
-        raise ValueError(f"{path}: флаги availability_check должны быть true/false")
+        raise PolicyError(f"{path}: флаги availability_check должны быть true/false")
     if not isinstance(data["policy_source"], str) or not data["policy_source"].strip():
-        raise ValueError(f"{path}: правило без policy_source")
+        raise PolicyError(f"{path}: правило без policy_source")
     return AvailabilityCheckRule(**data)
 
 
-@cache
-def default_rule() -> AvailabilityCheckRule:
-    return load_availability_rule()
+@dataclass(frozen=True)
+class ActivePolicy:
+    rule: AvailabilityCheckRule
+    path: Path
+    overridden: bool  # True — взят файл из $DATA_DIR, а не встроенный
+
+
+_active: ActivePolicy | None = None
+
+
+def activate(data_dir: Path | None = None) -> ActivePolicy:
+    """Перечитать политику при старте бэкенда. Битый файл переопределения — ошибка, а не откат на встроенный."""
+    global _active
+    override = (data_dir or get_settings().data_dir) / OVERRIDE_PATH
+    path = override if override.exists() else POLICY_PATH
+    _active = ActivePolicy(load_availability_rule(path), path, path != POLICY_PATH)
+    return _active
+
+
+def active_policy() -> ActivePolicy:
+    return _active or activate()
+
+
+def reset() -> None:
+    global _active
+    _active = None
 
 
 @dataclass(frozen=True)
@@ -114,7 +150,7 @@ def confirmed_term(values: tuple[str, ...]) -> str | None:
 
 
 def assess(snapshot: OfferSnapshot, rule: AvailabilityCheckRule | None = None) -> OfferAssessment:
-    rule = rule or default_rule()
+    rule = rule or active_policy().rule
     state = classify(snapshot.available, snapshot.price)
     kopecks = price_kopecks(snapshot.price)
     date = f" от {snapshot.snapshot_date}" if snapshot.snapshot_date else ""

@@ -106,9 +106,13 @@ docker compose exec backend python scripts/refresh_feed.py data/raw/Mindbox.yml.
 |---|---|---|
 | `available=true`, цена > 0 (61557) | `listed` | Назвать цену. Срок «Не определено» не превращается в срок |
 | цена 0 или пустая (504) | `on_request` | Цену не показывать, передать менеджеру с причиной `price_request` |
-| `available=false`, цена > 0 (48093) | `availability_check` | По `backend/app/services/price_policy.json` |
+| `available=false`, цена > 0 (48093) | `availability_check` | По файлу политики (ниже) |
 
-До Q&A с заказчиком `price_policy.json` разрешает назвать цену снимка с оговоркой и запрещает выпуск КП и автосчёт (`allow_quote_draft=false`, `allow_auto_invoice=false`), проверка доступности уходит менеджеру с причиной `availability`. После ответа заказчика поменяйте флаги, `confirmed` и `policy_source` в этом файле и пересоберите бэкенд (`docker compose up -d --build backend`): файл входит в образ.
+Политику бэкенд читает при старте из `$DATA_DIR/config/price_policy.json`, если файл есть, иначе из встроенного `backend/app/services/price_policy.json`. Встроенная политика до Q&A с заказчиком разрешает назвать цену снимка с оговоркой и запрещает выпуск КП и автосчёт (`allow_quote_draft=false`, `allow_auto_invoice=false`). Проверка доступности уходит менеджеру с причиной `availability`.
+
+После Q&A правим `$DATA_DIR/config/price_policy.json` (на стенде `/opt/stand/data/config/price_policy.json`) и перезапускаем backend: `docker compose restart backend`. Пересборка не нужна. За основу берите встроенный файл и меняйте флаги, `confirmed` и `policy_source`. Если файл переопределения не читается или не проходит проверку, бэкенд не стартует и пишет в лог путь и причину. Тихого отката на встроенные значения нет. Действующую политику и файл, из которого она прочитана, показывает `GET /api/v1/manager/catalog`.
+
+Для `listed` политика разрешает КП и автосчёт только со стороны цены. Согласие покупателя и условия документа проверяет коммерческая часть.
 
 Тесты эталонных SKU в `tests/test_price_policy.py` читают `data/raw/Mindbox.yml.gz.xml`. Без этого файла они пропускаются.
 

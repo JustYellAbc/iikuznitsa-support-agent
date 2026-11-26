@@ -183,6 +183,7 @@ def refresh(feed: Path, index: Path, knowledge: Path, limits: Limits = Limits(),
                     snapshot,
                 )
             self_check(staging, snapshot)
+            os.chmod(staging, 0o644)  # mkstemp в T06 даёт 0600: бэкенд может работать под другим uid
             if had_index:
                 _copy_atomic(index, previous)
             os.replace(staging, index)

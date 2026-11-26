@@ -26,7 +26,7 @@ from app.core.llm import today_spend_rub, today_start
 from app.db import repository
 from app.services import conversation_service, turn_service
 from app.services.catalog_snapshot import read_snapshot
-from app.services.price_policy import default_rule
+from app.services.price_policy import active_policy
 
 router = APIRouter(
     prefix="/api/v1/manager",
@@ -54,9 +54,17 @@ async def telemetry(all_time: bool = False, principal: Principal = Depends(requi
 
 @router.get("/catalog", response_model=CatalogStatus)
 async def catalog(principal: Principal = Depends(require_manager)) -> CatalogStatus:
-    """Снимок фида рабочего индекса (дата, SHA-256, счётчики состояний цены) и правило availability_check."""
+    """Снимок фида рабочего индекса (дата, SHA-256, счётчики состояний цены) и действующая политика цены."""
     snapshot = await asyncio.to_thread(read_snapshot, get_settings().catalog_index_path)
-    return CatalogStatus(snapshot=snapshot, availability_check=asdict(default_rule()))
+    policy = active_policy()
+    return CatalogStatus(
+        snapshot=snapshot,
+        availability_check={
+            **asdict(policy.rule),
+            "loaded_from": str(policy.path),
+            "overridden": policy.overridden,
+        },
+    )
 
 
 @router.get("/mode", response_model=ModeState)
