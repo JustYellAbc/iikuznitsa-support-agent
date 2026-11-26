@@ -651,6 +651,7 @@
             "type": "message",
             "text": "Повторюсь, пришлите пакет документов для тендера по этой позиции."
           },
+          "allow_silent": true,
           "assertions": {
             "allowed_prices_rub": ["77556"],
             "forbid_document": true

@@ -5,7 +5,16 @@
       "Edit(data/private/**)",
       "Write(data/private/**)",
       "Grep(data/private/**)",
-      "Glob(data/private/**)"
+      "Glob(data/private/**)",
+      "Bash(*data/private*)",
+      "Read(~/.local/share/iikuznitsa-eval-private/**)",
+      "Edit(~/.local/share/iikuznitsa-eval-private/**)",
+      "Write(~/.local/share/iikuznitsa-eval-private/**)",
+      "Grep(~/.local/share/iikuznitsa-eval-private/**)",
+      "Glob(~/.local/share/iikuznitsa-eval-private/**)",
+      "Bash(*iikuznitsa-eval-private*)",
+      "Bash(*EVAL_HOLDOUT_DIR*)",
+      "Bash(*EVAL_SPLIT_SEED*)"
     ]
   }
 }

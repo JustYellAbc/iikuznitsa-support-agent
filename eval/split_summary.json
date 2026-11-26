@@ -1,9 +1,8 @@
 {
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "archive_filename": "чаты поддержки.zip",
   "archive_sha256": "08b810ba0e705daa4b817be6c01a654bef5f1ed7e8f2c8ef47f539973bbb85a6",
-  "seed_source": "default",
-  "seed_sha256_prefix": "232104e15993",
+  "seed_policy": "secret EVAL_SPLIT_SEED (>= 128 bit), HMAC-SHA256 cluster order; seed is never published",
   "holdout_ratio_target": 0.2,
   "similarity_rules": {
     "shingle_k": 4,

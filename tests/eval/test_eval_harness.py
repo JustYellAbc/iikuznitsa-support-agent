@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -21,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from eval import pii, run_eval, split_chats  # noqa: E402
+from eval import pii, run_eval, split_chats
 
 ARCHIVE_PATH = REPO_ROOT / "data/raw/чаты поддержки.zip"
 CATALOG_PATH = REPO_ROOT / "data/raw/Mindbox.yml.gz.xml"
@@ -39,8 +41,17 @@ def test_real_archive_split_has_zero_overlap_and_pins_100646(tmp_path: Path) -> 
     if not ARCHIVE_PATH.is_file():
         pytest.skip("Raw support archive not present")
 
-    dev1, holdout1, summary1 = split_chats.run_split(ARCHIVE_PATH, tmp_path / "run1", tmp_path / "summary1.json")
-    dev2, holdout2, summary2 = split_chats.run_split(ARCHIVE_PATH, tmp_path / "run2", tmp_path / "summary2.json")
+    seed = secrets.token_hex(16)
+    dev1, holdout1, summary1 = split_chats.run_split(
+        ARCHIVE_PATH, tmp_path / "run1", tmp_path / "summary1.json", seed=seed
+    )
+    dev2, holdout2, summary2 = split_chats.run_split(
+        ARCHIVE_PATH, tmp_path / "run2", tmp_path / "summary2.json", seed=seed
+    )
+    for name in ("holdout_eval.json", "dev_ids.json"):
+        assert stat.S_IMODE((tmp_path / "run1" / name).stat().st_mode) == 0o600
+    assert stat.S_IMODE((tmp_path / "run1").stat().st_mode) == 0o700
+    assert "seed" not in holdout1 and "seed" not in dev1
 
     assert dev1 == dev2
     assert holdout1 == holdout2
@@ -123,7 +134,7 @@ def test_synthetic_archive_keeps_near_duplicate_clusters_together(tmp_path: Path
         zf.writestr("buy_part_3_masked.txt", "\n".join(lines_part3) + "\n")
 
     dev, holdout, summary = split_chats.run_split(
-        zip_path, tmp_path / "priv", tmp_path / "summary.json", holdout_ratio=0.30, seed=42
+        zip_path, tmp_path / "priv", tmp_path / "summary.json", holdout_ratio=0.30, seed=secrets.token_hex(16)
     )
     dev_ids = set(dev["ids"])
     holdout_ids = set(holdout["ids"])
@@ -141,21 +152,32 @@ def test_split_summary_is_safe_and_isolation_guards_exist(monkeypatch: pytest.Mo
     assert "ids" not in summary
     assert "cases" not in summary
     assert "seed" not in summary
-    assert "seed_sha256_prefix" in summary
+    assert "seed_sha256_prefix" not in summary
+    assert "seed_source" not in summary
     assert summary["overlap_count"] == 0
     assert summary["cluster_overlap_count"] == 0
     assert summary["anchor_100646_in_open_dev"] is True
     assert "[email]" not in summary_text
     assert "[номер]" not in summary_text
 
-    # Holdout default path lives outside repo tree; EVAL_SPLIT_SEED env var is respected.
-    assert not split_chats.default_holdout_dir().resolve().is_relative_to(REPO_ROOT.resolve())
-    monkeypatch.setenv("EVAL_SPLIT_SEED", "777999")
-    assert split_chats.resolve_seed(None) == (777999, "env:EVAL_SPLIT_SEED")
+    # Holdout default path lives outside the repo and outside /tmp; the seed comes only from EVAL_SPLIT_SEED.
+    monkeypatch.delenv("EVAL_HOLDOUT_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    default_dir = split_chats.default_holdout_dir()
+    assert default_dir == tmp_path / "home/.local/share/iikuznitsa-eval-private"
+    assert not default_dir.resolve().is_relative_to(REPO_ROOT.resolve())
+    token = secrets.token_hex(16)
+    monkeypatch.setenv("EVAL_SPLIT_SEED", token)
+    assert split_chats.resolve_seed() == token
 
     # Dotfiles & rules protecting holdout and ignoring .DS_Store.
     claude_cfg = json.loads((REPO_ROOT / ".claude/settings.json").read_text(encoding="utf-8"))
-    assert "Read(data/private/**)" in claude_cfg["permissions"]["deny"]
+    deny = claude_cfg["permissions"]["deny"]
+    assert "Read(data/private/**)" in deny
+    assert "Bash(*data/private*)" in deny
+    assert "Read(~/.local/share/iikuznitsa-eval-private/**)" in deny
+    assert "Bash(*iikuznitsa-eval-private*)" in deny
     assert "data/private/**" in (REPO_ROOT / ".geminiignore").read_text(encoding="utf-8")
     assert "data/private/**" in (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
     assert ".DS_Store" in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -240,10 +262,10 @@ def test_golden_open_reference_skus_match_xml() -> None:
             assert Decimal(ref["unit_price_kopecks"]) / Decimal(100) == actual["price"]
 
     # T03 arithmetic invariants
-    assert Decimal(ref_skus["19645"]["price_rub"]) + Decimal(ref_skus["532803"]["price_rub"]) == Decimal("41227")
-    assert 50 * Decimal(ref_skus["3850"]["price_rub"]) + Decimal(ref_skus["532803"]["price_rub"]) == Decimal("90047")
-    assert Decimal(ref_skus["19576"]["price_rub"]) + Decimal(ref_skus["359841"]["price_rub"]) == Decimal("110199")
-    assert Decimal(ref_skus["19578"]["price_rub"]) + Decimal(ref_skus["359843"]["price_rub"]) == Decimal("145274")
+    assert Decimal(ref_skus["19645"]["price_rub"]) + Decimal(ref_skus["532803"]["price_rub"]) == Decimal(41227)
+    assert 50 * Decimal(ref_skus["3850"]["price_rub"]) + Decimal(ref_skus["532803"]["price_rub"]) == Decimal(90047)
+    assert Decimal(ref_skus["19576"]["price_rub"]) + Decimal(ref_skus["359841"]["price_rub"]) == Decimal(110199)
+    assert Decimal(ref_skus["19578"]["price_rub"]) + Decimal(ref_skus["359843"]["price_rub"]) == Decimal(145274)
 
 
 def test_golden_open_mode_filtering() -> None:
@@ -283,12 +305,12 @@ def test_extract_prices_rub_supports_extensions_and_ignores_non_currency() -> No
         "варианты: 4 900 р., 1.523.654 ₽, 4.900 руб., 1 670,94 ₽, 41,2 тыс. ₽, 0,00 р."
     )
     assert run_eval.extract_prices_rub(sample) == [
-        Decimal("4900"),
-        Decimal("1523654"),
-        Decimal("4900"),
+        Decimal(4900),
+        Decimal(1523654),
+        Decimal(4900),
         Decimal("1670.94"),
-        Decimal("41200"),
-        Decimal("0"),
+        Decimal(41200),
+        Decimal(0),
     ]
 
 
@@ -546,6 +568,8 @@ def test_metrics_latency_economics_and_failed_case_accounting() -> None:
             closed_by_agent=True,
             latency_ms=[100.0, 200.0],
             cost_rub=0.40,
+            cost_status="exact",
+            cost_source="trace",
         ),
         run_eval.CaseResult(
             "c2",
@@ -556,6 +580,8 @@ def test_metrics_latency_economics_and_failed_case_accounting() -> None:
             closed_by_agent=False,
             latency_ms=[400.0],
             cost_rub=0.80,
+            cost_status="exact",
+            cost_source="trace",
         ),
         run_eval.CaseResult(
             "c3",
@@ -567,6 +593,8 @@ def test_metrics_latency_economics_and_failed_case_accounting() -> None:
             timed_out=True,
             latency_ms=[1000.0],
             cost_rub=0.60,
+            cost_status="exact",
+            cost_source="telemetry",
             errors=["Turn 1 timed out"],
             agent_responses=["Неверный ответ агента"],
         ),
@@ -581,6 +609,15 @@ def test_metrics_latency_economics_and_failed_case_accounting() -> None:
     assert summary["economics"]["avg_cost_per_case_rub"] == 0.6
     assert summary["economics"]["projected_500_cases_per_day_rub"] == 300.0
     assert summary["economics"]["weighted_projected_500_cases_per_day_rub"] is not None
+    assert summary["economics"]["cost_status"] == "exact"
+
+    # Without exact stand costs the report says "unavailable" instead of estimating.
+    for item in results:
+        item.cost_status, item.cost_rub = "unavailable", None
+    no_cost = run_eval.summarize_results(results, suite="open", mode="mvp", category_weights=weights)
+    assert no_cost["economics"]["cost_status"] == "unavailable"
+    assert no_cost["economics"]["avg_cost_per_case_rub"] is None
+    assert "unavailable" in run_eval.format_markdown_report(no_cost)
 
     md = run_eval.format_markdown_report(summary)
     assert "## Failed Case Responses" in md
@@ -608,7 +645,7 @@ def test_b1_quiescence_waits_for_trailing_handoff_and_pii_scrubs_holdout() -> No
             self.end_headers()
             self.wfile.write(raw)
 
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             m = re.match(r"^/api/v1/conversations/([^/]+)/events$", parsed.path)
             if not m:
@@ -623,7 +660,7 @@ def test_b1_quiescence_waits_for_trailing_handoff_and_pii_scrubs_holdout() -> No
                 has_more = next_after < len(events)
             self._send(200, {"events": page, "nextAfter": next_after, "hasMore": has_more})
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
@@ -735,7 +772,9 @@ def test_b1_quiescence_waits_for_trailing_handoff_and_pii_scrubs_holdout() -> No
         assert res.passed is True, res.errors
         assert res.escalated is True
         assert res.events_count == 3
-        assert res.cost_rub == 0.15
+        # X-LLM-Cost-Rub is not part of T04: without manager credentials the cost is unavailable.
+        assert res.cost_rub is None
+        assert res.cost_status == "unavailable"
         assert "Иван" not in received_texts[0]
         assert "10.20.30.40" not in received_texts[0]
 
@@ -757,12 +796,17 @@ def test_b1_quiescence_waits_for_trailing_handoff_and_pii_scrubs_holdout() -> No
         server.server_close()
 
 
-def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path) -> None:
-    """End-to-end HTTP test covering all 12 golden_open.json cases in full mode."""
+def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end HTTP test covering all 14 golden_open.json cases in full mode, with exact stand cost.
+
+    The mock mimics T05: manager login sets support_session, trace is visible only for conversations with a
+    handoff (otherwise 404), telemetry returns the last 20 LLM calls.
+    """
     golden = json.loads(GOLDEN_OPEN_PATH.read_text(encoding="utf-8"))
     skus = golden["reference_skus"]
     lock = threading.Lock()
-    state: dict[str, object] = {"counter": 0, "convs": {}, "spend": 0.0}
+    state: dict[str, object] = {"counter": 0, "convs": {}, "calls": [], "logins": 0}
+    manager_token = "mgr-" + secrets.token_hex(8)
 
     def prod_obj(oid: str) -> dict:
         s = skus[oid]
@@ -822,20 +866,38 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path) -> None:
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
 
-        def _send(self, code: int, payload: dict) -> None:
+        def _send(self, code: int, payload: object, cookie: str | None = None) -> None:
             raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(raw)
 
-        def do_GET(self) -> None:  # noqa: N802
+        def _is_manager(self) -> bool:
+            return f"support_session={manager_token}" in (self.headers.get("Cookie") or "")
+
+        def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
-            if parsed.path == "/health":
+            if parsed.path.startswith("/api/v1/manager/"):
+                if not self._is_manager():
+                    self._send(401, {"code": "unauthenticated", "message": "login"})
+                    return
                 with lock:
-                    spend = state["spend"]
-                self._send(200, {"status": "ok", "today_spend_rub": spend})
+                    calls = list(state["calls"])  # type: ignore[call-overload]
+                    convs = state["convs"]  # type: ignore[assignment]
+                if parsed.path == "/api/v1/manager/telemetry":
+                    self._send(200, {"today_spend_rub": 0.0, "recent_calls": calls[-20:][::-1]})
+                    return
+                m_trace = re.match(r"^/api/v1/manager/conversations/([^/]+)/trace$", parsed.path)
+                if m_trace and convs.get(m_trace.group(1), {}).get("handoff"):  # type: ignore[union-attr]
+                    own = [c for c in calls if c["session_id"] == m_trace.group(1)]
+                    turns = [{"turn_id": f"t{c['id']}", "total_cost_rub": c["cost_rub"]} for c in own]
+                    self._send(200, turns)
+                    return
+                self._send(404, {"code": "not_found", "message": "no access"})
                 return
             m = re.match(r"^/api/v1/conversations/([^/]+)/events$", parsed.path)
             if not m:
@@ -850,10 +912,17 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path) -> None:
                 has_more = next_after < len(events)
             self._send(200, {"events": page, "nextAfter": next_after, "hasMore": has_more})
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            if parsed.path == "/api/v1/auth/manager/login":
+                if body == {"username": "manager", "password": "pw-test"}:
+                    state["logins"] = int(state["logins"]) + 1  # type: ignore[call-overload]
+                    self._send(200, {"role": "manager"}, cookie=f"support_session={manager_token}; Path=/api/v1")
+                else:
+                    self._send(401, {"code": "unauthenticated", "message": "bad credentials"})
+                return
             if parsed.path == "/api/v1/conversations":
                 with lock:
                     state["counter"] = int(state["counter"]) + 1
@@ -871,9 +940,12 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path) -> None:
                 conv["turn"] += 1
                 aid = f"a-{conv['turn']}"
                 events: list[dict] = conv["events"]
-                state["spend"] = float(state["spend"]) + 0.25
+                calls: list[dict] = state["calls"]  # type: ignore[assignment]
+                calls.append({"id": len(calls) + 1, "session_id": cid, "step": "agent", "cost_rub": 0.25})
 
                 def push(data: dict) -> None:
+                    if data["type"] == "handoff":
+                        conv["handoff"] = True
                     events.append({"seq": len(events) + 1, "at": "2026-11-26T10:00:00Z", "actionId": aid, "data": data})
 
                 def msg(purpose: str, text: str, sources: list[dict]) -> None:
@@ -1001,6 +1073,8 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path) -> None:
     host, port = server.server_address
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    monkeypatch.setenv("EVAL_MANAGER_PASSWORD", "pw-test")
+    monkeypatch.delenv("EVAL_SESSION_COOKIE", raising=False)
     try:
         out_prefix = tmp_path / "eval_out"
         rc = run_eval.main(
@@ -1028,7 +1102,17 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path) -> None:
     assert report["total_cases"] == 14
     assert report["passed_cases"] == 14
     assert report["failed_cases"] == 0
-    assert report["economics"]["avg_cost_per_case_rub"] is not None
+    assert state["logins"] == 1
+    econ = report["economics"]
+    assert econ["cost_status"] == "exact", econ
+    assert econ["cost_sources"] == ["telemetry", "trace"]
+    by_id = {c["id"]: c for c in report["cases"]}
+    # One mocked LLM call (0.25 RUB) per action: exact cost, no double counting.
+    assert by_id["open-tender-repeat"]["cost_rub"] == 0.75
+    assert by_id["open-tender-repeat"]["cost_source"] == "trace"
+    assert by_id["open-price-61557"]["cost_rub"] == 0.25
+    assert by_id["open-price-61557"]["cost_source"] == "telemetry"
+    assert econ["avg_cost_per_case_rub"] == round(sum(c["cost_rub"] for c in report["cases"]) / 14, 4)
     assert (tmp_path / "eval_out.md").is_file()
 
 

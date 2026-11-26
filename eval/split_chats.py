@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -27,9 +28,12 @@ NON_WORD_RE = re.compile(r"[^\w\s]", re.UNICODE)
 WHITESPACE_RE = re.compile(r"\s+")
 
 DEFAULT_ARCHIVE = Path("data/raw/чаты поддержки.zip")
-DEFAULT_PRIVATE_DIR = Path("data/private")
 DEFAULT_SUMMARY_OUT = Path("eval/split_summary.json")
-DEFAULT_SEED = 20261126
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HOLDOUT_DIR_NAME = "iikuznitsa-eval-private"
+SEED_ENV = "EVAL_SPLIT_SEED"
+MIN_SEED_HEX_CHARS = 32  # 128 bits, e.g. python -c "import secrets; print(secrets.token_hex(16))"
+SEED_RE = re.compile(rf"[0-9a-fA-F]{{{MIN_SEED_HEX_CHARS},}}")
 # Pinned into open_dev:
 # - T02/T03 explicit references (#100646, #100625, #103038)
 # - Paraphrased examples & typos from docs/data_audit.md
@@ -62,24 +66,45 @@ DEFAULT_PINNED_FILES = ("buy_part_3_masked.txt",)
 
 
 def default_holdout_dir() -> Path:
-    """Return external holdout directory outside the repository tree."""
+    """External holdout directory: EVAL_HOLDOUT_DIR or $XDG_DATA_HOME (~/.local/share)/iikuznitsa-eval-private."""
     env_dir = os.environ.get("EVAL_HOLDOUT_DIR")
     if env_dir:
         return Path(env_dir).expanduser()
-    return Path(tempfile.gettempdir()) / "iikuznitsa-eval-private"
+    data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(data_home).expanduser() / HOLDOUT_DIR_NAME
 
 
-def resolve_seed(cli_seed: int | None) -> tuple[int, str]:
-    """Resolve split seed from CLI, EVAL_SPLIT_SEED env var, or fallback default."""
-    if cli_seed is not None:
-        return cli_seed, "cli"
-    env_seed = os.environ.get("EVAL_SPLIT_SEED")
-    if env_seed is not None and env_seed.strip():
-        try:
-            return int(env_seed.strip()), "env:EVAL_SPLIT_SEED"
-        except ValueError as exc:
-            raise ValueError(f"EVAL_SPLIT_SEED must be an integer, got {env_seed!r}") from exc
-    return DEFAULT_SEED, "default"
+def check_holdout_dir(path: Path) -> Path:
+    """Refuse holdout locations inside the repository or inside the shared, auto-cleaned temp directory."""
+    resolved = path.expanduser().resolve()
+    if resolved.is_relative_to(REPO_ROOT.resolve()):
+        raise ValueError(f"Holdout directory must be outside the repository: {resolved}")
+    for tmp_root in {Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve(), Path("/var/tmp").resolve()}:
+        if resolved.is_relative_to(tmp_root):
+            raise ValueError(f"Holdout directory must not live in a temp directory ({tmp_root}): {resolved}")
+    return resolved
+
+
+def resolve_seed() -> str:
+    """Read the secret split seed strictly from EVAL_SPLIT_SEED (>= 128 bits as hex); there is no default."""
+    env_seed = (os.environ.get(SEED_ENV) or "").strip()
+    if not env_seed:
+        raise ValueError(
+            f"{SEED_ENV} is not set. Generate a secret 128-bit seed, e.g. "
+            "`export EVAL_SPLIT_SEED=\"$(python3 -c 'import secrets; print(secrets.token_hex(16))')\"`, "
+            "and keep it private."
+        )
+    if not SEED_RE.fullmatch(env_seed):
+        raise ValueError(f"{SEED_ENV} must be at least {MIN_SEED_HEX_CHARS} hex characters (128 bits)")
+    return env_seed.lower()
+
+
+def _write_private(path: Path, payload: dict) -> None:
+    """Write JSON readable only by the owner (0600)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    os.chmod(path, 0o600)
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,9 +286,8 @@ def split_records(
     *,
     archive_filename: str,
     archive_sha256: str,
+    seed: str,
     holdout_ratio: float = 0.20,
-    seed: int = DEFAULT_SEED,
-    seed_source: str = "default",
     pinned_ids: tuple[int, ...] = DEFAULT_PINNED_IDS,
     pinned_files: tuple[str, ...] = DEFAULT_PINNED_FILES,
 ) -> tuple[dict, dict, dict]:
@@ -304,7 +328,7 @@ def split_records(
     def cluster_sort_key(c_idx: int) -> tuple[int, str]:
         indices = clusters[c_idx]
         min_id = records[indices[0]].chat_id
-        digest = hashlib.sha256(f"{seed}:{min_id}".encode()).hexdigest()
+        digest = hmac.new(seed.encode(), str(min_id).encode(), hashlib.sha256).hexdigest()
         return (1 if len(indices) == 1 else 0, digest)
 
     unpinned_cluster_indices.sort(key=cluster_sort_key)
@@ -358,7 +382,6 @@ def split_records(
         "split": "open_dev",
         "archive_filename": archive_filename,
         "archive_sha256": archive_sha256,
-        "seed": seed,
         "count": len(dev_ids),
         "ids": dev_ids,
     }
@@ -376,7 +399,6 @@ def split_records(
         "split": "private_holdout",
         "archive_filename": archive_filename,
         "archive_sha256": archive_sha256,
-        "seed": seed,
         "count": len(holdout_ids),
         "ids": holdout_ids,
         "category_counts": {cat: holdout_cat_counts[cat] for cat in sorted(cat_totals)},
@@ -384,13 +406,11 @@ def split_records(
     }
 
     total = len(records)
-    seed_sha256_prefix = hashlib.sha256(str(seed).encode()).hexdigest()[:12]
     summary_payload = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "archive_filename": archive_filename,
         "archive_sha256": archive_sha256,
-        "seed_source": seed_source,
-        "seed_sha256_prefix": seed_sha256_prefix,
+        "seed_policy": "secret EVAL_SPLIT_SEED (>= 128 bit), HMAC-SHA256 cluster order; seed is never published",
         "holdout_ratio_target": holdout_ratio,
         "similarity_rules": {
             "shingle_k": 4,
@@ -428,16 +448,13 @@ def split_records(
 
 def run_split(
     archive_path: Path,
-    private_dir: Path,
+    holdout_dir: Path,
     summary_out: Path,
     *,
-    holdout_dir: Path | None = None,
+    seed: str,
     holdout_ratio: float = 0.20,
-    seed: int | None = None,
 ) -> tuple[dict, dict, dict]:
-    """Execute the full split pipeline and write private, holdout, and public outputs."""
-    resolved_seed, seed_source = resolve_seed(seed)
-    target_holdout_dir = holdout_dir if holdout_dir is not None else private_dir
+    """Execute the split and write dev_ids.json + holdout_eval.json (0600, dir 0700) and the public summary."""
     archive_sha256, records = parse_archive(archive_path)
     clusters = cluster_records(records)
     dev_payload, holdout_payload, summary_payload = split_records(
@@ -445,56 +462,50 @@ def run_split(
         clusters,
         archive_filename=archive_path.name,
         archive_sha256=archive_sha256,
+        seed=seed,
         holdout_ratio=holdout_ratio,
-        seed=resolved_seed,
-        seed_source=seed_source,
     )
 
-    private_dir.mkdir(parents=True, exist_ok=True)
-    target_holdout_dir.mkdir(parents=True, exist_ok=True)
+    holdout_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(holdout_dir, 0o700)
     summary_out.parent.mkdir(parents=True, exist_ok=True)
-
-    (private_dir / "dev_ids.json").write_text(
-        json.dumps(dev_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    (target_holdout_dir / "holdout_eval.json").write_text(
-        json.dumps(holdout_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    # dev_ids.json is the complement of the holdout, so it is exactly as sensitive and lives next to it.
+    _write_private(holdout_dir / "dev_ids.json", dev_payload)
+    _write_private(holdout_dir / "holdout_eval.json", holdout_payload)
     summary_out.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return dev_payload, holdout_payload, summary_payload
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=f"The seed is read only from {SEED_ENV} (>= {MIN_SEED_HEX_CHARS} hex chars).",
+    )
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
-    parser.add_argument("--private-dir", type=Path, default=DEFAULT_PRIVATE_DIR)
     parser.add_argument(
         "--holdout-dir",
         type=Path,
         default=None,
-        help="External directory outside the repo for holdout_eval.json (env: EVAL_HOLDOUT_DIR)",
+        help=f"Private directory outside the repo and /tmp (env: EVAL_HOLDOUT_DIR, default ~/.local/share/{HOLDOUT_DIR_NAME})",
     )
     parser.add_argument("--summary-out", type=Path, default=DEFAULT_SUMMARY_OUT)
     parser.add_argument("--holdout-ratio", type=float, default=0.20)
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Deterministic split seed (defaults to EVAL_SPLIT_SEED env var, then fallback default)",
-    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    holdout_dir = args.holdout_dir if args.holdout_dir is not None else default_holdout_dir()
+    try:
+        seed = resolve_seed()
+        holdout_dir = check_holdout_dir(args.holdout_dir if args.holdout_dir is not None else default_holdout_dir())
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
     _, _, summary = run_split(
         args.archive,
-        args.private_dir,
+        holdout_dir,
         args.summary_out,
-        holdout_dir=holdout_dir,
+        seed=seed,
         holdout_ratio=args.holdout_ratio,
-        seed=args.seed,
     )
     print(
         f"Split {summary['total_records']} records -> "
@@ -502,7 +513,6 @@ def main(argv: list[str] | None = None) -> int:
         f"private_holdout={summary['private_holdout_count']} ({summary['private_holdout_ratio']:.1%}), "
         f"clusters={summary['duplicate_clusters']['total_clusters']}, "
         f"overlap_count={summary['overlap_count']}, "
-        f"seed_source={summary['seed_source']}, "
         f"holdout_path={holdout_dir / 'holdout_eval.json'}"
     )
     return 0

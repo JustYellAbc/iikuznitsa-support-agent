@@ -1,0 +1,7 @@
+line-length = 120
+target-version = "py312"
+
+[lint]
+extend-select = ["I", "UP", "B", "N", "A"]
+# Long word lists written as "a b c".split() are easier to review than list literals.
+ignore = ["SIM905"]
