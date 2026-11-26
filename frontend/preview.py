@@ -1,4 +1,5 @@
 """Loopback-only T09 preview. Replay customer-side examples from the accepted T04 contract."""
+
 import argparse
 import json
 import re
@@ -44,31 +45,63 @@ def operator_ui_example(turns):
             batch.append(dict(type="message", author="agent", purpose=purpose, text=text, sources=[]))
             question = body["text"]
         else:
-            batch.append(dict(type="handoff", handoff=dict(handoffId="demo-help", reason=reply,
-                              question=question or body["text"], products=[], status="open")))
+            batch.append(
+                dict(
+                    type="handoff",
+                    handoff=dict(
+                        handoffId="demo-help",
+                        reason=reply,
+                        question=question or body["text"],
+                        products=[],
+                        status="open",
+                    ),
+                )
+            )
         for data in batch:
             events.append(dict(seq=len(events) + 1, actionId=action_id, at="2026-11-26T15:00:00Z", data=data))
     return actions, events
 
 
 SCRIPTS = [load_script(case) for case in EXAMPLES if case["id"] in {"c-tender", "c-need", "c-price"}]
-ASK_ISSUE = ({"type": "message", "text": "Позовите оператора."}, ("clarification", "Подскажите, с каким вопросом нужна помощь?"))
-SCRIPTS.extend([
-    operator_ui_example([
-        ASK_ISSUE,
-        ({"type": "message", "text": "Как найти нужную лицензию?"}, ("answer", "Попробуйте поиск по названию продукта в каталоге.")),
-        ({"type": "message", "text": "Это не помогло, соедините с человеком."}, "customer_request"),
-    ]),
-    operator_ui_example([ASK_ISSUE, ({"type": "message", "text": "Позовите оператора."}, "customer_request")]),
-    operator_ui_example([({"type": "message", "text": "Это тендер. Нужны документы."}, "tender")]),
-    operator_ui_example([
-        ({"type": "message", "text": "Можно перенести эту лицензию на другой сервер?"},
-         ("clarification", "В источнике нет подтверждённых сведений. Подключить оператора, чтобы он уточнил ваш вопрос?")),
-        ({"type": "request_operator"}, "customer_request"),
-    ]),
-])
+ASK_ISSUE = (
+    {"type": "message", "text": "Позовите оператора."},
+    ("clarification", "Подскажите, с каким вопросом нужна помощь?"),
+)
+SCRIPTS.extend(
+    [
+        operator_ui_example(
+            [
+                ASK_ISSUE,
+                (
+                    {"type": "message", "text": "Как найти нужную лицензию?"},
+                    ("answer", "Попробуйте поиск по названию продукта в каталоге."),
+                ),
+                ({"type": "message", "text": "Это не помогло, соедините с человеком."}, "customer_request"),
+            ]
+        ),
+        operator_ui_example([ASK_ISSUE, ({"type": "message", "text": "Позовите оператора."}, "customer_request")]),
+        operator_ui_example([({"type": "message", "text": "Это тендер. Нужны документы."}, "tender")]),
+        operator_ui_example(
+            [
+                (
+                    {"type": "message", "text": "Можно перенести эту лицензию на другой сервер?"},
+                    (
+                        "clarification",
+                        "В источнике нет подтверждённых сведений. Подключить оператора, чтобы он уточнил ваш вопрос?",
+                    ),
+                ),
+                ({"type": "request_operator"}, "customer_request"),
+            ]
+        ),
+    ]
+)
 API = "/api/v1/conversations"
-FILES = {"index.html": "text/html", "chat.css": "text/css", "chat.js": "text/javascript", "render.js": "text/javascript"}
+FILES = {
+    "index.html": "text/html",
+    "chat.css": "text/css",
+    "chat.js": "text/javascript",
+    "render.js": "text/javascript",
+}
 
 
 class Preview(BaseHTTPRequestHandler):
@@ -126,7 +159,9 @@ class Preview(BaseHTTPRequestHandler):
             pos = chat["position"]
             matching = [s for s in chat["scripts"] if pos < len(s[0]) and s[0][pos][0] == body]
             if not matching:
-                return self.respond(422, {"code": "invalid_input", "message": "Локальный пример ожидает реплику из сценария Т04."})
+                return self.respond(
+                    422, {"code": "invalid_input", "message": "Локальный пример ожидает реплику из сценария Т04."}
+                )
             actions, events = matching[0]
             action_id = actions[pos][1]
             next_id = actions[pos + 1][1] if pos + 1 < len(actions) else None

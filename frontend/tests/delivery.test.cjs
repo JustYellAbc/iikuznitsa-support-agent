@@ -18,7 +18,7 @@ let browser;
 before(async () => { browser = await chromium.launch({ channel: process.env.T09_BROWSER_CHANNEL }); });
 after(async () => { await browser?.close(); });
 
-test("Вызов человека в интерфейсе Т09", async t => {
+test("Виджет Т09 на примерах контракта", async t => {
   const preview = spawn(process.env.PYTHON || "python", [path.join(__dirname, "../preview.py"), "--port", "0"],
     { windowsHide: true, stdio: ["ignore", "pipe", "inherit"] });
   const lines = createInterface({ input: preview.stdout });
@@ -27,6 +27,46 @@ test("Вызов человека в интерфейсе Т09", async t => {
     once(lines, "line"),
     once(preview, "exit").then(() => { throw new Error("Предпросмотр завершился до запуска"); }),
   ]);
+  await t.test("На мобильном экране видны три состояния цены и источники", async t => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    t.after(() => page.close());
+    const steps = cases.find(item => item.id === "c-price").steps;
+    const request = steps.find(step => step.operationId === "submitAction").body;
+    await page.goto(url);
+    await page.locator("#launch").click();
+    await page.locator("#message").fill(request.text);
+    await page.locator("#send").click();
+    const cards = page.locator("#log .result");
+    await cards.nth(2).waitFor();
+    const card = id => cards.filter({ has: page.locator('a[href*="-' + id + '/"]') });
+    assert.match((await card("61557").innerText()).replace(/\s/g, " "), /4 900 ₽ за упаковку/);
+    assert.match(await card("61557").innerText(), /Срок лицензии неизвестен/);
+    assert.match(await card("48093").innerText(), /Наличие требует подтверждения/);
+    assert.match(await card("504").innerText(), /Цена по запросу/);
+    assert.doesNotMatch(await card("504").innerText(), /₽/);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  });
+  await t.test("После обрыва потока виджет дочитывает историю с последнего события", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    const [first, second] = events;
+    const cursors = [];
+    await page.route("**/events?*", route => {
+      const cursor = Number(new URL(route.request().url()).searchParams.get("after"));
+      cursors.push(cursor);
+      const batch = cursor === first.seq ? [second] : [];
+      return route.fulfill({ json: { events: batch, nextAfter: batch.at(-1)?.seq ?? cursor, hasMore: false } });
+    });
+    await page.route("**/events/stream?*", route => {
+      const frame = "event: event\ndata: " + JSON.stringify(first) + "\n\n";
+      return route.fulfill({ contentType: "text/event-stream", body: frame + frame });
+    });
+    await page.goto(url);
+    await page.locator("#launch").click();
+    await page.getByText(second.data.text, { exact: true }).waitFor();
+    assert.equal(await page.getByText(first.data.text, { exact: true }).count(), 1);
+    assert.deepEqual(cursors.slice(0, 2), [0, first.seq]);
+  });
   for (const [name, turns] of [
     ["Повтор после ответа", [
       ["Позовите оператора.", "Подскажите, с каким вопросом нужна помощь?"],

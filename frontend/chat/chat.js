@@ -16,6 +16,7 @@ const operatorOffer = "В источнике нет подтверждённых
 let operatorOffered = false;
 let cursor = 0, posting = false, polling = false, denied = false, waitUntil = 0;
 let timer, wake, actionError = "", historyError = "";
+let stream, streamUnavailable = false;
 message.value = state.pending?.body.text || "";
 
 async function request(path, key, body) {
@@ -67,6 +68,7 @@ function showError(error, isAction) {
   if (!error.status && ["TypeError", "TimeoutError", "AbortError"].includes(error.name)) text = "Связь прервалась. Повторите запрос.";
   if (error.status === 401 || error.status === 403 || error.status === 404 && !isAction && state.id) {
     denied = true;
+    closeStream();
     text = error.status === 401 ? "Войдите на стенд и обновите страницу." : "Диалог недоступен. Обновите страницу, чтобы начать заново.";
     state = {}; save();
     log.replaceChildren(); openHandoffs.clear(); target.replaceChildren(); byId("target-label").hidden = true;
@@ -106,11 +108,36 @@ function display(event) {
   if (atBottom) scroller.scrollTop = scroller.scrollHeight;
 }
 
+function closeStream() {
+  if (stream) stream.close();
+  stream = null;
+}
+
+function subscribe() {
+  if (stream || streamUnavailable || panel.hidden || denied || !window.EventSource) return;
+  const source = new EventSource(base + "/" + encodeURIComponent(state.id) + "/events/stream?after=" + cursor);
+  stream = source;
+  function fallBack() {
+    if (stream !== source) return;
+    closeStream();
+    streamUnavailable = true;
+    poll(); // Recover any missing sequence from the T04 journal.
+  }
+  source.addEventListener("event", frame => {
+    if (stream !== source) return;
+    try {
+      display(JSON.parse(frame.data));
+      sync();
+    } catch { fallBack(); }
+  });
+  source.onerror = fallBack;
+}
+
 async function poll() {
-  if (polling || panel.hidden || !state.id || denied) return;
+  if (stream || polling || panel.hidden || !state.id || denied) return;
   clearTimeout(timer);
   polling = true;
-  let delay = 1200;
+  let delay;
   try {
     let page;
     do {
@@ -121,12 +148,16 @@ async function poll() {
       if (page.nextAfter !== cursor || page.hasMore && cursor === before) throw new Error("Ошибка курсора истории.");
     } while (page.hasMore && !panel.hidden);
     historyError = "";
+    subscribe();
   } catch (error) {
+    closeStream();
     showError(error, false);
     delay = Math.max(3000, (error.retryAfter || 0) * 1000);
   } finally {
     polling = false; sync();
-    if (!panel.hidden && !denied) timer = setTimeout(poll, delay);
+    if (!stream && !panel.hidden && !denied) {
+      timer = setTimeout(poll, delay ?? (posting || state.receipt ? 1200 : 4000));
+    }
   }
 }
 
@@ -177,11 +208,13 @@ function sendText() {
 }
 
 launch.onclick = () => {
+  streamUnavailable = false;
   panel.hidden = false; launch.hidden = true; launch.setAttribute("aria-expanded", "true");
   message.focus(); sync(); connect();
 };
 function close() {
   panel.hidden = true; launch.hidden = false; launch.setAttribute("aria-expanded", "false");
+  closeStream();
   clearTimeout(timer); launch.focus();
 }
 byId("close").onclick = close;
