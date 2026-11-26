@@ -10,15 +10,19 @@ from app.contracts.t04 import HandoffReason, Product
 ActionType = Literal["message", "request_operator"]
 SearchFinding = Literal["partner_required", "insufficient_evidence"]
 OFFER_HELP = "В источнике нет подтверждённых сведений. Подключить оператора, чтобы он уточнил ваш вопрос?"
+ASK_TOPIC = "Подскажите, с каким вопросом нужна помощь?"
 CONFIRMED = "Передал вопрос оператору. Он увидит переписку и ответит в этом чате."
 
 # Match a request for a human, not every mention of a manager or a telecom operator.
 HUMAN = r"(?:оператор|менеджер|специалист|человек|сотрудник)\w*"
 CALL = r"(?:позов\w*|позва\w*|подключ\w*|соедин\w*|переключ\w*|приглас\w*|связа\w*|поговор\w*|переда\w*)"
-HUMAN_REQUEST = re.compile(
-    rf"\b(?:{CALL}|нужен|нужна|хочу|можно)(?:\s+(?:меня|мне|нас|нам|пожалуйста|на|к|с|со|жив\w*|ваш\w*)){{0,4}}"
-    rf"\s+{HUMAN}\b(?!\s+связи)"
+REQUEST_WORDS = (
+    rf"(?:{CALL}|нужен|нужна|хочу|можно)(?:[ ,]+(?:меня|мне|нас|нам|пожалуйста|на|к|с|со|жив\w*|ваш\w*|"
+    rf"пообщаться|поговорить|связаться|позвать|подключить)){{0,5}}[ ,]+{HUMAN}"
 )
+HUMAN_REQUEST = re.compile(rf"\b{REQUEST_WORDS}\b(?!\s+связи)")
+COURTESY = r"(?:здравствуйте|здравствуй|добрый (?:день|вечер)|доброе утро|привет|пожалуйста|спасибо)"
+BARE_REQUEST = re.compile(rf"(?:{COURTESY}[,.! ]+)*(?:{REQUEST_WORDS}|{HUMAN})(?:[,!?. ]+{COURTESY})*[,!?. ]*")
 HUMAN_DECLINED = re.compile(
     rf"\b(?:без\s+{HUMAN}|не\s+(?:(?:надо|нужно|хочу)\s+)?{CALL}|не\s+нужен\s+{HUMAN}|{HUMAN}\s+не\s+нужен)"
 )
@@ -50,9 +54,11 @@ def asks_for_operator(text: str) -> bool:
 
 
 def bare_request(text: str) -> bool:
-    return asks_for_operator(text) and bool(
-        re.fullmatch(rf"(?:пожалуйста[, ]+)?(?:{CALL}\s+(?:мне\s+|с\s+)?)?{HUMAN}(?:[, ]+пожалуйста)?[?!. ]*", text)
-    )
+    return bool(BARE_REQUEST.fullmatch(text))
+
+
+def opening_chatter(text: str) -> bool:
+    return bool(re.fullmatch(rf"{COURTESY}[,.!? ]*", text) or AFFIRMATIVE.fullmatch(text))
 
 
 def handoff_reason(text: str) -> HandoffReason | None:
@@ -77,7 +83,7 @@ def open_question(history: list[Message], text: str, generic: bool) -> str:
             if (
                 m.role == "client"
                 and not bare_request(m.text.casefold())
-                and not AFFIRMATIVE.fullmatch(m.text.casefold())
+                and not opening_chatter(m.text.strip().casefold())
             ):
                 return m.text
     return text
@@ -87,7 +93,11 @@ def open_question(history: list[Message], text: str, generic: bool) -> str:
 class Routing:
     reason: HandoffReason
     question: str
-    offer_help: bool = False
+    clarification: str | None = None
+
+    @property
+    def offer_help(self) -> bool:
+        return self.clarification == OFFER_HELP
 
 
 def route_action(
@@ -105,8 +115,13 @@ def route_action(
             "customer_request", open_question(history, text or "Покупатель просит подключить оператора.", True)
         )
     reason = handoff_reason(body)
+    if reason == "customer_request" and bare_request(body):
+        prior_requests = any(m.role == "client" and not opening_chatter(m.text.strip().casefold()) for m in history)
+        if not prior_requests and not products and finding != "partner_required":
+            return Routing(reason, text, clarification=ASK_TOPIC)
+        return Routing(reason, open_question(history, text, True))
     if reason:
-        return Routing(reason, open_question(history, text, reason == "customer_request" and bare_request(body)))
+        return Routing(reason, text)
     if history and history[-1].role == "agent" and history[-1].text == OFFER_HELP and AFFIRMATIVE.fullmatch(body):
         return Routing("insufficient_evidence", open_question(history, text, True))
     if finding == "partner_required":
@@ -120,5 +135,5 @@ def route_action(
         if TERM.search(body) and p.licenseTerm is None:
             finding = "insufficient_evidence"
     if finding == "insufficient_evidence":
-        return Routing("insufficient_evidence", text, offer_help=True)
+        return Routing("insufficient_evidence", text, clarification=OFFER_HELP)
     return None

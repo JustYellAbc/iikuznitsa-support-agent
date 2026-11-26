@@ -9,7 +9,7 @@ from tests.conftest import api as stand_api  # noqa: F401 — pytest fixture
 from tests.conftest import client as client
 from tests.conftest import env as env
 
-from app.agent.handoff import OFFER_HELP, route_action
+from app.agent.handoff import ASK_TOPIC, OFFER_HELP, route_action
 from app.contracts.schemas import Message
 from app.contracts.t04 import Product, ProductsData
 from app.db import repository
@@ -18,8 +18,7 @@ from app.db import repository
 @pytest.mark.parametrize(
     ("text", "reason"),
     [
-        ("Позвать оператора", "customer_request"),
-        ("Соедините меня с живым человеком, пожалуйста", "customer_request"),
+        ("Соедините с оператором, лицензия не активируется", "customer_request"),
         ("Закупка по 44-ФЗ, понадобятся документы", "tender"),
         ("Нужны документы вне Store", "special_terms"),
         ("Пришлите анкету поставщика", "special_terms"),
@@ -30,7 +29,7 @@ from app.db import repository
 )
 def test_mandatory_routes(text, reason):
     route = route_action([], text, [])
-    assert route.reason == reason and not route.offer_help
+    assert route.reason == reason and route.clarification is None
     assert route.question == text
 
 
@@ -154,3 +153,48 @@ def test_parallel_t09_button_retries_create_one_receipt_and_handoff(stand_api): 
     assert h["reason"] == "customer_request" and h["products"] == []
     api.login()
     assert queue(api) == [h]
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    ["Позови оператора", "Соедините меня с живым человеком, пожалуйста", "Оператор!", "Хочу поговорить с менеджером"],
+)
+def test_first_request_without_a_topic_then_repeat(stand_api, request_text):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    api.login()
+    say(api, cid, "Добрый день!")
+    first = say(api, cid, request_text)
+    assert first[-1]["text"] == ASK_TOPIC and first[-1]["purpose"] == "clarification"
+    assert not queue(api)
+    second = say(api, cid, "Позови оператора")
+    assert [e["text"] for e in second if e.get("text") == ASK_TOPIC] == [ASK_TOPIC]
+    [ticket] = queue(api)
+    assert ticket["reason"] == "customer_request"
+    say(api, cid, request_text)
+    assert queue(api) == [ticket]
+
+
+def test_topic_after_clarification_then_customer_insists(stand_api):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    api.login()
+    say(api, cid, "Позови оператора")
+    question = "Где в заказе найти счёт?"
+    reply = say(api, cid, question)[-1]
+    assert reply["author"] == "agent" and reply["purpose"] == "answer"
+    assert not queue(api)
+    say(api, cid, "Позови оператора")
+    [ticket] = queue(api)
+    assert (ticket["reason"], ticket["question"]) == ("customer_request", question)
+
+
+def test_tender_after_first_request_goes_straight_to_manager(stand_api):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    api.login()
+    say(api, cid, "Оператор")
+    question = "Закупка тендерная, нужны документы"
+    say(api, cid, question)
+    [ticket] = queue(api)
+    assert (ticket["reason"], ticket["question"]) == ("tender", question)

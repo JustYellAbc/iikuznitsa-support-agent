@@ -23,7 +23,7 @@ LLM — только через app.core.llm.llm_call(). BudgetExceededError м�
 import time
 from collections.abc import Awaitable, Callable
 
-from app.agent.handoff import CONFIRMED, OFFER_HELP, ActionType, SearchFinding, route_action
+from app.agent.handoff import CONFIRMED, ActionType, SearchFinding, route_action
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Session, StepTrace
 from app.contracts.t04 import Product
 from app.core.llm import llm_call
@@ -52,7 +52,7 @@ async def run_turn(
         step = StepTrace(
             tool="handoff_policy",
             args={"reason": route.reason},
-            result_summary="Предложено подключение оператора" if route.offer_help else "Передача оператору",
+            result_summary=route.clarification or "Передача оператору",
         )
         await emit_step(step)
         return AgentReply(
@@ -60,15 +60,15 @@ async def run_turn(
                 turn_id=new_id("turn"),
                 session_id=session.id,
                 steps=[step],
-                decision="answer" if route.offer_help else "escalate",
-                escalation_reason=None if route.offer_help else route.reason,
+                decision="answer" if route.clarification else "escalate",
+                escalation_reason=None if route.clarification else route.reason,
                 total_cost_rub=0,
                 total_latency_ms=int((time.perf_counter() - started) * 1000),
             ),
-            text=OFFER_HELP if route.offer_help else CONFIRMED,
-            purpose="clarification" if route.offer_help else "notice",
+            text=route.clarification or CONFIRMED,
+            purpose="clarification" if route.clarification else "notice",
             handoff=None
-            if route.offer_help
+            if route.clarification
             else HandoffRequest(reason=route.reason, question=route.question, products=products),
         )
     resp = await llm_call(
