@@ -222,12 +222,12 @@ def test_cost_formula_and_step_aggregation(tmp_path: Path):
         summary,
         pricing,
         usd_rub_rate=Decimal("100"),
-        requests_per_day=500,
-        days_per_month=30,
     )
 
     assert res.has_measurements is True
     assert res.measured_dialogs == 2
+    assert res.period_days == 180
+    assert res.requests_per_period == 500
     assert res.weighted_variable_cost_rub == Decimal("0.975")
     assert res.unweighted_variable_cost_rub == Decimal("0.975")
 
@@ -245,19 +245,86 @@ def test_cost_formula_and_step_aggregation(tmp_path: Path):
     # Тождество: сумма стоимостей шагов == переменная стоимость 1 обращения.
     assert sum((s.cost_per_request_rub for s in res.steps), Decimal("0")) == res.active_variable_cost_rub
 
-    # 500 * 0.975 = 487.50 RUB; + 150 RUB infra = 637.50 RUB/day; * 30 = 19125.00 RUB/month.
-    assert res.daily_variable_cost_rub == Decimal("487.5")
+    # Базовый период (полгода = 180 дней, ровно 500 обращений за весь период):
+    # Переменные: 500 * 0.975 = 487.50 RUB; инфраструктура: 150 * 180 = 27000 RUB;
+    # Итого за полгода: 27487.50 RUB -> 54.975 RUB/обращение.
+    assert res.period_variable_cost_rub == Decimal("487.5")
     assert res.daily_infra_cost_rub == Decimal("150")
-    assert res.daily_total_cost_rub == Decimal("637.5")
-    assert res.monthly_total_cost_rub == Decimal("19125")
-    assert res.full_cost_per_request_rub == Decimal("1.275")
+    assert res.period_infra_cost_rub == Decimal("27000")
+    assert res.period_total_cost_rub == Decimal("27487.5")
+    assert res.full_cost_per_request_rub == Decimal("54.975")
 
-    # Оператор: 1200 RUB/h * 5 min / 60 = 100 RUB/req; 50000 RUB/day; 1500000 RUB/month.
+    # Ручной маршрут (оператор) на тех же 500 обращениях за полгода:
+    # 1200 RUB/ч * 5 мин / 60 = 100 RUB/обр; 500 * 100 = 50000 RUB за период.
     assert res.operator_cost_per_request_rub == Decimal("100")
-    assert res.operator_daily_cost_rub == Decimal("50000")
-    assert res.operator_monthly_cost_rub == Decimal("1500000")
-    assert res.savings_per_request_rub == Decimal("98.725")
-    assert res.savings_daily_rub == Decimal("49362.5")
+    assert res.operator_period_cost_rub == Decimal("50000")
+    assert res.savings_per_request_rub == Decimal("45.025")
+    assert res.savings_period_rub == Decimal("22512.5")
+    assert res.savings_pct == Decimal("45.025")
+
+    # Отдельный нагрузочный сценарий (500 обращений/сутки со слайда 2):
+    load = res.load_scenario
+    assert load.requests_per_day == 500
+    assert load.period_days == 180
+    assert load.requests_per_period == 90000
+    assert load.daily_variable_cost_rub == Decimal("487.5")
+    assert load.daily_infra_cost_rub == Decimal("150")
+    assert load.daily_total_cost_rub == Decimal("637.5")
+    assert load.period_variable_cost_rub == Decimal("87750")
+    assert load.period_infra_cost_rub == Decimal("27000")
+    assert load.period_total_cost_rub == Decimal("114750")
+    assert load.full_cost_per_request_rub == Decimal("1.275")
+    assert load.operator_daily_cost_rub == Decimal("50000")
+    assert load.operator_period_cost_rub == Decimal("9000000")
+    assert load.savings_per_request_rub == Decimal("98.725")
+    assert load.savings_daily_rub == Decimal("49362.5")
+    assert load.savings_period_rub == Decimal("8885250")
+    assert load.savings_pct == Decimal("98.725")
+
+
+def test_infra_is_independent_of_request_volume_and_load_scenario_is_separate(tmp_path: Path):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    pricing = ue.load_pricing_config(_write_synthetic_pricing(tmp_path / "pricing.yaml"))
+    dialogs = [
+        ue.DialogMeasurement(
+            dialog_id="d1",
+            category=NINE_CATEGORIES[0],
+            calls=(ue.LLMCallRecord("agent_loop", "synth-smart", 1000, 500),),  # 0.60 RUB
+        )
+    ]
+
+    # При неизменных 180 днях инфраструктура (150 * 180 = 27000) не зависит от объёма обращений.
+    base_500 = ue.compute_unit_economics(
+        dialogs, summary, pricing, usd_rub_rate=Decimal("100"), requests_per_period=500, period_days=180
+    )
+    small_100 = ue.compute_unit_economics(
+        dialogs, summary, pricing, usd_rub_rate=Decimal("100"), requests_per_period=100, period_days=180
+    )
+    assert base_500.period_infra_cost_rub == Decimal("27000")
+    assert small_100.period_infra_cost_rub == Decimal("27000")
+    assert base_500.period_variable_cost_rub == Decimal("300")
+    assert small_100.period_variable_cost_rub == Decimal("60")
+    assert base_500.operator_period_cost_rub == Decimal("50000")
+    assert small_100.operator_period_cost_rub == Decimal("10000")
+
+    # При изменении длительности периода (90 дней) инфраструктура = ставка * дни,
+    # а переменные и оператор на тех же 500 обращениях не меняются.
+    quarter = ue.compute_unit_economics(
+        dialogs, summary, pricing, usd_rub_rate=Decimal("100"), requests_per_period=500, period_days=90
+    )
+    assert quarter.period_infra_cost_rub == Decimal("13500")
+    assert quarter.period_variable_cost_rub == Decimal("300")
+    assert quarter.operator_period_cost_rub == Decimal("50000")
+    assert quarter.period_total_cost_rub == Decimal("13800")
+
+    # В Markdown-отчёте базовый расчёт и нагрузочный сценарий 500/сутки разделены и явно подписаны.
+    md = ue.render_markdown_report(base_500, pricing)
+    assert "500 обращений за 180 дн." in md
+    assert "27300.00" in md  # 300 + 27000
+    assert "50000.00" in md  # оператор на 500 обращениях
+    assert "Нагрузочный сценарий (отдельный расчёт: 500 обращений/сутки, не базовый прогноз)" in md
+    assert "не является базовым прогнозом" in md
+    assert "81000.00" in md  # 90000 * 0.60 + 27000 = 54000 + 27000 = 81000.00
 
 
 # --- 2. Взвешивание по долям категорий + eval/telemetry join --------------------
@@ -411,9 +478,14 @@ def test_empty_measurements(tmp_path: Path):
     assert res.measured_dialogs == 0
     assert res.steps == ()
     assert res.weighted_variable_cost_rub is None
-    assert res.daily_total_cost_rub is None
+    assert res.period_variable_cost_rub is None
+    assert res.period_total_cost_rub is None
     assert res.daily_infra_cost_rub == Decimal("150")
+    assert res.period_infra_cost_rub == Decimal("27000")
     assert res.operator_cost_per_request_rub == Decimal("100")
+    assert res.operator_period_cost_rub == Decimal("50000")
+    assert res.load_scenario.period_total_cost_rub is None
+    assert res.load_scenario.period_infra_cost_rub == Decimal("27000")
     assert len(res.missing_categories) == 9
     assert all(c.status == "no_data" and c.avg_variable_cost_rub is None for c in res.categories)
 
@@ -599,8 +671,14 @@ def test_xlsx_template_preserves_formulas_and_cbr_rate_end_to_end(tmp_path: Path
         assert all(isinstance(line, str) and line.strip() for line in comment_lines)
         assert "архив" in comment_lines[0].lower()
         assert "https://example.invalid/pricing/smart" in comment_lines[1]
+        assert "500 обр./180 дн." in comment_lines[2]
+        assert "нагрузочный сценарий (не база): 500 обр./сут." in comment_lines[2]
     finally:
         wb.close()
+
+    md = out_md.read_text(encoding="utf-8")
+    assert "500 обращений за 180 дн." in md
+    assert "не базовый прогноз" in md
 
 
 def test_xlsx_template_grouped_headers_and_shifted_rows(tmp_path: Path):

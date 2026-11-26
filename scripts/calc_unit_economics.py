@@ -35,8 +35,9 @@ ZERO = Decimal("0")
 
 SUPPORTED_CURRENCIES = frozenset({"RUB", "USD"})
 
-DEFAULT_REQUESTS_PER_DAY = 500
-DEFAULT_DAYS_PER_MONTH = 30
+DEFAULT_PERIOD_DAYS = 180
+DEFAULT_REQUESTS_PER_PERIOD = 500
+DEFAULT_LOAD_REQUESTS_PER_DAY = 500
 DEFAULT_REPORT_OUT = Path("docs/cost_report.md")
 DEFAULT_PRICING_PATH = Path("config/pricing.yaml")
 
@@ -152,6 +153,28 @@ class CategoryBreakdown:
 
 
 @dataclass(frozen=True)
+class LoadScenarioEconomics:
+    """Отдельный нагрузочный сценарий (например, 500 обращений/сутки со слайда 2; не базовый прогноз)."""
+
+    requests_per_day: int
+    period_days: int
+    requests_per_period: int
+    daily_variable_cost_rub: Decimal | None
+    daily_infra_cost_rub: Decimal
+    daily_total_cost_rub: Decimal | None
+    period_variable_cost_rub: Decimal | None
+    period_infra_cost_rub: Decimal
+    period_total_cost_rub: Decimal | None
+    full_cost_per_request_rub: Decimal | None
+    operator_daily_cost_rub: Decimal
+    operator_period_cost_rub: Decimal
+    savings_per_request_rub: Decimal | None
+    savings_daily_rub: Decimal | None
+    savings_period_rub: Decimal | None
+    savings_pct: Decimal | None
+
+
+@dataclass(frozen=True)
 class UnitEconomicsResult:
     has_measurements: bool
     weighting_mode: str  # "archive_weighted" | "unweighted" | "none"
@@ -160,25 +183,24 @@ class UnitEconomicsResult:
     uncovered_archive_share: Decimal
     missing_categories: tuple[str, ...]
     usd_rub_rate: Decimal | None
-    requests_per_day: int
-    days_per_month: int
+    period_days: int
+    requests_per_period: int
     steps: tuple[StepAggregate, ...]
     categories: tuple[CategoryBreakdown, ...]
     weighted_variable_cost_rub: Decimal | None
     unweighted_variable_cost_rub: Decimal | None
     active_variable_cost_rub: Decimal | None
-    daily_variable_cost_rub: Decimal | None
     daily_infra_cost_rub: Decimal
-    daily_total_cost_rub: Decimal | None
-    monthly_total_cost_rub: Decimal | None
+    period_variable_cost_rub: Decimal | None
+    period_infra_cost_rub: Decimal
+    period_total_cost_rub: Decimal | None
     full_cost_per_request_rub: Decimal | None
     operator_cost_per_request_rub: Decimal
-    operator_daily_cost_rub: Decimal
-    operator_monthly_cost_rub: Decimal
+    operator_period_cost_rub: Decimal
     savings_per_request_rub: Decimal | None
-    savings_daily_rub: Decimal | None
-    savings_monthly_rub: Decimal | None
+    savings_period_rub: Decimal | None
     savings_pct: Decimal | None
+    load_scenario: LoadScenarioEconomics
 
 
 @dataclass(frozen=True)
@@ -636,29 +658,102 @@ def _call_cost_rub(call: LLMCallRecord, pricing: PricingConfig, usd_rub_rate: De
     return (cost_in + cost_out) * rate
 
 
+def _compute_load_scenario(
+    *,
+    active_variable_cost_rub: Decimal | None,
+    daily_infra_cost_rub: Decimal,
+    operator_cost_per_request_rub: Decimal,
+    requests_per_day: int,
+    period_days: int,
+) -> LoadScenarioEconomics:
+    """Считает отдельный нагрузочный сценарий (например, 500 обращений/сутки со слайда 2)."""
+    req_day_dec = Decimal(requests_per_day)
+    period_days_dec = Decimal(period_days)
+    requests_per_period = requests_per_day * period_days
+    req_period_dec = Decimal(requests_per_period)
+
+    period_infra_cost_rub = daily_infra_cost_rub * period_days_dec
+    operator_daily_cost_rub = operator_cost_per_request_rub * req_day_dec
+    operator_period_cost_rub = operator_cost_per_request_rub * req_period_dec
+
+    if active_variable_cost_rub is None:
+        return LoadScenarioEconomics(
+            requests_per_day=requests_per_day,
+            period_days=period_days,
+            requests_per_period=requests_per_period,
+            daily_variable_cost_rub=None,
+            daily_infra_cost_rub=daily_infra_cost_rub,
+            daily_total_cost_rub=None,
+            period_variable_cost_rub=None,
+            period_infra_cost_rub=period_infra_cost_rub,
+            period_total_cost_rub=None,
+            full_cost_per_request_rub=None,
+            operator_daily_cost_rub=operator_daily_cost_rub,
+            operator_period_cost_rub=operator_period_cost_rub,
+            savings_per_request_rub=None,
+            savings_daily_rub=None,
+            savings_period_rub=None,
+            savings_pct=None,
+        )
+
+    daily_variable_cost_rub = req_day_dec * active_variable_cost_rub
+    daily_total_cost_rub = daily_variable_cost_rub + daily_infra_cost_rub
+    period_variable_cost_rub = req_period_dec * active_variable_cost_rub
+    period_total_cost_rub = period_variable_cost_rub + period_infra_cost_rub
+    full_cost_per_request_rub = period_total_cost_rub / req_period_dec
+
+    savings_per_request_rub = operator_cost_per_request_rub - full_cost_per_request_rub
+    savings_daily_rub = operator_daily_cost_rub - daily_total_cost_rub
+    savings_period_rub = operator_period_cost_rub - period_total_cost_rub
+    savings_pct = (savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
+
+    return LoadScenarioEconomics(
+        requests_per_day=requests_per_day,
+        period_days=period_days,
+        requests_per_period=requests_per_period,
+        daily_variable_cost_rub=daily_variable_cost_rub,
+        daily_infra_cost_rub=daily_infra_cost_rub,
+        daily_total_cost_rub=daily_total_cost_rub,
+        period_variable_cost_rub=period_variable_cost_rub,
+        period_infra_cost_rub=period_infra_cost_rub,
+        period_total_cost_rub=period_total_cost_rub,
+        full_cost_per_request_rub=full_cost_per_request_rub,
+        operator_daily_cost_rub=operator_daily_cost_rub,
+        operator_period_cost_rub=operator_period_cost_rub,
+        savings_per_request_rub=savings_per_request_rub,
+        savings_daily_rub=savings_daily_rub,
+        savings_period_rub=savings_period_rub,
+        savings_pct=savings_pct,
+    )
+
+
 def compute_unit_economics(
     dialogs: list[DialogMeasurement],
     split_summary: SplitSummary,
     pricing: PricingConfig,
     *,
     usd_rub_rate: Decimal | None,
-    requests_per_day: int = DEFAULT_REQUESTS_PER_DAY,
-    days_per_month: int = DEFAULT_DAYS_PER_MONTH,
+    requests_per_period: int = DEFAULT_REQUESTS_PER_PERIOD,
+    period_days: int = DEFAULT_PERIOD_DAYS,
+    load_requests_per_day: int = DEFAULT_LOAD_REQUESTS_PER_DAY,
 ) -> UnitEconomicsResult:
-    """Агрегирует шаги агента, взвешивает по долям категорий и считает суточную/месячную экономику."""
-    if requests_per_day <= 0:
-        raise ValueError("requests_per_day должно быть > 0.")
-    if days_per_month <= 0:
-        raise ValueError("days_per_month должно быть > 0.")
+    """Агрегирует шаги агента, взвешивает по долям категорий и считает экономику за период и нагрузочный сценарий."""
+    if requests_per_period <= 0:
+        raise ValueError("requests_per_period должно быть > 0.")
+    if period_days <= 0:
+        raise ValueError("period_days должно быть > 0.")
+    if load_requests_per_day <= 0:
+        raise ValueError("load_requests_per_day должно быть > 0.")
 
     infra_rate = _currency_multiplier(pricing.infrastructure.currency, usd_rub_rate, "инфраструктуры")
     daily_infra_cost_rub = pricing.infrastructure.daily_cost * infra_rate
 
+    req_period_dec = Decimal(requests_per_period)
+    period_days_dec = Decimal(period_days)
+    period_infra_cost_rub = daily_infra_cost_rub * period_days_dec
+
     operator_cost_per_request_rub = pricing.operator.hourly_rate_rub * pricing.operator.minutes_per_request / SIXTY
-    req_day_dec = Decimal(requests_per_day)
-    days_month_dec = Decimal(days_per_month)
-    operator_daily_cost_rub = operator_cost_per_request_rub * req_day_dec
-    operator_monthly_cost_rub = operator_daily_cost_rub * days_month_dec
+    operator_period_cost_rub = operator_cost_per_request_rub * req_period_dec
 
     # Пустые замеры — честный результат без подстановки нулей в переменную стоимость.
     if not dialogs:
@@ -673,6 +768,13 @@ def compute_unit_economics(
             )
             for cat in split_summary.categories.values()
         )
+        load_scenario = _compute_load_scenario(
+            active_variable_cost_rub=None,
+            daily_infra_cost_rub=daily_infra_cost_rub,
+            operator_cost_per_request_rub=operator_cost_per_request_rub,
+            requests_per_day=load_requests_per_day,
+            period_days=period_days,
+        )
         return UnitEconomicsResult(
             has_measurements=False,
             weighting_mode="none",
@@ -681,25 +783,24 @@ def compute_unit_economics(
             uncovered_archive_share=Decimal("1"),
             missing_categories=tuple(split_summary.categories.keys()),
             usd_rub_rate=usd_rub_rate,
-            requests_per_day=requests_per_day,
-            days_per_month=days_per_month,
+            period_days=period_days,
+            requests_per_period=requests_per_period,
             steps=(),
             categories=empty_cats,
             weighted_variable_cost_rub=None,
             unweighted_variable_cost_rub=None,
             active_variable_cost_rub=None,
-            daily_variable_cost_rub=None,
             daily_infra_cost_rub=daily_infra_cost_rub,
-            daily_total_cost_rub=None,
-            monthly_total_cost_rub=None,
+            period_variable_cost_rub=None,
+            period_infra_cost_rub=period_infra_cost_rub,
+            period_total_cost_rub=None,
             full_cost_per_request_rub=None,
             operator_cost_per_request_rub=operator_cost_per_request_rub,
-            operator_daily_cost_rub=operator_daily_cost_rub,
-            operator_monthly_cost_rub=operator_monthly_cost_rub,
+            operator_period_cost_rub=operator_period_cost_rub,
             savings_per_request_rub=None,
-            savings_daily_rub=None,
-            savings_monthly_rub=None,
+            savings_period_rub=None,
             savings_pct=None,
+            load_scenario=load_scenario,
         )
 
     # Проверяем наличие всех моделей в pricing.yaml и считаем стоимость каждого диалога.
@@ -855,15 +956,21 @@ def compute_unit_economics(
             )
         )
 
-    daily_variable_cost_rub = req_day_dec * active_variable_cost_rub
-    daily_total_cost_rub = daily_variable_cost_rub + daily_infra_cost_rub
-    monthly_total_cost_rub = daily_total_cost_rub * days_month_dec
-    full_cost_per_request_rub = daily_total_cost_rub / req_day_dec
+    period_variable_cost_rub = req_period_dec * active_variable_cost_rub
+    period_total_cost_rub = period_variable_cost_rub + period_infra_cost_rub
+    full_cost_per_request_rub = period_total_cost_rub / req_period_dec
 
     savings_per_request_rub = operator_cost_per_request_rub - full_cost_per_request_rub
-    savings_daily_rub = operator_daily_cost_rub - daily_total_cost_rub
-    savings_monthly_rub = operator_monthly_cost_rub - monthly_total_cost_rub
-    savings_pct = (savings_daily_rub / operator_daily_cost_rub) * HUNDRED if operator_daily_cost_rub > ZERO else ZERO
+    savings_period_rub = operator_period_cost_rub - period_total_cost_rub
+    savings_pct = (savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
+
+    load_scenario = _compute_load_scenario(
+        active_variable_cost_rub=active_variable_cost_rub,
+        daily_infra_cost_rub=daily_infra_cost_rub,
+        operator_cost_per_request_rub=operator_cost_per_request_rub,
+        requests_per_day=load_requests_per_day,
+        period_days=period_days,
+    )
 
     return UnitEconomicsResult(
         has_measurements=True,
@@ -873,25 +980,24 @@ def compute_unit_economics(
         uncovered_archive_share=uncovered_share,
         missing_categories=tuple(missing_cats),
         usd_rub_rate=usd_rub_rate,
-        requests_per_day=requests_per_day,
-        days_per_month=days_per_month,
+        period_days=period_days,
+        requests_per_period=requests_per_period,
         steps=tuple(step_aggs),
         categories=tuple(category_rows),
         weighted_variable_cost_rub=weighted_variable_cost_rub,
         unweighted_variable_cost_rub=unweighted_variable_cost_rub,
         active_variable_cost_rub=active_variable_cost_rub,
-        daily_variable_cost_rub=daily_variable_cost_rub,
         daily_infra_cost_rub=daily_infra_cost_rub,
-        daily_total_cost_rub=daily_total_cost_rub,
-        monthly_total_cost_rub=monthly_total_cost_rub,
+        period_variable_cost_rub=period_variable_cost_rub,
+        period_infra_cost_rub=period_infra_cost_rub,
+        period_total_cost_rub=period_total_cost_rub,
         full_cost_per_request_rub=full_cost_per_request_rub,
         operator_cost_per_request_rub=operator_cost_per_request_rub,
-        operator_daily_cost_rub=operator_daily_cost_rub,
-        operator_monthly_cost_rub=operator_monthly_cost_rub,
+        operator_period_cost_rub=operator_period_cost_rub,
         savings_per_request_rub=savings_per_request_rub,
-        savings_daily_rub=savings_daily_rub,
-        savings_monthly_rub=savings_monthly_rub,
+        savings_period_rub=savings_period_rub,
         savings_pct=savings_pct,
+        load_scenario=load_scenario,
     )
 
 
@@ -936,7 +1042,7 @@ def _merge_span(ws: Worksheet, row: int, col: int) -> tuple[int, int, int, int]:
 def _as_positive_decimal(val: Any) -> Decimal | None:
     if val is None or isinstance(val, bool) or _is_formula(val):
         return None
-    if isinstance(val, (int, float, Decimal)):
+    if isinstance(val, int | float | Decimal):
         d = Decimal(str(val))
         return d if d.is_finite() and d > ZERO else None
     if isinstance(val, str):
@@ -1237,9 +1343,12 @@ def build_comment_lines(result: UnitEconomicsResult, pricing: PricingConfig) -> 
     line2 = f"Прайсы LLM: {model_refs}."
 
     line3 = (
-        f"Инфраструктура: {_fmt_dec(result.daily_infra_cost_rub)} ₽/сут "
-        f"({pricing.infrastructure.source_url}, {pricing.infrastructure.date}); "
-        f"оператор: {_fmt_dec(result.operator_cost_per_request_rub)} ₽/обр ({pricing.operator.date})."
+        f"База ({result.requests_per_period} обр./{result.period_days} дн.): "
+        f"инфра {_fmt_dec(result.daily_infra_cost_rub)} ₽/сут "
+        f"({_fmt_dec(result.period_infra_cost_rub)} ₽/период, "
+        f"{pricing.infrastructure.source_url}, {pricing.infrastructure.date}); "
+        f"оператор {_fmt_dec(result.operator_cost_per_request_rub)} ₽/обр ({pricing.operator.date}); "
+        f"нагрузочный сценарий (не база): {result.load_scenario.requests_per_day} обр./сут."
     )
     return [line1, line2, line3]
 
@@ -1317,23 +1426,35 @@ def fill_xlsx_template(
 
 def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) -> str:
     """Формирует воспроизводимый Markdown-отчёт по unit-экономике."""
+    load = result.load_scenario
     rate_str = _fmt_dec(result.usd_rub_rate, "0.0001") if result.usd_rub_rate else "не использовался"
     w_var = _fmt_dec(result.weighted_variable_cost_rub, "0.0001")
     u_var = _fmt_dec(result.unweighted_variable_cost_rub, "0.0001")
-    d_var = _fmt_dec(result.daily_variable_cost_rub, "0.01")
+    p_var = _fmt_dec(result.period_variable_cost_rub, "0.01")
     d_inf = _fmt_dec(result.daily_infra_cost_rub, "0.01")
-    d_tot = _fmt_dec(result.daily_total_cost_rub, "0.01")
-    m_tot = _fmt_dec(result.monthly_total_cost_rub, "0.01")
+    p_inf = _fmt_dec(result.period_infra_cost_rub, "0.01")
+    p_tot = _fmt_dec(result.period_total_cost_rub, "0.01")
     full_req = _fmt_dec(result.full_cost_per_request_rub, "0.0001")
     op_hr = _fmt_dec(pricing.operator.hourly_rate_rub, "0.01")
     op_min = _fmt_dec(pricing.operator.minutes_per_request, "0.01")
     op_req = _fmt_dec(result.operator_cost_per_request_rub, "0.01")
-    op_day = _fmt_dec(result.operator_daily_cost_rub, "0.01")
-    op_mon = _fmt_dec(result.operator_monthly_cost_rub, "0.01")
+    op_per = _fmt_dec(result.operator_period_cost_rub, "0.01")
     sav_req = _fmt_dec(result.savings_per_request_rub, "0.01")
-    sav_day = _fmt_dec(result.savings_daily_rub, "0.01")
-    sav_mon = _fmt_dec(result.savings_monthly_rub, "0.01")
+    sav_per = _fmt_dec(result.savings_period_rub, "0.01")
     sav_pct_cell = f"{_fmt_dec(result.savings_pct, '0.01')}%" if result.savings_pct is not None else "н/д"
+
+    l_d_var = _fmt_dec(load.daily_variable_cost_rub, "0.01")
+    l_d_tot = _fmt_dec(load.daily_total_cost_rub, "0.01")
+    l_p_var = _fmt_dec(load.period_variable_cost_rub, "0.01")
+    l_p_inf = _fmt_dec(load.period_infra_cost_rub, "0.01")
+    l_p_tot = _fmt_dec(load.period_total_cost_rub, "0.01")
+    l_full_req = _fmt_dec(load.full_cost_per_request_rub, "0.0001")
+    l_op_day = _fmt_dec(load.operator_daily_cost_rub, "0.01")
+    l_op_per = _fmt_dec(load.operator_period_cost_rub, "0.01")
+    l_sav_req = _fmt_dec(load.savings_per_request_rub, "0.01")
+    l_sav_day = _fmt_dec(load.savings_daily_rub, "0.01")
+    l_sav_per = _fmt_dec(load.savings_period_rub, "0.01")
+    l_sav_pct_cell = f"{_fmt_dec(load.savings_pct, '0.01')}%" if load.savings_pct is not None else "н/д"
 
     lines: list[str] = [
         "# Расчёт стоимости запроса и unit-экономики (T19)",
@@ -1346,36 +1467,62 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
         f"- **Покрытие долей архива**: {_fmt_dec(result.covered_archive_share * HUNDRED, '0.01')}% "
         f"(без замеров: {_fmt_dec(result.uncovered_archive_share * HUNDRED, '0.01')}%)",
         f"- **Курс USD/RUB (ЦБ)**: {rate_str}",
-        f"- **Нагрузка**: {result.requests_per_day} обращений/сутки, {result.days_per_month} дней/месяц",
+        f"- **Базовый период и объём**: {result.requests_per_period} обращений за {result.period_days} дн. "
+        "(основной прогноз по подтверждённому объёму заказчика)",
+        f"- **Отдельный нагрузочный сценарий (слайд 2, не базовый прогноз)**: "
+        f"{load.requests_per_day} обращений/сутки ({load.requests_per_period} обращений за {load.period_days} дн.)",
         "",
         "> **Важное допущение**: доли категорий взяты из архива обращений (`split_summary.json`), "
         "а не из рабочего потока на витрине. Категории без замеров помечены явно и не заполняются средним.",
         "",
-        "## Сводка стоимости",
+        f"## Базовый расчёт за период ({result.period_days} дн., {result.requests_per_period} обращений)",
         "",
         "| Показатель | Значение |",
         "|---|---|",
         f"| Средняя переменная стоимость 1 обращения (взвешенная), ₽ | {w_var} |",
         f"| Средняя переменная стоимость 1 обращения (невзвешенная), ₽ | {u_var} |",
-        f"| Переменные расходы в сутки ({result.requests_per_day} × средняя переменная), ₽ | {d_var} |",
-        f"| Суточная инфраструктура, ₽ | {d_inf} |",
-        f"| **Итого в сутки ({result.requests_per_day} × переменная + инфраструктура), ₽** | **{d_tot}** |",
-        f"| **Итого в месяц ({result.days_per_month} сут.), ₽** | **{m_tot}** |",
-        f"| Полная себестоимость 1 обращения (с инфраструктурой), ₽ | {full_req} |",
+        f"| Переменные расходы за период ({result.requests_per_period} × средняя переменная), ₽ | {p_var} |",
+        f"| Суточная инфраструктура, ₽/сут. | {d_inf} |",
+        f"| Инфраструктура за период (суточная ставка × {result.period_days} дн., не зависит от числа обращений), ₽ | "
+        f"{p_inf} |",
+        f"| **Итого за период ({result.requests_per_period} × переменная "
+        f"+ инфраструктура за {result.period_days} дн.), ₽** | **{p_tot}** |",
+        f"| Полная себестоимость 1 обращения за период (с инфраструктурой), ₽ | {full_req} |",
         "",
-        "## Сравнение с временем оператора",
+        f"## Сравнение с ручным маршрутом (оператором) — базовый объём "
+        f"({result.requests_per_period} обр. / {result.period_days} дн.)",
         "",
         "| Показатель | Значение |",
         "|---|---|",
         f"| Стоимость часа оператора, ₽/ч | {op_hr} |",
         f"| Среднее время оператора на обращение, мин | {op_min} |",
         f"| Стоимость 1 обращения у оператора, ₽ | {op_req} |",
-        f"| Затраты на оператора в сутки ({result.requests_per_day} обр.), ₽ | {op_day} |",
-        f"| Затраты на оператора в месяц ({result.days_per_month} сут.), ₽ | {op_mon} |",
+        f"| Затраты ручного маршрута за период ({result.requests_per_period} обр.), ₽ | {op_per} |",
         f"| Экономия на 1 обращении (оператор − агент с инфрой), ₽ | {sav_req} |",
-        f"| Экономия в сутки, ₽ | {sav_day} |",
-        f"| Экономия в месяц, ₽ | {sav_mon} |",
-        f"| Относительная экономия, % | {sav_pct_cell} |",
+        f"| Экономия за период ({result.period_days} дн., {result.requests_per_period} обр.), ₽ | {sav_per} |",
+        f"| Относительная экономия за период, % | {sav_pct_cell} |",
+        "",
+        f"## Нагрузочный сценарий (отдельный расчёт: {load.requests_per_day} обращений/сутки, не базовый прогноз)",
+        "",
+        f"> **Отдельный нагрузочный расчёт (слайд 2)**: {load.requests_per_day} обращений/сутки "
+        f"({load.requests_per_period} обращений за {load.period_days} дн.). "
+        "Используется для оценки поведения экономики при высокой нагрузке и **не является базовым прогнозом**.",
+        "",
+        "| Показатель (нагрузочный сценарий) | Значение |",
+        "|---|---|",
+        f"| Переменные расходы в сутки ({load.requests_per_day} × средняя переменная), ₽ | {l_d_var} |",
+        f"| Суточная инфраструктура, ₽ | {d_inf} |",
+        f"| **Итого в сутки (агент + инфраструктура), ₽** | **{l_d_tot}** |",
+        f"| Переменные расходы за {load.period_days} дн. ({load.requests_per_period} обр.), ₽ | {l_p_var} |",
+        f"| Инфраструктура за {load.period_days} дн. (суточная ставка × {load.period_days} дн.), ₽ | {l_p_inf} |",
+        f"| **Итого за {load.period_days} дн. (агент + инфраструктура), ₽** | **{l_p_tot}** |",
+        f"| Полная себестоимость 1 обращения (нагрузочный сценарий), ₽ | {l_full_req} |",
+        f"| Затраты оператора в сутки ({load.requests_per_day} обр.), ₽ | {l_op_day} |",
+        f"| Затраты оператора за {load.period_days} дн. ({load.requests_per_period} обр.), ₽ | {l_op_per} |",
+        f"| Экономия на 1 обращении (нагрузочный сценарий), ₽ | {l_sav_req} |",
+        f"| Экономия в сутки, ₽ | {l_sav_day} |",
+        f"| Экономия за {load.period_days} дн., ₽ | {l_sav_per} |",
+        f"| Относительная экономия (нагрузочный сценарий), % | {l_sav_pct_cell} |",
         "",
         "## Разбивка по шагам агента",
         "",
@@ -1514,16 +1661,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Курс USD/RUB (используется ТОЛЬКО если --template не передан).",
     )
     parser.add_argument(
-        "--requests-per-day",
+        "--requests-per-period",
         type=int,
-        default=DEFAULT_REQUESTS_PER_DAY,
-        help="Число обращений в сутки для масштабирования (по умолчанию 500).",
+        default=DEFAULT_REQUESTS_PER_PERIOD,
+        help="Базовый объём обращений за весь расчётный период (по умолчанию 500 за полгода, подтверждено заказчиком).",
     )
     parser.add_argument(
-        "--days-per-month",
+        "--period-days",
         type=int,
-        default=DEFAULT_DAYS_PER_MONTH,
-        help="Число дней в месяце (по умолчанию 30).",
+        default=DEFAULT_PERIOD_DAYS,
+        help="Длительность расчётного периода в днях (по умолчанию 180 — полгода).",
+    )
+    parser.add_argument(
+        "--load-requests-per-day",
+        type=int,
+        default=DEFAULT_LOAD_REQUESTS_PER_DAY,
+        help="Отдельный нагрузочный сценарий со слайда 2: обращений в сутки (по умолчанию 500; не базовый прогноз).",
     )
     return parser
 
@@ -1557,8 +1710,9 @@ def main(argv: list[str] | None = None) -> int:
             split_summary,
             pricing,
             usd_rub_rate=usd_rub_rate,
-            requests_per_day=args.requests_per_day,
-            days_per_month=args.days_per_month,
+            requests_per_period=args.requests_per_period,
+            period_days=args.period_days,
+            load_requests_per_day=args.load_requests_per_day,
         )
 
         if args.template is not None and args.xlsx_out is not None:
