@@ -1,0 +1,100 @@
+# Ручной деплой main на стенд. Только workflow_dispatch: репозиторий публичный,
+# поэтому никаких pull_request / pull_request_target с доступом к секретам.
+name: Deploy stand
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-stand
+  cancel-in-progress: false
+
+env:
+  STAND_URL: https://139-100-217-243.sslip.io
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Pytest
+        run: pytest -q
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY; do
+            if [ -z "${!name}" ]; then echo "::error::Secret $name is not set"; exit 1; fi
+          done
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::DEPLOY_KNOWN_HOSTS is not set, trusting ssh-keyscan on first use"
+            ssh-keyscan -t ed25519 "$DEPLOY_HOST" > ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy origin/main
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          # Без git clean: .env и ./data не отслеживаются git и должны пережить деплой
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'EOF'
+          set -euo pipefail
+          cd /opt/stand
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+          echo "Deploying $(git log --oneline -1)"
+          docker compose up -d --build --remove-orphans
+          EOF
+
+      - name: Health check
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          if ! curl -fsS --retry 10 --retry-delay 2 --retry-all-errors "$STAND_URL/health"; then
+            echo "::error::$STAND_URL/health is not healthy"
+            ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+              'cd /opt/stand && docker compose logs --tail=50 backend' || true
+            exit 1
+          fi
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
