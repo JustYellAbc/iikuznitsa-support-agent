@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from zoneinfo import ZoneInfo
 from catalog import index as catalog_index
 
 from app.services.catalog_snapshot import SNAPSHOT_TABLE, open_index, read_offer, read_snapshot
-from app.services.price_policy import PRICE_STATES, T06_PRICE_STATES, assess, classify
+from app.services.price_policy import PRICE_STATES, T06_PRICE_STATES, assess, classify, is_supported_currency
 
 # Эталоны трёх состояний цены в снимке от 25.11.2026: listed, on_request, availability_check
 CONTROL_OFFERS = ("61557", "504", "48093")
@@ -39,15 +40,63 @@ class Limits:
     min_offers: int = 1000
     max_drop: float = 0.5  # на какую долю новый снимок может быть меньше текущего по числу SKU
     max_missing_share: float = 0.01  # допустимая доля офферов без названия, ссылки, цены или available
+    min_usable_share: float = 0.9  # минимальная доля пригодных для поиска позиций (RUB/RUR и https://)
     allow_older: bool = False
 
 
 def file_digest(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
+    size = 0
     with path.open("rb") as stream:
         while chunk := stream.read(1 << 20):
             digest.update(chunk)
-    return digest.hexdigest(), path.stat().st_size
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def _snapshot_feed_file(feed: Path, directory: Path) -> tuple[Path, str, int]:
+    """Сделать неизменяемую временную копию XML для одного импорта и посчитать SHA-256 по тем же байтам."""
+    if not feed.is_file():
+        raise FeedRejected(f"Фид пуст или не найден: {feed}")
+    digest = hashlib.sha256()
+    size = 0
+    header = b""
+    fd, raw_name = tempfile.mkstemp(dir=directory, prefix=".feed-import-", suffix=".xml")
+    copy_path = Path(raw_name)
+    try:
+        with os.fdopen(fd, "wb") as out, feed.open("rb") as stream:
+            while chunk := stream.read(1 << 20):
+                if len(header) < 2:
+                    header += chunk[: 2 - len(header)]
+                    if header == b"\x1f\x8b":
+                        raise FeedRejected("Фид сжат gzip: распакуйте его в XML")
+                digest.update(chunk)
+                out.write(chunk)
+                size += len(chunk)
+        if size == 0:
+            raise FeedRejected(f"Фид пуст или не найден: {feed}")
+    except BaseException:
+        copy_path.unlink(missing_ok=True)
+        raise
+    return copy_path, digest.hexdigest(), size
+
+
+def _is_buyer_usable(currency: str | None, source: str | None) -> bool:
+    return is_supported_currency(currency) and bool(source and source.startswith("https://"))
+
+
+def _count_usable_offers(index: Path) -> int | None:
+    if not index.is_file():
+        return None
+    with open_index(index) as db:
+        has_offers = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='offers'").fetchone()
+        if not has_offers:
+            return None
+        return sum(
+            1
+            for row in db.execute("SELECT currency, source FROM offers")
+            if _is_buyer_usable(row["currency"], row["source"])
+        )
 
 
 def feed_time(raw: str) -> datetime:
@@ -61,16 +110,18 @@ def feed_time(raw: str) -> datetime:
 def inspect_index(path: Path, limits: Limits) -> dict:
     """Инварианты собранного индекса и счётчики трёх состояний цены по политике T14."""
     counts = dict.fromkeys(PRICE_STATES, 0)
-    missing = mismatched = 0
+    missing = mismatched = usable = 0
     with open_index(path) as db:
         if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise FeedRejected("Собранный индекс повреждён (PRAGMA quick_check)")
         date = db.execute("SELECT snapshot FROM metadata").fetchone()["snapshot"]
-        for row in db.execute("SELECT name,source,available,price,price_state FROM offers"):
+        for row in db.execute("SELECT name,source,available,price,currency,price_state FROM offers"):
             state = classify(row["available"], row["price"])
             counts[state] += 1
             mismatched += T06_PRICE_STATES.get(row["price_state"]) != state
             missing += not (row["name"] and row["source"]) or row["price"] is None or row["available"] is None
+            if _is_buyer_usable(row["currency"], row["source"]):
+                usable += 1
     feed_time(date)
     total = sum(counts.values())
     if total < limits.min_offers:
@@ -79,6 +130,11 @@ def inspect_index(path: Path, limits: Limits) -> dict:
         raise FeedRejected(f"{missing} из {total} офферов без названия, ссылки, цены или available")
     if mismatched:
         raise FeedRejected(f"У {mismatched} офферов состояние цены индекса T06 расходится с политикой T04")
+    if usable == 0 or usable < total * limits.min_usable_share:
+        raise FeedRejected(
+            f"Для покупательского поиска пригодно {usable} из {total} офферов "
+            f"(нужны валюта RUB/RUR и https://-ссылка, минимум {limits.min_usable_share:.0%})"
+        )
     return {"feed_date": date, "offers_count": total, **counts}
 
 
@@ -104,13 +160,29 @@ def _read_current(index: Path) -> dict | None:
     return {"feed_date": meta["snapshot"], "offers_count": offers_count}
 
 
-def check_against_current(stats: dict, current: dict | None, limits: Limits) -> None:
+def check_against_current(
+    stats: dict,
+    current: dict | None,
+    limits: Limits,
+    *,
+    usable_offers: int | None = None,
+    current_usable: int | None = None,
+) -> None:
     if current is None:
         return
     if stats["offers_count"] < current["offers_count"] * (1 - limits.max_drop):
         raise FeedRejected(
             f"SKU стало {stats['offers_count']} вместо {current['offers_count']}: "
             f"падение больше {limits.max_drop:.0%}, похоже на обрезанный фид"
+        )
+    if (
+        usable_offers is not None
+        and current_usable is not None
+        and usable_offers < current_usable * (1 - limits.max_drop)
+    ):
+        raise FeedRejected(
+            f"Пригодных для поиска позиций стало {usable_offers} вместо {current_usable}: "
+            f"падение больше {limits.max_drop:.0%}"
         )
     if not limits.allow_older and feed_time(stats["feed_date"]) < feed_time(current["feed_date"]):
         raise FeedRejected(f"Выгрузка {stats['feed_date']} старше текущей {current['feed_date']} (--allow-older)")
@@ -167,33 +239,50 @@ def _copy_atomic(source: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
-def refresh(feed: Path, index: Path, knowledge: Path, limits: Limits = Limits(), now: datetime | None = None) -> dict:
-    if not feed.is_file() or feed.stat().st_size == 0:
+def refresh(
+    feed: Path,
+    index: Path,
+    knowledge: Path,
+    limits: Limits = Limits(),
+    now: datetime | None = None,
+    *,
+    feed_name: str | None = None,
+) -> dict:
+    if not feed.is_file():
         raise FeedRejected(f"Фид пуст или не найден: {feed}")
-    with feed.open("rb") as stream:
-        if stream.read(2) == b"\x1f\x8b":
-            raise FeedRejected("Фид сжат gzip: распакуйте его в XML")
     index.parent.mkdir(parents=True, exist_ok=True)
     staging = index.with_name(f"{index.stem}.staging{index.suffix}")
     previous = index.with_name(f"{index.stem}.prev{index.suffix}")
+    rollback_backup = index.with_name(f"{index.stem}.rollback{index.suffix}")
     with _exclusive(index):
         try:
             current = _read_current(index)
+            current_usable = _count_usable_offers(index) if current is not None else None
         except sqlite3.Error:
             current = None  # повреждённый рабочий индекс не мешает собрать новый
+            current_usable = None
         had_index = index.is_file()
-        sha256, size = file_digest(feed)
+        # Неизменяемая копия XML для хеша и build(): конкурентная запись не рассогласует SHA-256 и БД.
+        feed_copy, sha256, size = _snapshot_feed_file(feed, index.parent)
+        rollback_source: Path | None = None
         try:
             try:
-                catalog_index.build(feed, staging, knowledge)
+                catalog_index.build(feed_copy, staging, knowledge)
             except Exception as exc:
                 raise FeedRejected(f"Фид не собран: {type(exc).__name__}: {exc}") from exc
             stats = inspect_index(staging, limits)
-            check_against_current(stats, current, limits)
+            staging_usable = _count_usable_offers(staging)
+            check_against_current(
+                stats,
+                current,
+                limits,
+                usable_offers=staging_usable,
+                current_usable=current_usable,
+            )
             snapshot = {
                 **stats,
                 "feed_sha256": sha256,
-                "feed_name": feed.name,
+                "feed_name": feed_name or feed.name,
                 "feed_bytes": size,
                 "refreshed_at": (now or datetime.now(UTC)).isoformat(timespec="seconds"),
             }
@@ -206,15 +295,25 @@ def refresh(feed: Path, index: Path, knowledge: Path, limits: Limits = Limits(),
                 )
             self_check(staging, snapshot)
             os.chmod(staging, 0o644)  # mkstemp в T06 даёт 0600: бэкенд может работать под другим uid
+            same_snapshot = bool(current and current.get("feed_sha256") and current.get("feed_sha256") == sha256)
             if had_index:
-                _copy_atomic(index, previous)
+                if same_snapshot:
+                    # Повтор идентичного снимка не должен затирать предыдущую отличную версию в catalog.prev.sqlite3
+                    _copy_atomic(index, rollback_backup)
+                    rollback_source = rollback_backup
+                else:
+                    _copy_atomic(index, previous)
+                    rollback_source = previous
             os.replace(staging, index)
         finally:
             staging.unlink(missing_ok=True)
+            feed_copy.unlink(missing_ok=True)
         try:
             report = self_check(index, snapshot)
         except Exception:
-            if had_index:
-                _copy_atomic(previous, index)
+            if rollback_source is not None and rollback_source.is_file():
+                _copy_atomic(rollback_source, index)
             raise
+        finally:
+            rollback_backup.unlink(missing_ok=True)
     return {"snapshot": snapshot, "previous": current, **report}

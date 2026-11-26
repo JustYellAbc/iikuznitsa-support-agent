@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -25,15 +26,20 @@ from app.config import get_settings  # noqa: E402
 from app.services.feed_refresh import FeedRejected, Limits, refresh  # noqa: E402
 
 
-def download(url: str, directory: Path) -> Path:
+def download(url: str, directory: Path) -> tuple[Path, str]:
+    """Скачивает фид в уникальный временный файл этого запуска, чтобы параллельные загрузки не мешали друг другу."""
     directory.mkdir(parents=True, exist_ok=True)
-    target = directory / (Path(urlparse(url).path).name or "feed.xml")
-    partial = target.with_name(target.name + ".part")
-    with urlopen(url, timeout=60) as response, partial.open("wb") as out:
-        while chunk := response.read(1 << 20):
-            out.write(chunk)
-    os.replace(partial, target)
-    return target
+    name = Path(urlparse(url).path).name or "feed.xml"
+    fd, raw_path = tempfile.mkstemp(dir=directory, prefix=f".{name}.", suffix=".part")
+    partial = Path(raw_path)
+    try:
+        with urlopen(url, timeout=60) as response, os.fdopen(fd, "wb") as out:
+            while chunk := response.read(1 << 20):
+                out.write(chunk)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return partial, name
 
 
 def main() -> int:
@@ -53,13 +59,23 @@ def main() -> int:
     parser.add_argument("--allow-older", action="store_true", help="разрешить выгрузку старше текущей")
     args = parser.parse_args()
 
-    feed = download(args.feed, settings.data_dir / "raw") if args.feed.startswith(("http://", "https://")) else None
+    downloaded: Path | None = None
+    feed_name: str | None = None
+    if args.feed.startswith(("http://", "https://")):
+        downloaded, feed_name = download(args.feed, settings.data_dir / "raw")
     limits = Limits(min_offers=args.min_offers, max_drop=args.max_drop, allow_older=args.allow_older)
     try:
-        report = refresh(feed or Path(args.feed), args.index, args.knowledge, limits)
-    except FeedRejected as exc:
-        print(f"Каталог не изменён: {exc}", file=sys.stderr)
-        return 1
+        try:
+            report = refresh(downloaded or Path(args.feed), args.index, args.knowledge, limits, feed_name=feed_name)
+        except FeedRejected as exc:
+            print(f"Каталог не изменён: {exc}", file=sys.stderr)
+            return 1
+        if downloaded is not None and feed_name is not None:
+            os.replace(downloaded, settings.data_dir / "raw" / feed_name)
+            downloaded = None
+    finally:
+        if downloaded is not None:
+            downloaded.unlink(missing_ok=True)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

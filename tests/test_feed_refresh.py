@@ -26,16 +26,16 @@ BASE = [
 ]
 
 
-def write_feed(path: Path, date: str, offers=BASE) -> Path:
+def write_feed(path: Path, date: str, offers=BASE, *, currency: str = "RUR", scheme: str = "https") -> Path:
     root = ET.Element("yml_catalog", date=date)
     shop = ET.SubElement(root, "shop")
     ET.SubElement(ET.SubElement(shop, "categories"), "category", id="1").text = "Программы"
     items = ET.SubElement(shop, "offers")
     for offer_id, available, price, name in offers:
         offer = ET.SubElement(items, "offer", id=offer_id, available=available)
-        ET.SubElement(offer, "url").text = f"https://store.softline.ru/test/-{offer_id}/"
+        ET.SubElement(offer, "url").text = f"{scheme}://store.softline.ru/test/-{offer_id}/"
         ET.SubElement(offer, "price").text = price
-        ET.SubElement(offer, "currencyId").text = "RUR"
+        ET.SubElement(offer, "currencyId").text = currency
         ET.SubElement(offer, "categoryId").text = "1"
         ET.SubElement(offer, "name").text = name
         ET.SubElement(offer, "param", name="Срок действия").text = "Не определено"
@@ -186,6 +186,83 @@ def test_t06_index_rejects_sharp_drop_in_offers(tmp_path):
     assert digest(index) == before
     assert read_snapshot(index) is None
     assert _read_t06_state(index) == ("2026-11-25 10:00", 3000)
+
+
+@pytest.mark.parametrize(
+    "bad_kwargs",
+    [
+        {"currency": "USD", "scheme": "https"},
+        {"currency": "RUR", "scheme": "http"},
+    ],
+)
+def test_unusable_currency_or_http_feed_is_rejected(tmp_path, bad_kwargs):
+    """Фид того же размера с 100% USD или 100% http://-ссылками отклоняется, рабочий индекс сохраняется."""
+    index = tmp_path / "private" / "catalog.sqlite3"
+    offers = _bulk_offers(1000)
+    healthy = write_feed(tmp_path / "healthy.xml", "2026-11-25 10:00", offers)
+    refresh(healthy, index, KNOWLEDGE, Limits())
+    before = digest(index)
+    before_snap = read_snapshot(index)
+
+    broken = write_feed(tmp_path / "bad.xml", "2026-11-26 10:00", offers, **bad_kwargs)
+    with pytest.raises(FeedRejected, match="пригодно"):
+        refresh(broken, index, KNOWLEDGE, Limits())
+
+    assert digest(index) == before
+    assert read_snapshot(index) == before_snap
+    assert read_offer(index, "sku-0").currency == "RUR"
+
+
+def test_repeat_identical_snapshot_preserves_previous_backup(tmp_path):
+    """A -> B -> повтор B не перезатирает catalog.prev.sqlite3 версией B (сохраняет A)."""
+    index = tmp_path / "private" / "catalog.sqlite3"
+    feed_a = write_feed(tmp_path / "a.xml", "2026-11-24 10:00", BASE)
+    changed_b = [("t1", "true", "250", "Тестовый офисный пакет"), *BASE[1:]]
+    feed_b = write_feed(tmp_path / "b.xml", "2026-11-25 10:00", changed_b)
+
+    refresh(feed_a, index, KNOWLEDGE, LIMITS, now=datetime(2026, 11, 24, 12, tzinfo=UTC))
+    snap_a = read_snapshot(index)
+    refresh(feed_b, index, KNOWLEDGE, LIMITS, now=datetime(2026, 11, 25, 12, tzinfo=UTC))
+    snap_b = read_snapshot(index)
+    assert read_snapshot(index.with_name("catalog.prev.sqlite3")) == snap_a
+
+    # Повтор идентичного фида B
+    refresh(feed_b, index, KNOWLEDGE, LIMITS, now=datetime(2026, 11, 25, 13, tzinfo=UTC))
+    assert read_snapshot(index)["feed_date"] == "2026-11-25 10:00"
+    assert read_snapshot(index)["feed_sha256"] == snap_b["feed_sha256"]
+    assert read_snapshot(index.with_name("catalog.prev.sqlite3")) == snap_a
+    assert sorted(p.name for p in index.parent.iterdir()) == [
+        "catalog.prev.sqlite3",
+        "catalog.sqlite3",
+        "catalog.sqlite3.lock",
+    ]
+
+
+def test_concurrent_feed_mutation_does_not_mismatch_hash_and_db(tmp_path, monkeypatch):
+    """Подмена исходного XML между хешированием и build() не ломает соответствие SHA-256 и собранной БД."""
+    from catalog import index as catalog_index
+
+    index = tmp_path / "private" / "catalog.sqlite3"
+    feed_path = write_feed(tmp_path / "feed.xml", "2026-11-25 10:00", BASE)
+    sha_a = digest(feed_path)
+    mutated = [("t1", "true", "999", "Тестовый офисный пакет"), *BASE[1:]]
+    real_build = catalog_index.build
+    seen_build_paths: list[Path] = []
+
+    def mutating_build(src, dest, knowledge):
+        seen_build_paths.append(src)
+        # Имитируем конкурентную подмену исходного файла до запуска парсера T06
+        write_feed(feed_path, "2026-11-26 10:00", mutated)
+        return real_build(src, dest, knowledge)
+
+    monkeypatch.setattr(catalog_index, "build", mutating_build)
+    report = refresh(feed_path, index, KNOWLEDGE, LIMITS)
+
+    assert seen_build_paths and seen_build_paths[0] != feed_path
+    assert report["snapshot"]["feed_sha256"] == sha_a
+    assert report["snapshot"]["feed_date"] == "2026-11-25 10:00"
+    assert read_offer(index, "t1").price == "100"
+    assert not [p for p in index.parent.iterdir() if p.name.startswith(".feed-import-")]
 
 
 def test_cli_reports_and_exit_codes(tmp_path):

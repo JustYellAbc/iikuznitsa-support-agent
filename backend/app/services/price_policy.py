@@ -11,9 +11,11 @@
 """
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from decimal import InvalidOperation
 from pathlib import Path
+from typing import Any
 
 from app.config import get_settings
 from app.contracts.t04 import HandoffReason, PriceState, Product, rub_to_kopecks
@@ -21,8 +23,19 @@ from app.contracts.t04 import HandoffReason, PriceState, Product, rub_to_kopecks
 # Встроенная политика; на стенде её переопределяет $DATA_DIR/config/price_policy.json без пересборки образа
 POLICY_PATH = Path(__file__).with_name("price_policy.json")
 OVERRIDE_PATH = Path("config") / "price_policy.json"
-# Значения «Срок действия», которые срок не подтверждают (как в catalog/index.py)
-UNDEFINED_TERMS = {"", "не определено", "мес."}
+# Значения «Срок действия», которые срок не подтверждают (тот же набор служебных исключений, что в catalog/index.py)
+UNDEFINED_TERMS = frozenset(
+    {
+        "",
+        "не определено",
+        "мес.",
+        "другое или отсутствует",
+        "не указано",
+        "нет данных",
+    }
+)
+# Валюты, для которых разрешён рублёвый расчёт (совпадает с T07)
+SUPPORTED_CURRENCIES = frozenset({"RUB", "RUR"})
 PRICE_STATES: tuple[PriceState, ...] = ("listed", "availability_check", "on_request")
 # Состояния индекса T06 (catalog/index.py) -> priceState T04
 T06_PRICE_STATES: dict[str, PriceState] = {
@@ -124,8 +137,43 @@ class OfferAssessment:
 
     def to_product(self) -> Product:
         s = self.snapshot
-        price = s.price if self.unit_price_kopecks is not None else None
+        # По контракту T04 скрытая цена передаётся как unitPriceKopecks=None (priceState=on_request).
+        price = s.price if self.show_price and self.unit_price_kopecks is not None else None
         return Product.from_catalog(s.offer_id, s.name, s.url, bool(s.available), price, self.license_term)
+
+
+def is_supported_currency(currency: str | None) -> bool:
+    """Поддерживается ли валюта снимка для рублёвого расчёта (только RUB / RUR)."""
+    return bool(currency and currency.strip().upper() in SUPPORTED_CURRENCIES)
+
+
+def snapshot_from_row(row: Mapping[str, Any], snapshot_date: str | None = None) -> OfferSnapshot:
+    """Собрать OfferSnapshot из строки таблицы offers (T06) с сохранением сырых параметров."""
+    keys = set(row.keys())
+    params = row["params"] if "params" in keys else {}
+    if isinstance(params, str):
+        params = json.loads(params)
+    raw_terms: tuple[str, ...] = ()
+    if "details" in keys and row["details"]:
+        details = json.loads(row["details"]) if isinstance(row["details"], str) else row["details"]
+        raw_params = details.get("raw_params") if isinstance(details, dict) else None
+        if isinstance(raw_params, dict) and "Срок действия" in raw_params:
+            raw_terms = tuple(str(v) for v in raw_params["Срок действия"])
+    if not raw_terms and isinstance(params, dict):
+        raw_terms = tuple(str(v) for v in params.get("Срок действия", ()))
+    raw_avail = row["available"]
+    available = None if raw_avail is None else bool(raw_avail)
+    raw_currency = row["currency"] if "currency" in keys else None
+    return OfferSnapshot(
+        offer_id=str(row["id"]),
+        name=str(row["name"]),
+        url=str(row["source"]),
+        available=available,
+        price=None if row["price"] is None else str(row["price"]),
+        currency=str(raw_currency) if raw_currency else None,
+        license_terms=raw_terms,
+        snapshot_date=snapshot_date,
+    )
 
 
 def price_kopecks(price: str | None) -> int | None:
@@ -144,17 +192,31 @@ def classify(available: bool | None, price: str | None) -> PriceState:
 
 
 def confirmed_term(values: tuple[str, ...]) -> str | None:
-    """Срок из снимка, только если он единственный и определён."""
+    """Срок из снимка, только если он единственный и определён (исключая служебные заглушки T06)."""
     terms = {v.strip() for v in values if v.strip().casefold() not in UNDEFINED_TERMS}
     return terms.pop() if len(terms) == 1 else None
 
 
 def assess(snapshot: OfferSnapshot, rule: AvailabilityCheckRule | None = None) -> OfferAssessment:
     rule = rule or active_policy().rule
+    term = confirmed_term(snapshot.license_terms)
+    if not is_supported_currency(snapshot.currency):
+        return OfferAssessment(
+            snapshot=snapshot,
+            price_state="on_request",
+            unit_price_kopecks=None,
+            show_price=False,
+            price_caveat=None,
+            license_term=term,
+            allow_quote_draft=False,
+            allow_auto_invoice=False,
+            handoff_reason="price_request",
+            policy_source="contracts/t04/openapi.yaml: currency must be RUB/RUR for ruble pricing",
+        )
     state = classify(snapshot.available, snapshot.price)
     kopecks = price_kopecks(snapshot.price)
     date = f" от {snapshot.snapshot_date}" if snapshot.snapshot_date else ""
-    common = {"snapshot": snapshot, "price_state": state, "license_term": confirmed_term(snapshot.license_terms)}
+    common = {"snapshot": snapshot, "price_state": state, "license_term": term}
     if state == "listed":
         return OfferAssessment(
             **common,

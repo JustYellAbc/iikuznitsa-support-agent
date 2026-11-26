@@ -6,7 +6,16 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from app.agent.catalog_selection import CODE, LATIN, MDAEMON, Selection, named_request, offer_product, result
+from app.agent.catalog_selection import (
+    CODE,
+    LATIN,
+    MDAEMON,
+    Selection,
+    named_request,
+    offer_assessment,
+    offer_product,
+    result,
+)
 from app.agent.handoff import OFFER_HELP, PRICE
 from app.contracts.t04 import Product, Source
 
@@ -154,7 +163,8 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
         if not row:
             return result(OFFER_HELP)
         name, params = row["name"], row["params"]
-        p = offer_product(row)
+        assessment = offer_assessment(row)
+        p = assessment.to_product()
         facts = []
         unknown = []
         refs = []
@@ -203,13 +213,13 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
         if "order_status" in topics:
             unknown.append("состояние конкретного заказа")
         if "price" in topics:
-            if p.unitPriceKopecks is None:
+            if not assessment.show_price or p.unitPriceKopecks is None:
                 unknown.append("цена")
             else:
                 rub, kop = divmod(p.unitPriceKopecks, 100)
                 money = f"{rub:,}".replace(",", " ") + (f",{kop:02}" if kop else "")
                 facts.append(f"Цена по снимку — {money} ₽.")
-        if p.priceState == "availability_check":
+        if assessment.price_state == "availability_check":
             facts.append("Наличие требует подтверждения.")
         if unknown:
             # The T09/T12 offer opens the operator button. Show the sourced partial answer

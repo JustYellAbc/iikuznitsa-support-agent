@@ -103,8 +103,50 @@ def test_policy_switch_after_customer_answer(tmp_path):
         True,
         "Q&A с заказчиком",
     )
-    # Цена снимка в продукте T04 остаётся: priceState=availability_check требует unitPriceKopecks
-    assert a.to_product().unitPriceKopecks == 10000
+    assert a.unit_price_kopecks == 10000
+    # Когда показ цены выключен, покупательская карточка T04 скрывает сумму (unitPriceKopecks=None, on_request)
+    product = a.to_product()
+    assert (product.priceState, product.unitPriceKopecks) == ("on_request", None)
+
+
+@pytest.mark.parametrize("currency", ["USD", "EUR", "", None])
+def test_unsupported_currency_blocks_ruble_pricing_and_documents(currency):
+    raw = OfferSnapshot(
+        offer_id="usd-1",
+        name="USD License",
+        url="https://store.softline.ru/test/-usd-1/",
+        available=True,
+        price="100",
+        currency=currency,
+        license_terms=("12 мес.",),
+        snapshot_date="2026-11-25 10:00",
+    )
+    a = assess(raw)
+    # Исходные данные снимка сохраняются без искажений
+    assert a.snapshot.price == "100"
+    assert a.snapshot.currency == currency
+    # Рублёвый расчёт и документы заблокированы
+    assert (a.price_state, a.unit_price_kopecks, a.show_price) == ("on_request", None, False)
+    assert not a.allow_quote_draft and not a.allow_auto_invoice
+    assert a.handoff_reason == "price_request"
+    assert a.to_product().unitPriceKopecks is None
+
+
+@pytest.mark.parametrize("currency", ["RUB", "RUR", "rub"])
+def test_supported_ruble_currencies_allow_pricing_and_documents(currency):
+    raw = OfferSnapshot(
+        offer_id="rub-1",
+        name="RUB License",
+        url="https://store.softline.ru/test/-rub-1/",
+        available=True,
+        price="100",
+        currency=currency,
+        license_terms=("12 мес.",),
+        snapshot_date="2026-11-25 10:00",
+    )
+    a = assess(raw)
+    assert (a.price_state, a.unit_price_kopecks, a.show_price) == ("listed", 10000, True)
+    assert a.allow_quote_draft and a.allow_auto_invoice
 
 
 @pytest.mark.parametrize(
@@ -125,14 +167,23 @@ def test_broken_policy_file_is_rejected(tmp_path, patch):
     [
         (("Не определено",), None),
         (("мес.",), None),
+        (("нет данных",), None),
+        (("другое или отсутствует",), None),
+        (("не указано",), None),
         ((), None),
         (("12 мес.",), "12 мес."),
         (("12 мес.", "12 мес."), "12 мес."),
+        (("12 мес.", "нет данных"), "12 мес."),
+        (("12 мес.", "другое или отсутствует"), "12 мес."),
+        (("12 мес.", "не указано"), "12 мес."),
         (("12 мес.", "24 мес."), None),
     ],
 )
 def test_confirmed_term(terms, expected):
     assert price_policy.confirmed_term(terms) == expected
+    a = assess(snapshot(True, "100", terms=terms))
+    assert a.license_term == expected
+    assert a.snapshot.license_terms == terms
 
 
 # --- Эталонные SKU реального снимка (data/raw/ не в git: без фида тест пропускается) -------------
@@ -254,3 +305,69 @@ def test_broken_override_stops_startup(tmp_path, text):
     override = write_override(tmp_path, text)
     with pytest.raises(price_policy.PolicyError, match=str(override)), TestClient(create_app()):
         pass
+
+
+def test_buyer_views_hide_price_when_policy_disables_it(tmp_path):
+    """При show_snapshot_price_with_caveat=false сумма скрыта в карточке, тексте и на «Какая цена?»."""
+    from catalog.index import build
+
+    from app.main import create_app
+
+    data = json.loads(price_policy.POLICY_PATH.read_text(encoding="utf-8"))
+    data["availability_check"].update(
+        show_snapshot_price_with_caveat=False,
+        confirmed=True,
+        policy_source="Q&A: скрывать цену для недоступных SKU",
+    )
+    write_override(tmp_path, json.dumps(data, ensure_ascii=False))
+
+    root = ET.Element("yml_catalog", date="2026-11-25 10:00")
+    shop = ET.SubElement(root, "shop")
+    ET.SubElement(ET.SubElement(shop, "categories"), "category", id="1").text = "ПО"
+    offers = ET.SubElement(shop, "offers")
+    row = ET.SubElement(offers, "offer", id="verify", available="false")
+    for tag, value in {
+        "name": "Widget Server",
+        "price": "120",
+        "currencyId": "RUR",
+        "categoryId": "1",
+        "url": "https://store.softline.ru/test/-verify/",
+    }.items():
+        ET.SubElement(row, tag).text = value
+    ET.SubElement(row, "param", name="Срок действия").text = "12 мес."
+    feed = tmp_path / "verify.xml"
+    ET.ElementTree(root).write(feed, encoding="utf-8", xml_declaration=True)
+    build(feed, tmp_path / "private" / "catalog.sqlite3", KNOWLEDGE)
+
+    with TestClient(create_app()) as client:
+        api = Api(client)
+        assert manager_policy(api)["show_snapshot_price_with_caveat"] is False
+
+        cid = api.new_conversation()
+        r1 = api.say(cid, "Нужен Widget Server")
+        assert r1.status_code == 202
+        api.idle()
+        ev1 = [e["data"] for e in api.events(cid) if e["actionId"] == r1.json()["actionId"]]
+        product_events = [e for e in ev1 if e["type"] == "products"]
+        assert product_events, ev1
+        card = product_events[0]["products"][0]
+        assert card["offerId"] == "verify"
+        assert card["unitPriceKopecks"] is None
+        assert card["priceState"] == "on_request"
+        msg1 = [e["text"] for e in ev1 if e["type"] == "message" and e["author"] == "agent"]
+        assert msg1 and "120" not in " ".join(msg1)
+        assert "Цена по запросу" in " ".join(msg1)
+        assert "Наличие требует подтверждения" in " ".join(msg1)
+
+        r2 = api.say(cid, "Какая цена?")
+        assert r2.status_code == 202
+        api.idle()
+        ev2 = [e["data"] for e in api.events(cid) if e["actionId"] == r2.json()["actionId"]]
+        msg2 = [e["text"] for e in ev2 if e["type"] == "message" and e["author"] == "agent"]
+        assert msg2 and "120" not in " ".join(msg2)
+        assert "Цена по запросу" in " ".join(msg2)
+        for ev in ev2:
+            if ev["type"] == "products":
+                assert all(p["unitPriceKopecks"] is None for p in ev["products"])
+            elif ev["type"] == "handoff":
+                assert all(p["unitPriceKopecks"] is None for p in ev["handoff"]["products"])
