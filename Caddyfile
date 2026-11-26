@@ -1,0 +1,27 @@
+# HTTPS на sslip.io-домене стенда + :80 для обращений по голому IP.
+# CORS выставляет FastAPI (CORS_ORIGINS в .env): дублирование заголовков здесь ломает браузерный CORS.
+
+(stand) {
+	@backend path /api/* /health
+	handle @backend {
+		reverse_proxy backend:8000 {
+			# SSE без буферизации
+			flush_interval -1
+		}
+	}
+
+	handle {
+		encode gzip
+		root * /srv/frontend
+		try_files {path} {path}/index.html /index.html
+		file_server
+	}
+}
+
+139-100-217-243.sslip.io {
+	import stand
+}
+
+:80 {
+	import stand
+}

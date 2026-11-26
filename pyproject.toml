@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["tests", "backend/app/agent"]
+pythonpath = ["backend"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["backend", "scripts", "tests"]
+# Файлы контракта T04 ведёт его владелец — копия из ветки feat/t04-api-contract
+extend-exclude = ["contracts/t04"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008"]
