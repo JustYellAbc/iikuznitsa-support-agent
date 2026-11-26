@@ -198,7 +198,7 @@ def test_idempotency_scope_and_conflict(api: Api):
 
 def test_end_to_end_turn_is_traced_and_costed(api: Api):
     cid = api.new_conversation()
-    r = api.say(cid, "Нужен MDaemon на 20 пользователей")
+    r = api.say(cid, "Добрый день! Чем вы можете помочь?")
     assert r.status_code == 202 and r.json()["conversationId"] == cid
     api.idle()
     evs = api.events(cid)

@@ -20,7 +20,7 @@ REQUEST_WORDS = (
     rf"(?:{CALL}|нужен|нужна|хочу|можно)(?:[ ,]+(?:меня|мне|нас|нам|пожалуйста|на|к|с|со|жив\w*|ваш\w*|"
     rf"пообщаться|поговорить|связаться|позвать|подключить)){{0,5}}[ ,]+{HUMAN}"
 )
-HUMAN_REQUEST = re.compile(rf"\b{REQUEST_WORDS}\b(?!\s+связи)")
+HUMAN_REQUEST = re.compile(rf"\b{REQUEST_WORDS}\b(?!\s+связи)", re.I)
 COURTESY = r"(?:здравствуйте|здравствуй|добрый (?:день|вечер)|доброе утро|привет|пожалуйста|спасибо)"
 BARE_REQUEST = re.compile(rf"(?:{COURTESY}[,.! ]+)*(?:{REQUEST_WORDS}|{HUMAN})(?:[,!?. ]+{COURTESY})*[,!?. ]*")
 HUMAN_DECLINED = re.compile(
