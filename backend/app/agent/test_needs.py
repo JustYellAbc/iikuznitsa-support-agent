@@ -83,6 +83,20 @@ def test_mailbox_intake_before_selection_and_tender(stand_api, need_index):  # n
     assert card["reason"] == "tender" and [p["offerId"] for p in card["products"]] == ["mail"]
 
 
+@pytest.mark.parametrize("separator", [". Есть", " и есть"])
+def test_windows_gateway_independent_of_linux_mail_host(stand_api, need_index, separator):  # noqa: F811
+    cid = stand_api.new_conversation()
+    say(stand_api, cid, START)
+    events = say(
+        stand_api,
+        cid,
+        f"Коммерческое юрлицо, покупаем впервые на год. Почта на Postfix под Linux{separator} "
+        "отдельная Windows-машина для шлюза. 50 адресов. Файлы на одном Windows Server 2019. Бюджет до 605 ₽.",
+    )
+    assert {p["offerId"] for p in events[-2]["products"]} == {"gw", "files"}
+    assert "599 ₽" in events[-1]["text"]
+
+
 def test_compare_recalculate_and_select(stand_api, need_index):  # noqa: F811
     api = stand_api
     cid = api.new_conversation()

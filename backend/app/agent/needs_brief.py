@@ -123,7 +123,13 @@ def update_brief(previous: Brief, text: str) -> Brief:
         b.servers = servers
     if previous.goal == "protect" and previous.gateway is None and re.fullmatch(r"(?:да|нет)[.! ]*", s):
         b.gateway = s.startswith("да")
-    for clause in re.split(r"[.,;!?]|\s+а\s+", s):
+    # Keep OS and availability with the machine being described. A conjunction can
+    # introduce another machine just as punctuation can ("Postfix ... и есть отдельная ...").
+    for clause in re.split(
+        r"[.,;!?]|\s+(?:а|но)\s+|\s+и\s+(?=(?:есть|нет|доступ\w*|недоступ\w*|"
+        r"мож\w*|отдельн\w*|выделенн\w*|почт\w*|файл\w*|postfix|exchange)\b)",
+        s,
+    ):
         if re.search(GATEWAY, clause):
             if re.search(r"\b(?:без|нет|нельзя|недоступ\w*|не)\b", clause) or re.search(LINUX, clause):
                 b.gateway = False
