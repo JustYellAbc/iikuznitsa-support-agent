@@ -87,6 +87,31 @@ python catalog/index.py search data/private/catalog.sqlite3 "восстанов�
 
 После обновления импортёра пересоберите индекс из XML командой `build`. Для сверки с источником используйте `details.raw_params`: значения каждого имени перечислены в порядке из фида, включая повторы, пустые значения и «Не определено». В ранее собранных индексах этого словаря нет. Для ответа о сроке используйте `params["Срок действия"]`. Если ключ отсутствует, срок неизвестен.
 
+## T14 · Обновление фида и состояние цены
+
+`scripts/refresh_feed.py` пересобирает индекс T06 из нового фида без остановки бэкенда. Порядок такой: проверка XML, сборка рядом с рабочим индексом, проверка инвариантов, запись метаданных снимка, self-check и атомарная подмена `$DATA_DIR/private/catalog.sqlite3`. Если фид битый, пустой, сжатый, без даты выгрузки, содержит меньше `--min-offers` (по умолчанию 1000) офферов, старше текущего снимка или меньше его по числу SKU более чем на `--max-drop` (по умолчанию 50%), скрипт завершается с кодом 1, а рабочий каталог не меняется. Прежний снимок лежит рядом в `catalog.prev.sqlite3`. Для ручного отката: `mv data/private/catalog.prev.sqlite3 data/private/catalog.sqlite3`.
+
+```bash
+# локально (DATA_DIR из .env, по умолчанию ./data)
+python scripts/refresh_feed.py data/raw/Mindbox.yml.gz.xml
+# на стенде: положить фид в /opt/stand/data/raw/ и запустить внутри контейнера
+docker compose exec backend python scripts/refresh_feed.py data/raw/Mindbox.yml.gz.xml
+```
+
+Скрипт печатает JSON с метаданными снимка: дата `yml_catalog/@date`, SHA-256 и размер файла, число SKU, счётчики `listed` / `availability_check` / `on_request`, время обновления. Там же прежний снимок, проверочный поисковый запрос и состояние эталонных офферов 61557, 504 и 48093. Те же метаданные отдаёт `GET /api/v1/manager/catalog`, а `/health` показывает `offers_count` рабочего снимка.
+
+Состояние оффера считает `app/services/price_policy.py` по тому же правилу, что `Product.from_catalog` из T04:
+
+| Снимок | `priceState` | Что можно |
+|---|---|---|
+| `available=true`, цена > 0 (61557) | `listed` | Назвать цену. Срок «Не определено» не превращается в срок |
+| цена 0 или пустая (504) | `on_request` | Цену не показывать, передать менеджеру с причиной `price_request` |
+| `available=false`, цена > 0 (48093) | `availability_check` | По `backend/app/services/price_policy.json` |
+
+До Q&A с заказчиком `price_policy.json` разрешает назвать цену снимка с оговоркой и запрещает выпуск КП и автосчёт (`allow_quote_draft=false`, `allow_auto_invoice=false`), проверка доступности уходит менеджеру с причиной `availability`. После ответа заказчика поменяйте флаги, `confirmed` и `policy_source` в этом файле и пересоберите бэкенд (`docker compose up -d --build backend`): файл входит в образ.
+
+Тесты эталонных SKU в `tests/test_price_policy.py` читают `data/raw/Mindbox.yml.gz.xml`. Без этого файла они пропускаются.
+
 ## Работа в команде
 
 - Для каждой задачи создаём отдельную ветку от актуальной `main`, например `feat/t07-catalog`.

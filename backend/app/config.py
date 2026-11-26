@@ -43,6 +43,11 @@ class Settings(BaseSettings):
         return self.data_dir / "app.db"
 
     @property
+    def catalog_index_path(self) -> Path:
+        """Индекс каталога T06, который пересобирает scripts/refresh_feed.py."""
+        return self.data_dir / "private" / "catalog.sqlite3"
+
+    @property
     def quotes_dir(self) -> Path:
         return self.data_dir / "quotes"
 

@@ -1,0 +1,9 @@
+{
+  "availability_check": {
+    "show_snapshot_price_with_caveat": true,
+    "allow_quote_draft": false,
+    "allow_auto_invoice": false,
+    "confirmed": false,
+    "policy_source": "evals/t03/README.md, «Цена есть, доступность требует проверки» (встреча 26.11.2026). Временное правило команды до Q&A с заказчиком."
+  }
+}
