@@ -34,6 +34,8 @@ HUNDRED = Decimal("100")
 ZERO = Decimal("0")
 
 SUPPORTED_CURRENCIES = frozenset({"RUB", "USD"})
+# T05 /api/v1/manager/telemetry возвращает не более 20 последних вызовов даже с all_time=true.
+TELEMETRY_RECENT_CALLS_LIMIT = 20
 
 DEFAULT_PERIOD_DAYS = 180
 DEFAULT_REQUESTS_PER_PERIOD = 500
@@ -43,6 +45,8 @@ DEFAULT_PRICING_PATH = Path("config/pricing.yaml")
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 URL_RE = re.compile(r"^https?://\S+$")
+SUM_RANGE_RE = re.compile(r"(?:SUM|СУММ)\(\s*\$?[A-Z]+\$?(\d+)\s*:\s*\$?[A-Z]+\$?(\d+)\s*\)", re.IGNORECASE)
+CELL_REF_RE = re.compile(r"\$([A-Z]{1,3})\$(\d+)")
 
 # --- Исключения -----------------------------------------------------------------
 
@@ -126,6 +130,7 @@ class DialogMeasurement:
     dialog_id: str
     category: str | None
     calls: tuple[LLMCallRecord, ...]
+    escalated: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,6 +164,8 @@ class LoadScenarioEconomics:
     requests_per_day: int
     period_days: int
     requests_per_period: int
+    daily_tokens_in: Decimal | None
+    daily_tokens_out: Decimal | None
     daily_variable_cost_rub: Decimal | None
     daily_infra_cost_rub: Decimal
     daily_total_cost_rub: Decimal | None
@@ -168,10 +175,15 @@ class LoadScenarioEconomics:
     full_cost_per_request_rub: Decimal | None
     operator_daily_cost_rub: Decimal
     operator_period_cost_rub: Decimal
+    daily_residual_operator_cost_rub: Decimal | None
+    period_residual_operator_cost_rub: Decimal | None
     savings_per_request_rub: Decimal | None
     savings_daily_rub: Decimal | None
     savings_period_rub: Decimal | None
     savings_pct: Decimal | None
+    net_savings_daily_rub: Decimal | None
+    net_savings_period_rub: Decimal | None
+    net_savings_pct: Decimal | None
 
 
 @dataclass(frozen=True)
@@ -179,6 +191,8 @@ class UnitEconomicsResult:
     has_measurements: bool
     weighting_mode: str  # "archive_weighted" | "unweighted" | "none"
     measured_dialogs: int
+    escalated_dialogs: int
+    escalation_rate: Decimal | None
     covered_archive_share: Decimal
     uncovered_archive_share: Decimal
     missing_categories: tuple[str, ...]
@@ -187,6 +201,10 @@ class UnitEconomicsResult:
     requests_per_period: int
     steps: tuple[StepAggregate, ...]
     categories: tuple[CategoryBreakdown, ...]
+    avg_tokens_in_per_request: Decimal | None
+    avg_tokens_out_per_request: Decimal | None
+    daily_tokens_in: Decimal | None
+    daily_tokens_out: Decimal | None
     weighted_variable_cost_rub: Decimal | None
     unweighted_variable_cost_rub: Decimal | None
     active_variable_cost_rub: Decimal | None
@@ -197,22 +215,28 @@ class UnitEconomicsResult:
     full_cost_per_request_rub: Decimal | None
     operator_cost_per_request_rub: Decimal
     operator_period_cost_rub: Decimal
+    period_residual_operator_cost_rub: Decimal | None
+    period_pilot_total_cost_rub: Decimal | None
     savings_per_request_rub: Decimal | None
     savings_period_rub: Decimal | None
     savings_pct: Decimal | None
+    net_savings_period_rub: Decimal | None
+    net_savings_pct: Decimal | None
     load_scenario: LoadScenarioEconomics
+    telemetry_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class TemplateLayout:
     sheet_name: str
     cbr_rate_cell: tuple[int, int]  # (row, col)
-    cbr_rate_value: Decimal
+    cbr_rate_value: Decimal | None
     header_row: int
     columns: dict[str, int]  # field_key -> 1-based column index
     data_rows: tuple[int, ...]
     comment_cells: tuple[tuple[int, int], ...]  # up to 3 (row, col) cells, or 1 multiline cell
     formula_cells: frozenset[tuple[int, int]] = field(default_factory=frozenset)
+    currency_symbols: dict[str, str] = field(default_factory=lambda: {"USD": "$", "RUB": "₽"})
 
 
 # --- Вспомогательные функции для Decimal ----------------------------------------
@@ -457,10 +481,19 @@ def _extract_calls_from_turns(turns: list[Any], ctx: str) -> tuple[list[LLMCallR
 
 def _load_telemetry_dumps(
     paths: list[Path],
-) -> tuple[dict[str, list[LLMCallRecord]], dict[str, str | None]]:
-    """Читает один или несколько JSON-дампов /api/v1/manager/telemetry или per-dialog экспортов."""
+    *,
+    allow_incomplete_telemetry: bool = False,
+) -> tuple[dict[str, list[LLMCallRecord]], dict[str, str | None], dict[str, bool], list[str]]:
+    """Читает один или несколько JSON-дампов /api/v1/manager/telemetry или per-dialog экспортов.
+
+    Окно /manager/telemetry (recent_calls) ограничено 20 последними вызовами даже при all_time=true.
+    При признаках обрезки окна (len >= 20 или сумма вызовов в steps > len(recent_calls)) по умолчанию
+    поднимается InputDataError, чтобы не выдавать неполное окно за полную стоимость диалога.
+    """
     calls_by_session: dict[str, list[LLMCallRecord]] = {}
     categories_by_session: dict[str, str | None] = {}
+    escalated_by_session: dict[str, bool] = {}
+    warnings: list[str] = []
     seen_call_ids: set[Any] = set()
 
     for path in paths:
@@ -485,6 +518,8 @@ def _load_telemetry_dumps(
                 calls_by_session.setdefault(sid, [])
                 if dlg.get("category") is not None:
                     categories_by_session[sid] = str(dlg["category"])
+                if dlg.get("escalated"):
+                    escalated_by_session[sid] = True
                 for c_idx, call in enumerate(raw_calls):
                     if not isinstance(call, dict):
                         raise InputDataError(f"{path}: dialogs[{idx}].calls[{c_idx}] должен быть объектом.")
@@ -496,10 +531,12 @@ def _load_telemetry_dumps(
                     calls_by_session[sid].append(_parse_call_dict(call, f"{path}:dialogs[{idx}].calls[{c_idx}]"))
             continue
 
+        is_recent_window = False
         if isinstance(payload, list):
             raw_list = payload
         elif isinstance(payload, dict) and isinstance(payload.get("recent_calls"), list):
             raw_list = payload["recent_calls"]
+            is_recent_window = True
         elif isinstance(payload, dict) and isinstance(payload.get("calls"), list):
             raw_list = payload["calls"]
         elif isinstance(payload, dict) and isinstance(payload.get("llm_calls"), list):
@@ -509,6 +546,23 @@ def _load_telemetry_dumps(
                 f"Неизвестный формат телеметрии в {path}: ожидались поля 'recent_calls', 'calls', 'llm_calls', "
                 "'dialogs' или JSON-массив вызовов."
             )
+
+        if is_recent_window:
+            reported_steps_calls = 0
+            if isinstance(payload.get("steps"), list):
+                reported_steps_calls = sum(int(st.get("calls") or 0) for st in payload["steps"] if isinstance(st, dict))
+            truncated = len(raw_list) >= TELEMETRY_RECENT_CALLS_LIMIT or (reported_steps_calls > len(raw_list))
+            if truncated:
+                msg = (
+                    f"Неполное окно /manager/telemetry в {path}: в recent_calls {len(raw_list)} записей "
+                    f"(лимит окна {TELEMETRY_RECENT_CALLS_LIMIT}"
+                    + (f", всего в steps: {reported_steps_calls}" if reported_steps_calls else "")
+                    + "). Используйте полный per-dialog trace/экспорт T10 (llm_calls / dialogs[]) "
+                    "или явно передайте --allow-incomplete-telemetry."
+                )
+                if not allow_incomplete_telemetry:
+                    raise InputDataError(msg)
+                warnings.append(msg)
 
         for idx, call in enumerate(raw_list):
             if not isinstance(call, dict):
@@ -528,7 +582,7 @@ def _load_telemetry_dumps(
             if call.get("category") is not None:
                 categories_by_session[sid] = str(call["category"])
 
-    return calls_by_session, categories_by_session
+    return calls_by_session, categories_by_session, escalated_by_session, warnings
 
 
 def load_measurements(
@@ -537,15 +591,22 @@ def load_measurements(
     telemetry_paths: list[Path],
     split_summary: SplitSummary,
     category_map: dict[str, str] | None = None,
+    allow_incomplete_telemetry: bool = False,
+    warnings_out: list[str] | None = None,
 ) -> list[DialogMeasurement]:
-    """Объединяет eval-отчёты и/или телеметрию в список замеров по диалогам."""
+    """Объединяет eval-отчёты и/или телеметрию в список замеров по диалогам (ровно 1 замер на диалог)."""
     if not eval_report_paths and not telemetry_paths:
         raise InputDataError("Нужно указать хотя бы один источник замеров: --eval-report и/или --telemetry.")
 
     cat_map = category_map or {}
     valid_categories = set(split_summary.categories.keys())
-    telemetry_calls, telemetry_cats = _load_telemetry_dumps(telemetry_paths)
+    telemetry_calls, telemetry_cats, telemetry_esc, tel_warnings = _load_telemetry_dumps(
+        telemetry_paths, allow_incomplete_telemetry=allow_incomplete_telemetry
+    )
+    if warnings_out is not None:
+        warnings_out.extend(tel_warnings)
     matched_sessions: set[str] = set()
+    seen_dialog_ids: set[str] = set()
     dialogs: list[DialogMeasurement] = []
 
     for path in eval_report_paths:
@@ -590,21 +651,32 @@ def load_measurements(
 
             if calls is None and conv_id_str and conv_id_str in telemetry_calls:
                 calls = list(telemetry_calls[conv_id_str])
-                matched_sessions.add(conv_id_str)
             elif calls is None and case_id in telemetry_calls:
                 calls = list(telemetry_calls[case_id])
-                matched_sessions.add(case_id)
 
             if calls is None:
                 # Если в eval-отчёте есть кейс без телеметрии вызовов и без совпадения в telemetry —
                 # не подставляем нули молча: пропускаем как незамеренный, а если таких 100%, ниже будет 0 диалогов.
                 continue
 
-            dialogs.append(DialogMeasurement(dialog_id=conv_id_str or case_id, category=category, calls=tuple(calls)))
+            # Дедупликация: помечаем оба ключа (conversation_id и case_id), чтобы телеметрия не добавила дубль.
+            if conv_id_str:
+                matched_sessions.add(conv_id_str)
+            matched_sessions.add(case_id)
+            dialog_id = conv_id_str or case_id
+            if dialog_id in seen_dialog_ids:
+                continue
+            seen_dialog_ids.add(dialog_id)
+            escalated = bool(case.get("escalated")) or bool(
+                (conv_id_str and telemetry_esc.get(conv_id_str)) or telemetry_esc.get(case_id)
+            )
+            dialogs.append(
+                DialogMeasurement(dialog_id=dialog_id, category=category, calls=tuple(calls), escalated=escalated)
+            )
 
     # Добавляем диалоги из телеметрии, не сматченные с eval-кейсами.
     for sid, calls in telemetry_calls.items():
-        if sid in matched_sessions:
+        if sid in matched_sessions or sid in seen_dialog_ids:
             continue
         category = cat_map.get(sid) or telemetry_cats.get(sid)
         if category is not None:
@@ -614,7 +686,12 @@ def load_measurements(
                     f"Диалог телеметрии '{sid}' имеет неизвестную категорию {category!r}. "
                     f"Допустимые категории из split_summary: {sorted(valid_categories)}."
                 )
-        dialogs.append(DialogMeasurement(dialog_id=sid, category=category, calls=tuple(calls)))
+        seen_dialog_ids.add(sid)
+        dialogs.append(
+            DialogMeasurement(
+                dialog_id=sid, category=category, calls=tuple(calls), escalated=telemetry_esc.get(sid, False)
+            )
+        )
 
     categorized = [d for d in dialogs if d.category is not None]
     uncategorized = [d for d in dialogs if d.category is None]
@@ -661,6 +738,9 @@ def _call_cost_rub(call: LLMCallRecord, pricing: PricingConfig, usd_rub_rate: De
 def _compute_load_scenario(
     *,
     active_variable_cost_rub: Decimal | None,
+    avg_tokens_in_per_request: Decimal | None,
+    avg_tokens_out_per_request: Decimal | None,
+    escalation_rate: Decimal | None,
     daily_infra_cost_rub: Decimal,
     operator_cost_per_request_rub: Decimal,
     requests_per_day: int,
@@ -681,6 +761,8 @@ def _compute_load_scenario(
             requests_per_day=requests_per_day,
             period_days=period_days,
             requests_per_period=requests_per_period,
+            daily_tokens_in=None,
+            daily_tokens_out=None,
             daily_variable_cost_rub=None,
             daily_infra_cost_rub=daily_infra_cost_rub,
             daily_total_cost_rub=None,
@@ -690,27 +772,45 @@ def _compute_load_scenario(
             full_cost_per_request_rub=None,
             operator_daily_cost_rub=operator_daily_cost_rub,
             operator_period_cost_rub=operator_period_cost_rub,
+            daily_residual_operator_cost_rub=None,
+            period_residual_operator_cost_rub=None,
             savings_per_request_rub=None,
             savings_daily_rub=None,
             savings_period_rub=None,
             savings_pct=None,
+            net_savings_daily_rub=None,
+            net_savings_period_rub=None,
+            net_savings_pct=None,
         )
 
+    daily_tokens_in = req_day_dec * (avg_tokens_in_per_request or ZERO)
+    daily_tokens_out = req_day_dec * (avg_tokens_out_per_request or ZERO)
     daily_variable_cost_rub = req_day_dec * active_variable_cost_rub
     daily_total_cost_rub = daily_variable_cost_rub + daily_infra_cost_rub
     period_variable_cost_rub = req_period_dec * active_variable_cost_rub
     period_total_cost_rub = period_variable_cost_rub + period_infra_cost_rub
     full_cost_per_request_rub = period_total_cost_rub / req_period_dec
 
+    esc = escalation_rate if escalation_rate is not None else ZERO
+    daily_residual_operator = operator_daily_cost_rub * esc
+    period_residual_operator = operator_period_cost_rub * esc
+
     savings_per_request_rub = operator_cost_per_request_rub - full_cost_per_request_rub
     savings_daily_rub = operator_daily_cost_rub - daily_total_cost_rub
     savings_period_rub = operator_period_cost_rub - period_total_cost_rub
     savings_pct = (savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
+    net_savings_daily_rub = operator_daily_cost_rub - (daily_total_cost_rub + daily_residual_operator)
+    net_savings_period_rub = operator_period_cost_rub - (period_total_cost_rub + period_residual_operator)
+    net_savings_pct = (
+        (net_savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
+    )
 
     return LoadScenarioEconomics(
         requests_per_day=requests_per_day,
         period_days=period_days,
         requests_per_period=requests_per_period,
+        daily_tokens_in=daily_tokens_in,
+        daily_tokens_out=daily_tokens_out,
         daily_variable_cost_rub=daily_variable_cost_rub,
         daily_infra_cost_rub=daily_infra_cost_rub,
         daily_total_cost_rub=daily_total_cost_rub,
@@ -720,10 +820,15 @@ def _compute_load_scenario(
         full_cost_per_request_rub=full_cost_per_request_rub,
         operator_daily_cost_rub=operator_daily_cost_rub,
         operator_period_cost_rub=operator_period_cost_rub,
+        daily_residual_operator_cost_rub=daily_residual_operator,
+        period_residual_operator_cost_rub=period_residual_operator,
         savings_per_request_rub=savings_per_request_rub,
         savings_daily_rub=savings_daily_rub,
         savings_period_rub=savings_period_rub,
         savings_pct=savings_pct,
+        net_savings_daily_rub=net_savings_daily_rub,
+        net_savings_period_rub=net_savings_period_rub,
+        net_savings_pct=net_savings_pct,
     )
 
 
@@ -736,6 +841,7 @@ def compute_unit_economics(
     requests_per_period: int = DEFAULT_REQUESTS_PER_PERIOD,
     period_days: int = DEFAULT_PERIOD_DAYS,
     load_requests_per_day: int = DEFAULT_LOAD_REQUESTS_PER_DAY,
+    telemetry_warnings: tuple[str, ...] = (),
 ) -> UnitEconomicsResult:
     """Агрегирует шаги агента, взвешивает по долям категорий и считает экономику за период и нагрузочный сценарий."""
     if requests_per_period <= 0:
@@ -770,6 +876,9 @@ def compute_unit_economics(
         )
         load_scenario = _compute_load_scenario(
             active_variable_cost_rub=None,
+            avg_tokens_in_per_request=None,
+            avg_tokens_out_per_request=None,
+            escalation_rate=None,
             daily_infra_cost_rub=daily_infra_cost_rub,
             operator_cost_per_request_rub=operator_cost_per_request_rub,
             requests_per_day=load_requests_per_day,
@@ -779,6 +888,8 @@ def compute_unit_economics(
             has_measurements=False,
             weighting_mode="none",
             measured_dialogs=0,
+            escalated_dialogs=0,
+            escalation_rate=None,
             covered_archive_share=ZERO,
             uncovered_archive_share=Decimal("1"),
             missing_categories=tuple(split_summary.categories.keys()),
@@ -787,6 +898,10 @@ def compute_unit_economics(
             requests_per_period=requests_per_period,
             steps=(),
             categories=empty_cats,
+            avg_tokens_in_per_request=None,
+            avg_tokens_out_per_request=None,
+            daily_tokens_in=None,
+            daily_tokens_out=None,
             weighted_variable_cost_rub=None,
             unweighted_variable_cost_rub=None,
             active_variable_cost_rub=None,
@@ -797,10 +912,15 @@ def compute_unit_economics(
             full_cost_per_request_rub=None,
             operator_cost_per_request_rub=operator_cost_per_request_rub,
             operator_period_cost_rub=operator_period_cost_rub,
+            period_residual_operator_cost_rub=None,
+            period_pilot_total_cost_rub=None,
             savings_per_request_rub=None,
             savings_period_rub=None,
             savings_pct=None,
+            net_savings_period_rub=None,
+            net_savings_pct=None,
             load_scenario=load_scenario,
+            telemetry_warnings=tuple(telemetry_warnings),
         )
 
     # Проверяем наличие всех моделей в pricing.yaml и считаем стоимость каждого диалога.
@@ -956,16 +1076,45 @@ def compute_unit_economics(
             )
         )
 
+    avg_tokens_in_per_request = sum((s.calls_per_request * s.avg_tokens_in for s in step_aggs), ZERO)
+    avg_tokens_out_per_request = sum((s.calls_per_request * s.avg_tokens_out for s in step_aggs), ZERO)
+    base_req_per_day = req_period_dec / period_days_dec
+    daily_tokens_in = avg_tokens_in_per_request * base_req_per_day
+    daily_tokens_out = avg_tokens_out_per_request * base_req_per_day
+
+    escalated_dialogs = sum(1 for d in dialogs if d.escalated)
+    if weighting_mode == "archive_weighted":
+        escalation_rate = sum(
+            (
+                norm_weights[c]
+                * (Decimal(sum(1 for d, _ in dialogs_by_cat[c] if d.escalated)) / Decimal(len(dialogs_by_cat[c])))
+                for c in norm_weights
+            ),
+            ZERO,
+        )
+    else:
+        escalation_rate = Decimal(escalated_dialogs) / Decimal(len(dialogs))
+
     period_variable_cost_rub = req_period_dec * active_variable_cost_rub
     period_total_cost_rub = period_variable_cost_rub + period_infra_cost_rub
     full_cost_per_request_rub = period_total_cost_rub / req_period_dec
 
+    period_residual_operator_cost_rub = operator_period_cost_rub * escalation_rate
+    period_pilot_total_cost_rub = period_total_cost_rub + period_residual_operator_cost_rub
+
     savings_per_request_rub = operator_cost_per_request_rub - full_cost_per_request_rub
     savings_period_rub = operator_period_cost_rub - period_total_cost_rub
     savings_pct = (savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
+    net_savings_period_rub = operator_period_cost_rub - period_pilot_total_cost_rub
+    net_savings_pct = (
+        (net_savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
+    )
 
     load_scenario = _compute_load_scenario(
         active_variable_cost_rub=active_variable_cost_rub,
+        avg_tokens_in_per_request=avg_tokens_in_per_request,
+        avg_tokens_out_per_request=avg_tokens_out_per_request,
+        escalation_rate=escalation_rate,
         daily_infra_cost_rub=daily_infra_cost_rub,
         operator_cost_per_request_rub=operator_cost_per_request_rub,
         requests_per_day=load_requests_per_day,
@@ -976,6 +1125,8 @@ def compute_unit_economics(
         has_measurements=True,
         weighting_mode=weighting_mode,
         measured_dialogs=len(dialogs),
+        escalated_dialogs=escalated_dialogs,
+        escalation_rate=escalation_rate,
         covered_archive_share=covered_share,
         uncovered_archive_share=uncovered_share,
         missing_categories=tuple(missing_cats),
@@ -984,6 +1135,10 @@ def compute_unit_economics(
         requests_per_period=requests_per_period,
         steps=tuple(step_aggs),
         categories=tuple(category_rows),
+        avg_tokens_in_per_request=avg_tokens_in_per_request,
+        avg_tokens_out_per_request=avg_tokens_out_per_request,
+        daily_tokens_in=daily_tokens_in,
+        daily_tokens_out=daily_tokens_out,
         weighted_variable_cost_rub=weighted_variable_cost_rub,
         unweighted_variable_cost_rub=unweighted_variable_cost_rub,
         active_variable_cost_rub=active_variable_cost_rub,
@@ -994,10 +1149,15 @@ def compute_unit_economics(
         full_cost_per_request_rub=full_cost_per_request_rub,
         operator_cost_per_request_rub=operator_cost_per_request_rub,
         operator_period_cost_rub=operator_period_cost_rub,
+        period_residual_operator_cost_rub=period_residual_operator_cost_rub,
+        period_pilot_total_cost_rub=period_pilot_total_cost_rub,
         savings_per_request_rub=savings_per_request_rub,
         savings_period_rub=savings_period_rub,
         savings_pct=savings_pct,
+        net_savings_period_rub=net_savings_period_rub,
+        net_savings_pct=net_savings_pct,
         load_scenario=load_scenario,
+        telemetry_warnings=tuple(telemetry_warnings),
     )
 
 
@@ -1055,33 +1215,68 @@ def _as_positive_decimal(val: Any) -> Decimal | None:
     return None
 
 
-def _find_cbr_rate_cell(ws: Worksheet) -> tuple[tuple[int, int], Decimal]:
-    """Ищет ячейку курса ЦБ рядом с меткой («Курс ЦБ» / «Курс USD» и т.п.)."""
+def _col_letters_to_index(letters: str) -> int:
+    idx = 0
+    for ch in letters.upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx
+
+
+def _find_cbr_rate_cell(
+    ws: Worksheet,
+    *,
+    data_rows: tuple[int, ...] = (),
+) -> tuple[tuple[int, int], Decimal | None]:
+    """Ищет ячейку курса ЦБ: сначала по ссылке в формулах таблицы ($I$3), затем по всей строке метки «Курс ЦБ»."""
     max_r = ws.max_row or 0
     max_c = ws.max_column or 0
+
+    # 1. Ищем метку «Курс ЦБ» / «Курс USD» (например, в A3 без объединения или H3).
+    rate_label_rows: list[tuple[int, int, int, int]] = []
     for r in range(1, max_r + 1):
         for c in range(1, max_c + 1):
             text = _norm_text(ws.cell(row=r, column=c).value)
             if not text or "курс" not in text:
                 continue
-            if not any(tok in text for tok in ("цб", "usd", "доллар", "руб", "$", "валют")):
+            if any(tok in text for tok in ("цб", "usd", "доллар", "руб", "$", "валют")):
+                rate_label_rows.append(_merge_span(ws, r, c))
+
+    # 2. Проверяем абсолютную ссылку на ячейку курса в формулах (например, IF(H9="$",$I$3,1) -> I3).
+    scan_rows = data_rows or tuple(range(1, max_r + 1))
+    for r in scan_rows:
+        for c in range(1, max_c + 1):
+            val = ws.cell(row=r, column=c).value
+            if not _is_formula(val):
                 continue
-            min_r, min_c, max_mr, max_mc = _merge_span(ws, r, c)
-            candidates = [
-                (min_r, max_mc + 1),
-                (min_r, max_mc + 2),
-                (max_mr + 1, min_c),
-            ]
-            for cr, cc in candidates:
-                if cr > max_r or cc > max_c:
+            for col_letters, row_str in CELL_REF_RE.findall(str(val)):
+                cr, cc = int(row_str), _col_letters_to_index(col_letters)
+                if cr in scan_rows or cr > max_r + 5 or cc > max_c + 5:
                     continue
                 tl = _top_left_of_merge(ws, cr, cc)
-                val = _as_positive_decimal(ws.cell(row=tl[0], column=tl[1]).value)
-                if val is not None:
-                    return tl, val
+                cell_val = ws.cell(row=tl[0], column=tl[1]).value
+                if _is_formula(cell_val):
+                    continue
+                parsed = _as_positive_decimal(cell_val)
+                if parsed is not None or any(min_r <= tl[0] <= max_mr for min_r, _, max_mr, _ in rate_label_rows):
+                    return tl, parsed
+
+    # 3. Если формулы не дали ссылку, ищем положительное число по всей строке метки (A3 -> I3) и под ней.
+    for min_r, min_c, max_mr, max_mc in rate_label_rows:
+        candidates = [(min_r, cc) for cc in range(max_mc + 1, max_c + 1)]
+        if max_mr + 1 <= max_r:
+            candidates.append((max_mr + 1, min_c))
+        for cr, cc in candidates:
+            tl = _top_left_of_merge(ws, cr, cc)
+            val = _as_positive_decimal(ws.cell(row=tl[0], column=tl[1]).value)
+            if val is not None:
+                return tl, val
+        # Пустая ячейка курса в строке метки (например, пустой I3 до подстановки --usd-rub-rate).
+        if max_c > max_mc:
+            return _top_left_of_merge(ws, min_r, max_c), None
+
     raise TemplateLayoutError(
-        f"На листе '{ws.title}' не найдена ячейка курса ЦБ: ожидалась положительная числовая ячейка "
-        "рядом с меткой «Курс ЦБ» / «Курс USD» (например, значение в I3)."
+        f"На листе '{ws.title}' не найдена ячейка курса ЦБ: ожидалась ячейка курса "
+        "рядом с меткой «Курс ЦБ» / «Курс USD» или по ссылке $I$3 в формулах."
     )
 
 
@@ -1179,6 +1374,7 @@ def _find_step_table(ws: Worksheet) -> tuple[int, dict[str, int], tuple[int, ...
 
     # Определяем строки таблицы данных ниже header_row до строки «Итого»/комментариев/пустого блока.
     data_rows: list[int] = []
+    summary_row: int | None = None
     step_col = best_cols["step"]
     for r in range(best_row + 1, max_r + 1):
         row_texts = [_norm_text(ws.cell(row=r, column=c).value) for c in range(1, max_c + 1)]
@@ -1187,6 +1383,7 @@ def _find_step_table(ws: Worksheet) -> tuple[int, dict[str, int], tuple[int, ...
         if any(kw in step_text for kw in SUMMARY_ROW_KEYWORDS) or any(
             first_non_empty.startswith(kw) for kw in SUMMARY_ROW_KEYWORDS
         ):
+            summary_row = r
             break
 
         has_formula_in_row = any(_is_formula(ws.cell(row=r, column=c).value) for c in range(1, max_c + 1))
@@ -1197,6 +1394,20 @@ def _find_step_table(ws: Worksheet) -> tuple[int, dict[str, int], tuple[int, ...
             # Пустая строка после блока строк с формулами/шаблонами — конец таблицы.
             break
 
+    # Если в итоговой строке есть SUM(I9:I12), используем строго диапазон итога — серый пример в строке 8 не трогаем.
+    if summary_row is not None:
+        for c in range(1, max_c + 1):
+            val = ws.cell(row=summary_row, column=c).value
+            if _is_formula(val):
+                m = SUM_RANGE_RE.search(str(val))
+                if m:
+                    start_r, end_r = int(m.group(1)), int(m.group(2))
+                    if start_r > best_row and end_r >= start_r and end_r < summary_row:
+                        data_rows = list(range(start_r, end_r + 1))
+                        break
+    elif data_rows and _norm_text(ws.cell(row=data_rows[0], column=step_col).value).startswith("пример"):
+        data_rows = data_rows[1:]
+
     if not data_rows:
         raise TemplateLayoutError(
             f"На листе '{ws.title}' после строки заголовков {best_row} не найдено ни одной строки данных таблицы шагов."
@@ -1205,11 +1416,40 @@ def _find_step_table(ws: Worksheet) -> tuple[int, dict[str, int], tuple[int, ...
     return best_row, best_cols, tuple(data_rows)
 
 
-def _find_comment_cells(ws: Worksheet) -> tuple[tuple[int, int], ...]:
-    """Ищет блок комментария (до 3 строк) по метке «Комментарий» / «Примечание»."""
+def _detect_currency_symbols(
+    ws: Worksheet,
+    data_rows: tuple[int, ...],
+    header_row: int,
+    currency_col: int,
+) -> dict[str, str]:
+    """Определяет формат обозначения валюты в шаблоне: символы ('₽'/'$') или ISO ('RUB'/'USD')."""
+    max_c = ws.max_column or 0
+    for r in data_rows:
+        for c in range(1, max_c + 1):
+            val = ws.cell(row=r, column=c).value
+            if not _is_formula(val):
+                continue
+            formula = str(val)
+            if '"$"' in formula or "'$'" in formula:
+                return {"USD": "$", "RUB": "₽"}
+            if '"USD"' in formula.upper():
+                return {"USD": "USD", "RUB": "RUB"}
+    # Проверяем строку-пример (если есть между header_row и data_rows[0]) или ячейки столбца валюты.
+    check_rows = list(range(header_row + 1, data_rows[0])) + list(data_rows)
+    for r in check_rows:
+        val = str(ws.cell(row=r, column=currency_col).value or "").strip()
+        if val in {"$", "₽"}:
+            return {"USD": "$", "RUB": "₽"}
+        if val.upper() in {"USD", "RUB"}:
+            return {"USD": "USD", "RUB": "RUB"}
+    return {"USD": "$", "RUB": "₽"}
+
+
+def _find_comment_cells(ws: Worksheet, *, min_row: int = 1) -> tuple[tuple[int, int], ...]:
+    """Ищет блок комментария (до 3 строк) НИЖЕ таблицы шагов по метке «Комментарий» / «Примечание»."""
     max_r = ws.max_row or 0
     max_c = ws.max_column or 0
-    for r in range(1, max_r + 1):
+    for r in range(max(1, min_row), max_r + 1):
         for c in range(1, max_c + 1):
             text = _norm_text(ws.cell(row=r, column=c).value)
             if not text or not any(kw in text for kw in ("комментар", "примечан", "пояснен")):
@@ -1238,7 +1478,7 @@ def _find_comment_cells(ws: Worksheet) -> tuple[tuple[int, int], ...]:
                                         stacked_right.append(nxt_tl)
                         return tuple(stacked_right[:3])
 
-            # Вариант 2: строки под меткой «Комментарий» (до 3 строк).
+            # Вариант 2: строки под меткой «Комментарий» (до 3 строк, например A17:A19 под A16).
             below_cells: list[tuple[int, int]] = []
             for offset in (1, 2, 3):
                 nr = max_mr + offset
@@ -1255,7 +1495,7 @@ def _find_comment_cells(ws: Worksheet) -> tuple[tuple[int, int], ...]:
                 return tuple(below_cells[:3])
 
     raise TemplateLayoutError(
-        f"На листе '{ws.title}' не найден блок комментария (ожидалась метка «Комментарий» / «Примечание»)."
+        f"На листе '{ws.title}' не найден блок комментария ниже таблицы шагов (ожидалась метка «Комментарий»)."
     )
 
 
@@ -1263,7 +1503,10 @@ def locate_template_layout(ws: Worksheet) -> TemplateLayout:
     """Определяет структуру листа шаблона без хардкода координат."""
     cbr_cell, cbr_rate = _find_cbr_rate_cell(ws)
     header_row, columns, data_rows = _find_step_table(ws)
-    comment_cells = _find_comment_cells(ws)
+    # Уточняем ячейку курса с учётом найденных строк шагов (формулы в data_rows).
+    cbr_cell, cbr_rate = _find_cbr_rate_cell(ws, data_rows=data_rows)
+    currency_symbols = _detect_currency_symbols(ws, data_rows, header_row, columns["currency"])
+    comment_cells = _find_comment_cells(ws, min_row=max(data_rows) + 1)
 
     formula_cells: set[tuple[int, int]] = set()
     for r in range(1, (ws.max_row or 0) + 1):
@@ -1280,11 +1523,12 @@ def locate_template_layout(ws: Worksheet) -> TemplateLayout:
         data_rows=data_rows,
         comment_cells=comment_cells,
         formula_cells=frozenset(formula_cells),
+        currency_symbols=currency_symbols,
     )
 
 
-def read_template_cbr_rate(template_path: Path, sheet_name: str | None = None) -> tuple[Decimal, TemplateLayout]:
-    """Открывает шаблон .xlsx, проверяет его структуру и возвращает курс ЦБ и layout."""
+def read_template_cbr_rate(template_path: Path, sheet_name: str | None = None) -> tuple[Decimal | None, TemplateLayout]:
+    """Открывает шаблон .xlsx, проверяет его структуру и возвращает курс ЦБ (или None, если ячейка пуста) и layout."""
     if not template_path.is_file():
         raise TemplateLayoutError(f"Файл шаблона .xlsx не найден: {template_path}.")
     wb = openpyxl.load_workbook(template_path, data_only=False)
@@ -1383,7 +1627,14 @@ def fill_xlsx_template(
                 raise TemplateLayoutError(f"Попытка перезаписать ячейку с формулой {(row, col)}.")
             ws.cell(row=row, column=col).value = value
 
-        # Записываем строки шагов агента.
+        # Если ячейка курса в шаблоне (например, I3) была пустой, а курс передан — заполняем её.
+        # Уже заполненный курс ЦБ в шаблоне никогда не перезаписывается.
+        if layout.cbr_rate_value is None and result.usd_rub_rate is not None:
+            cr, cc = layout.cbr_rate_cell
+            if (cr, cc) not in layout.formula_cells and not _is_formula(ws.cell(row=cr, column=cc).value):
+                ws.cell(row=cr, column=cc).value = float(result.usd_rub_rate)
+
+        # Записываем строки шагов агента (только в data_rows; строку-пример не трогаем).
         for idx, row_num in enumerate(layout.data_rows):
             if idx < len(result.steps):
                 step = result.steps[idx]
@@ -1395,7 +1646,7 @@ def fill_xlsx_template(
                     "tokens_out": float(_q(step.avg_tokens_out, "0.01")),
                     "price_in": float(step.price_in_per_1m),
                     "price_out": float(step.price_out_per_1m),
-                    "currency": step.currency,
+                    "currency": layout.currency_symbols.get(step.currency, step.currency),
                 }
                 for field_key, col_idx in layout.columns.items():
                     _safe_write(row_num, col_idx, row_values[field_key])
@@ -1430,6 +1681,8 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
     rate_str = _fmt_dec(result.usd_rub_rate, "0.0001") if result.usd_rub_rate else "не использовался"
     w_var = _fmt_dec(result.weighted_variable_cost_rub, "0.0001")
     u_var = _fmt_dec(result.unweighted_variable_cost_rub, "0.0001")
+    tok_in_day = _fmt_dec(result.daily_tokens_in, "0.01")
+    tok_out_day = _fmt_dec(result.daily_tokens_out, "0.01")
     p_var = _fmt_dec(result.period_variable_cost_rub, "0.01")
     d_inf = _fmt_dec(result.daily_infra_cost_rub, "0.01")
     p_inf = _fmt_dec(result.period_infra_cost_rub, "0.01")
@@ -1439,10 +1692,19 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
     op_min = _fmt_dec(pricing.operator.minutes_per_request, "0.01")
     op_req = _fmt_dec(result.operator_cost_per_request_rub, "0.01")
     op_per = _fmt_dec(result.operator_period_cost_rub, "0.01")
+    esc_pct_cell = (
+        f"{_fmt_dec(result.escalation_rate * HUNDRED, '0.01')}%" if result.escalation_rate is not None else "н/д"
+    )
+    res_op_per = _fmt_dec(result.period_residual_operator_cost_rub, "0.01")
+    pilot_tot_per = _fmt_dec(result.period_pilot_total_cost_rub, "0.01")
+    net_sav_per = _fmt_dec(result.net_savings_period_rub, "0.01")
+    net_sav_pct_cell = f"{_fmt_dec(result.net_savings_pct, '0.01')}%" if result.net_savings_pct is not None else "н/д"
     sav_req = _fmt_dec(result.savings_per_request_rub, "0.01")
     sav_per = _fmt_dec(result.savings_period_rub, "0.01")
     sav_pct_cell = f"{_fmt_dec(result.savings_pct, '0.01')}%" if result.savings_pct is not None else "н/д"
 
+    l_tok_in_day = _fmt_dec(load.daily_tokens_in, "0.01")
+    l_tok_out_day = _fmt_dec(load.daily_tokens_out, "0.01")
     l_d_var = _fmt_dec(load.daily_variable_cost_rub, "0.01")
     l_d_tot = _fmt_dec(load.daily_total_cost_rub, "0.01")
     l_p_var = _fmt_dec(load.period_variable_cost_rub, "0.01")
@@ -1451,10 +1713,21 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
     l_full_req = _fmt_dec(load.full_cost_per_request_rub, "0.0001")
     l_op_day = _fmt_dec(load.operator_daily_cost_rub, "0.01")
     l_op_per = _fmt_dec(load.operator_period_cost_rub, "0.01")
+    l_res_op_per = _fmt_dec(load.period_residual_operator_cost_rub, "0.01")
+    l_net_sav_day = _fmt_dec(load.net_savings_daily_rub, "0.01")
+    l_net_sav_per = _fmt_dec(load.net_savings_period_rub, "0.01")
+    l_net_sav_pct = f"{_fmt_dec(load.net_savings_pct, '0.01')}%" if load.net_savings_pct is not None else "н/д"
     l_sav_req = _fmt_dec(load.savings_per_request_rub, "0.01")
     l_sav_day = _fmt_dec(load.savings_daily_rub, "0.01")
     l_sav_per = _fmt_dec(load.savings_period_rub, "0.01")
     l_sav_pct_cell = f"{_fmt_dec(load.savings_pct, '0.01')}%" if load.savings_pct is not None else "н/д"
+
+    total_archive = sum(c.archive_count for c in result.categories)
+    measured_archive = sum(c.archive_count for c in result.categories if c.status == "measured")
+    measured_cat_cnt = sum(1 for c in result.categories if c.status == "measured")
+    total_cat_cnt = len(result.categories)
+    cov_pct_str = _fmt_dec(result.covered_archive_share * HUNDRED, "0.01")
+    uncov_pct_str = _fmt_dec(result.uncovered_archive_share * HUNDRED, "0.01")
 
     lines: list[str] = [
         "# Расчёт стоимости запроса и unit-экономики (T19)",
@@ -1462,10 +1735,11 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
         "## Параметры расчёта",
         "",
         "- **Единица учёта**: 1 запрос = 1 обращение = все LLM-вызовы в диалоге.",
-        f"- **Замерено диалогов**: {result.measured_dialogs}",
+        f"- **Замерено диалогов**: {result.measured_dialogs} (из них передано менеджеру: {result.escalated_dialogs}, "
+        f"доля эскалаций: {esc_pct_cell})",
         f"- **Режим взвешивания**: `{result.weighting_mode}`",
-        f"- **Покрытие долей архива**: {_fmt_dec(result.covered_archive_share * HUNDRED, '0.01')}% "
-        f"(без замеров: {_fmt_dec(result.uncovered_archive_share * HUNDRED, '0.01')}%)",
+        f"- **Покрытие долей архива**: {cov_pct_str}% ({measured_archive} из {total_archive} обращений, "
+        f"{measured_cat_cnt} из {total_cat_cnt} категорий; без замеров: {uncov_pct_str}%)",
         f"- **Курс USD/RUB (ЦБ)**: {rate_str}",
         f"- **Базовый период и объём**: {result.requests_per_period} обращений за {result.period_days} дн. "
         "(основной прогноз по подтверждённому объёму заказчика)",
@@ -1474,59 +1748,93 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
         "",
         "> **Важное допущение**: доли категорий взяты из архива обращений (`split_summary.json`), "
         "а не из рабочего потока на витрине. Категории без замеров помечены явно и не заполняются средним.",
-        "",
-        f"## Базовый расчёт за период ({result.period_days} дн., {result.requests_per_period} обращений)",
-        "",
-        "| Показатель | Значение |",
-        "|---|---|",
-        f"| Средняя переменная стоимость 1 обращения (взвешенная), ₽ | {w_var} |",
-        f"| Средняя переменная стоимость 1 обращения (невзвешенная), ₽ | {u_var} |",
-        f"| Переменные расходы за период ({result.requests_per_period} × средняя переменная), ₽ | {p_var} |",
-        f"| Суточная инфраструктура, ₽/сут. | {d_inf} |",
-        f"| Инфраструктура за период (суточная ставка × {result.period_days} дн., не зависит от числа обращений), ₽ | "
-        f"{p_inf} |",
-        f"| **Итого за период ({result.requests_per_period} × переменная "
-        f"+ инфраструктура за {result.period_days} дн.), ₽** | **{p_tot}** |",
-        f"| Полная себестоимость 1 обращения за период (с инфраструктурой), ₽ | {full_req} |",
-        "",
-        f"## Сравнение с ручным маршрутом (оператором) — базовый объём "
-        f"({result.requests_per_period} обр. / {result.period_days} дн.)",
-        "",
-        "| Показатель | Значение |",
-        "|---|---|",
-        f"| Стоимость часа оператора, ₽/ч | {op_hr} |",
-        f"| Среднее время оператора на обращение, мин | {op_min} |",
-        f"| Стоимость 1 обращения у оператора, ₽ | {op_req} |",
-        f"| Затраты ручного маршрута за период ({result.requests_per_period} обр.), ₽ | {op_per} |",
-        f"| Экономия на 1 обращении (оператор − агент с инфрой), ₽ | {sav_req} |",
-        f"| Экономия за период ({result.period_days} дн., {result.requests_per_period} обр.), ₽ | {sav_per} |",
-        f"| Относительная экономия за период, % | {sav_pct_cell} |",
-        "",
-        f"## Нагрузочный сценарий (отдельный расчёт: {load.requests_per_day} обращений/сутки, не базовый прогноз)",
-        "",
-        f"> **Отдельный нагрузочный расчёт (слайд 2)**: {load.requests_per_day} обращений/сутки "
-        f"({load.requests_per_period} обращений за {load.period_days} дн.). "
-        "Используется для оценки поведения экономики при высокой нагрузке и **не является базовым прогнозом**.",
-        "",
-        "| Показатель (нагрузочный сценарий) | Значение |",
-        "|---|---|",
-        f"| Переменные расходы в сутки ({load.requests_per_day} × средняя переменная), ₽ | {l_d_var} |",
-        f"| Суточная инфраструктура, ₽ | {d_inf} |",
-        f"| **Итого в сутки (агент + инфраструктура), ₽** | **{l_d_tot}** |",
-        f"| Переменные расходы за {load.period_days} дн. ({load.requests_per_period} обр.), ₽ | {l_p_var} |",
-        f"| Инфраструктура за {load.period_days} дн. (суточная ставка × {load.period_days} дн.), ₽ | {l_p_inf} |",
-        f"| **Итого за {load.period_days} дн. (агент + инфраструктура), ₽** | **{l_p_tot}** |",
-        f"| Полная себестоимость 1 обращения (нагрузочный сценарий), ₽ | {l_full_req} |",
-        f"| Затраты оператора в сутки ({load.requests_per_day} обр.), ₽ | {l_op_day} |",
-        f"| Затраты оператора за {load.period_days} дн. ({load.requests_per_period} обр.), ₽ | {l_op_per} |",
-        f"| Экономия на 1 обращении (нагрузочный сценарий), ₽ | {l_sav_req} |",
-        f"| Экономия в сутки, ₽ | {l_sav_day} |",
-        f"| Экономия за {load.period_days} дн., ₽ | {l_sav_per} |",
-        f"| Относительная экономия (нагрузочный сценарий), % | {l_sav_pct_cell} |",
-        "",
-        "## Разбивка по шагам агента",
-        "",
     ]
+
+    if result.missing_categories and result.has_measurements:
+        lines.extend(
+            [
+                "",
+                f"> **Область прогноза (частичная выборка)**: замерено {measured_cat_cnt} из {total_cat_cnt} категорий "
+                f"({measured_archive} из {total_archive} обращений архива, {cov_pct_str}%). "
+                "Нормированная средняя стоимость ниже относится **только к составу замеренных категорий**; "
+                "перенос на 100% потока является явным допущением до замера или оценки пропущенных категорий.",
+            ]
+        )
+
+    for warn in result.telemetry_warnings:
+        lines.extend(["", f"> **Предупреждение о неполноте данных**: {warn}"])
+
+    lines.extend(
+        [
+            "",
+            f"## Базовый расчёт за период ({result.period_days} дн., {result.requests_per_period} обращений)",
+            "",
+            "| Показатель | Значение |",
+            "|---|---|",
+            f"| Средняя переменная стоимость 1 обращения (взвешенная), ₽ | {w_var} |",
+            f"| Средняя переменная стоимость 1 обращения (невзвешенная), ₽ | {u_var} |",
+            f"| Суммарные входные токены в сутки (база {result.requests_per_period}/{result.period_days} обр./сут.) | "
+            f"{tok_in_day} |",
+            f"| Суммарные выходные токены в сутки (база {result.requests_per_period}/{result.period_days} обр./сут.) | "
+            f"{tok_out_day} |",
+            f"| Переменные расходы за период ({result.requests_per_period} × средняя переменная), ₽ | {p_var} |",
+            f"| Суточная инфраструктура, ₽/сут. | {d_inf} |",
+            f"| Инфраструктура за период (суточная ставка × {result.period_days} дн., "
+            f"не зависит от числа обращений), ₽ | {p_inf} |",
+            f"| **Итого за период ({result.requests_per_period} × переменная "
+            f"+ инфраструктура за {result.period_days} дн.), ₽** | **{p_tot}** |",
+            f"| Полная себестоимость 1 обращения за период (с инфраструктурой), ₽ | {full_req} |",
+            "",
+            f"## Сравнение с ручным маршрутом (оператором) — базовый объём "
+            f"({result.requests_per_period} обр. / {result.period_days} дн.)",
+            "",
+            "| Показатель | Значение |",
+            "|---|---|",
+            f"| Стоимость часа оператора, ₽/ч | {op_hr} |",
+            f"| Среднее время оператора на обращение, мин | {op_min} |",
+            f"| Стоимость 1 обращения у оператора, ₽ | {op_req} |",
+            f"| Затраты ручного маршрута за период ({result.requests_per_period} обр.), ₽ | {op_per} |",
+            f"| Доля передач менеджеру в замерах, % | {esc_pct_cell} |",
+            f"| Остаточные затраты оператора на переданных обращениях за период, ₽ | {res_op_per} |",
+            f"| Итого в пилоте за период (агент + инфраструктура + остаточный оператор), ₽ | {pilot_tot_per} |",
+            f"| **Чистая экономия за период с учётом передач менеджеру, ₽** | **{net_sav_per}** |",
+            f"| **Чистая относительная экономия с учётом передач менеджеру, %** | **{net_sav_pct_cell}** |",
+            f"| Верхняя граница экономии на 1 обращении (при полном замещении, без эскалаций), ₽ | {sav_req} |",
+            f"| Верхняя граница экономии за период (при полном замещении, без эскалаций), ₽ | {sav_per} |",
+            f"| Верхняя граница относительной экономии (при полном замещении, без эскалаций), % | {sav_pct_cell} |",
+            "",
+            f"## Нагрузочный сценарий (отдельный расчёт: {load.requests_per_day} обращений/сутки, не базовый прогноз)",
+            "",
+            f"> **Отдельный нагрузочный расчёт (слайд 2)**: {load.requests_per_day} обращений/сутки "
+            f"({load.requests_per_period} обращений за {load.period_days} дн.). "
+            "Используется для оценки поведения экономики при высокой нагрузке и **не является базовым прогнозом**.",
+            "",
+            "| Показатель (нагрузочный сценарий) | Значение |",
+            "|---|---|",
+            f"| Суммарные входные токены в сутки ({load.requests_per_day} обр./сут.) | {l_tok_in_day} |",
+            f"| Суммарные выходные токены в сутки ({load.requests_per_day} обр./сут.) | {l_tok_out_day} |",
+            f"| Переменные расходы в сутки ({load.requests_per_day} × средняя переменная), ₽ | {l_d_var} |",
+            f"| Суточная инфраструктура, ₽ | {d_inf} |",
+            f"| **Итого в сутки (агент + инфраструктура), ₽** | **{l_d_tot}** |",
+            f"| Переменные расходы за {load.period_days} дн. ({load.requests_per_period} обр.), ₽ | {l_p_var} |",
+            f"| Инфраструктура за {load.period_days} дн. (суточная ставка × {load.period_days} дн.), ₽ | {l_p_inf} |",
+            f"| **Итого за {load.period_days} дн. (агент + инфраструктура), ₽** | **{l_p_tot}** |",
+            f"| Полная себестоимость 1 обращения (нагрузочный сценарий), ₽ | {l_full_req} |",
+            f"| Затраты оператора в сутки ({load.requests_per_day} обр.), ₽ | {l_op_day} |",
+            f"| Затраты оператора за {load.period_days} дн. ({load.requests_per_period} обр.), ₽ | {l_op_per} |",
+            f"| Остаточные затраты оператора на передачах за {load.period_days} дн., ₽ | {l_res_op_per} |",
+            f"| Чистая экономия в сутки с учётом передач менеджеру, ₽ | {l_net_sav_day} |",
+            f"| Чистая экономия за {load.period_days} дн. с учётом передач менеджеру, ₽ | {l_net_sav_per} |",
+            f"| Чистая относительная экономия (нагрузочный сценарий), % | {l_net_sav_pct} |",
+            f"| Верхняя граница экономии на 1 обращении (при полном замещении), ₽ | {l_sav_req} |",
+            f"| Верхняя граница экономии в сутки (при полном замещении), ₽ | {l_sav_day} |",
+            f"| Верхняя граница экономии за {load.period_days} дн. (при полном замещении), ₽ | {l_sav_per} |",
+            f"| Верхняя граница относительной экономии (при полном замещении), % | {l_sav_pct_cell} |",
+            "",
+            "## Разбивка по шагам агента",
+            "",
+        ]
+    )
 
     if result.steps:
         lines.extend(
@@ -1658,7 +1966,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--usd-rub-rate",
         type=str,
         default=None,
-        help="Курс USD/RUB (используется ТОЛЬКО если --template не передан).",
+        help="Курс USD/RUB (используется без --template либо для заполнения пустой ячейки I3 в шаблоне).",
+    )
+    parser.add_argument(
+        "--allow-incomplete-telemetry",
+        action="store_true",
+        help="Разрешить расчёт по неполному окну /manager/telemetry (recent_calls >= 20) с явным предупреждением.",
     )
     parser.add_argument(
         "--requests-per-period",
@@ -1687,11 +2000,14 @@ def main(argv: list[str] | None = None) -> int:
         pricing = load_pricing_config(args.pricing)
         split_summary = load_split_summary(args.split_summary)
         category_map = load_category_map(args.category_map)
+        telemetry_warnings: list[str] = []
         dialogs = load_measurements(
             eval_report_paths=args.eval_report,
             telemetry_paths=args.telemetry,
             split_summary=split_summary,
             category_map=category_map,
+            allow_incomplete_telemetry=args.allow_incomplete_telemetry,
+            warnings_out=telemetry_warnings,
         )
 
         if args.template is not None:
@@ -1699,7 +2015,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise UnitEconomicsError("При указании --template необходимо задать --xlsx-out.")
             if args.template.resolve() == args.xlsx_out.resolve():
                 raise UnitEconomicsError("Путь --xlsx-out не должен перезаписывать исходный --template.")
-            usd_rub_rate, _ = read_template_cbr_rate(args.template, sheet_name=args.sheet)
+            template_rate, _ = read_template_cbr_rate(args.template, sheet_name=args.sheet)
+            if template_rate is not None:
+                usd_rub_rate = template_rate
+            elif args.usd_rub_rate is not None:
+                usd_rub_rate = _parse_decimal(args.usd_rub_rate, "--usd-rub-rate", allow_zero=False)
+            else:
+                usd_rub_rate = None
         elif args.usd_rub_rate is not None:
             usd_rub_rate = _parse_decimal(args.usd_rub_rate, "--usd-rub-rate", allow_zero=False)
         else:
@@ -1713,6 +2035,7 @@ def main(argv: list[str] | None = None) -> int:
             requests_per_period=args.requests_per_period,
             period_days=args.period_days,
             load_requests_per_day=args.load_requests_per_day,
+            telemetry_warnings=tuple(telemetry_warnings),
         )
 
         if args.template is not None and args.xlsx_out is not None:

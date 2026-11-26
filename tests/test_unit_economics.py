@@ -752,3 +752,392 @@ def test_xlsx_template_layout_mismatch_fails_clearly(tmp_path: Path):
 
     with pytest.raises(ue.TemplateLayoutError, match="курса ЦБ"):
         ue.read_template_cbr_rate(no_rate_tpl)
+
+
+# --- 6. Официальный шаблон организатора («Расчёт»), стык с T10 и требования пилота ---
+
+
+def _create_official_organizer_template(path: Path, *, cbr_rate: float | None = None) -> tuple[Path, dict[str, str]]:
+    """Копия структуры официального листа «Расчёт» организатора (A3/I3, строка 8 — пример, I9:I12, A16->A17:A19)."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Расчёт"
+
+    ws["A1"] = "Калькулятор стоимости одного запроса ИИ-агента"
+    # Метка курса в A3 БЕЗ объединения, значение предназначено для I3.
+    ws["A3"] = "Курс ЦБ (USD/RUB)"
+    if cbr_rate is not None:
+        ws["I3"] = cbr_rate
+    # Инструкция над таблицей содержит слово «комментарий» — _find_comment_cells обязан её проигнорировать.
+    ws["A5"] = "Инструкция: заполните строки ниже, а комментарий к допущениям внесите в блок под таблицей."
+
+    headers = [
+        "Шаг агента",
+        "Модель",
+        "Вызовов на запрос",
+        "Средние токены вход",
+        "Средние токены выход",
+        "Цена за 1 млн вход",
+        "Цена за 1 млн выход",
+        "Валюта",
+        "Стоимость, руб.",
+    ]
+    for col_idx, text in enumerate(headers, start=1):
+        ws.cell(row=7, column=col_idx, value=text)
+
+    formulas: dict[str, str] = {}
+    # Строка 8 — серый пример, НЕ входящий в SUM(I9:I12).
+    example_vals = ["Пример: классификация", "example-model", 1, 500, 100, 1.0, 2.0, "$"]
+    for col_idx, val in enumerate(example_vals, start=1):
+        ws.cell(row=8, column=col_idx, value=val)
+    ex_formula = '=IF(C8="","",C8*((D8/1000000)*F8+(E8/1000000)*G8)*IF(H8="$",$I$3,1))'
+    ws.cell(row=8, column=9, value=ex_formula)
+    formulas["I8"] = ex_formula
+
+    # Строки 9–12 — рабочие строки шагов, формула умножает на $I$3 ТОЛЬКО при H{r}="$".
+    for r in range(9, 13):
+        formula = f'=IF(C{r}="","",C{r}*((D{r}/1000000)*F{r}+(E{r}/1000000)*G{r})*IF(H{r}="$",$I$3,1))'
+        ws.cell(row=r, column=9, value=formula)
+        formulas[f"I{r}"] = formula
+
+    ws["A13"] = "Итого за 1 запрос, руб."
+    total_formula = "=SUM(I9:I12)"
+    ws["I13"] = total_formula
+    formulas["I13"] = total_formula
+
+    ws["A16"] = "Комментарий"
+
+    wb.save(path)
+    wb.close()
+    return path, formulas
+
+
+def _eval_official_sheet_total(ws) -> Decimal:
+    """Пересчитывает формулу официального листа I13 = SUM(I9:I12) с учётом H{r}=='$' и I3."""
+    rate = Decimal(str(ws["I3"].value)) if ws["I3"].value is not None else Decimal("1")
+    total = Decimal("0")
+    for r in range(9, 13):
+        calls = ws.cell(row=r, column=3).value
+        if calls in (None, ""):
+            continue
+        t_in = Decimal(str(ws.cell(row=r, column=4).value))
+        t_out = Decimal(str(ws.cell(row=r, column=5).value))
+        p_in = Decimal(str(ws.cell(row=r, column=6).value))
+        p_out = Decimal(str(ws.cell(row=r, column=7).value))
+        cur = ws.cell(row=r, column=8).value
+        mult = rate if cur == "$" else Decimal("1")
+        row_cost = (
+            Decimal(str(calls)) * ((t_in / Decimal("1000000")) * p_in + (t_out / Decimal("1000000")) * p_out) * mult
+        )
+        total += row_cost
+    return total
+
+
+def test_official_organizer_sheet_layout_symbols_and_i13_recalc(tmp_path: Path):
+    split_path = _write_synthetic_split_summary(tmp_path / "split.json")
+    pricing_path = _write_synthetic_pricing(tmp_path / "pricing.yaml")
+
+    # 1. Копия официального листа с заполненным I3 = 90.
+    tpl_filled, orig_formulas = _create_official_organizer_template(tmp_path / "official_filled.xlsx", cbr_rate=90.0)
+    rate_val, layout = ue.read_template_cbr_rate(tpl_filled)
+    assert rate_val == Decimal("90.0")
+    assert layout.cbr_rate_cell == (3, 9)
+    assert layout.data_rows == (9, 10, 11, 12)
+    assert layout.comment_cells == ((17, 1), (18, 1), (19, 1))
+    assert layout.currency_symbols == {"USD": "$", "RUB": "₽"}
+
+    # 2. Копия официального листа с ПУСТЫМ I3 + передача --usd-rub-rate 90 через CLI.
+    tpl_empty, _ = _create_official_organizer_template(tmp_path / "official_empty.xlsx", cbr_rate=None)
+    eval_path = tmp_path / "eval_t10.json"
+    # Шаг 1 (USD): 1000 in * 2 + 500 out * 8 = 0.006 USD * 90 = 0.54 RUB
+    # Шаг 2 (RUB): 500 in * 100 + 250 out * 400 = 0.15 RUB
+    # Итого за 1 запрос: 0.69 RUB
+    eval_path.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "id": "open-1",
+                        "conversation_id": "conv-1",
+                        "category": NINE_CATEGORIES[0],
+                        "escalated": False,
+                        "llm_calls": [
+                            {"step": "agent_loop", "model": "synth-smart", "tokens_in": 1000, "tokens_out": 500},
+                            {"step": "format_reply", "model": "synth-fast-rub", "tokens_in": 500, "tokens_out": 250},
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    out_xlsx = tmp_path / "official_out.xlsx"
+    out_md = tmp_path / "official_report.md"
+    rc = ue.main(
+        [
+            "--eval-report",
+            str(eval_path),
+            "--split-summary",
+            str(split_path),
+            "--pricing",
+            str(pricing_path),
+            "--template",
+            str(tpl_empty),
+            "--xlsx-out",
+            str(out_xlsx),
+            "--report-out",
+            str(out_md),
+            "--usd-rub-rate",
+            "90",
+        ]
+    )
+    assert rc == 0
+
+    wb = openpyxl.load_workbook(out_xlsx, data_only=False)
+    try:
+        ws = wb["Расчёт"]
+        assert ws["I3"].value == 90.0
+        # Заголовок (строка 7) и серый пример (строка 8) не тронуты.
+        assert ws["A7"].value == "Шаг агента"
+        assert ws["A8"].value == "Пример: классификация"
+        assert ws["B8"].value == "example-model"
+        assert ws["H8"].value == "$"
+        # Шаги записаны строго в 9 и 10 с символами '$' и '₽'.
+        assert ws["A9"].value == "agent_loop"
+        assert ws["H9"].value == "$"
+        assert ws["A10"].value == "format_reply"
+        assert ws["H10"].value == "₽"
+        assert ws["A11"].value is None
+        assert ws["A12"].value is None
+        # Все формулы целы.
+        for coord, expected_formula in orig_formulas.items():
+            assert ws[coord].value == expected_formula
+        # Комментарии записаны строго в A17:A19 под A16.
+        assert ws["A16"].value == "Комментарий"
+        for r in (17, 18, 19):
+            assert isinstance(ws.cell(row=r, column=1).value, str) and ws.cell(row=r, column=1).value.strip()
+        # Пересчёт I13 = SUM(I9:I12) точно равен ожидаемой стоимости моделей (0.54 + 0.15 = 0.69 RUB).
+        assert _eval_official_sheet_total(ws) == Decimal("0.69")
+    finally:
+        wb.close()
+
+    # 3. Расчёт только в рублях работает с пустым I3 без --usd-rub-rate.
+    rub_pricing = _write_synthetic_pricing(
+        tmp_path / "rub_pricing.yaml",
+        overrides={
+            "models": {
+                "synth-fast-rub": {
+                    "input_per_1m": 100.0,
+                    "output_per_1m": 400.0,
+                    "currency": "RUB",
+                    "source_url": "https://example.invalid/pricing/fast",
+                    "date": "2026-11-26",
+                }
+            }
+        },
+    )
+    rub_eval = tmp_path / "rub_eval.json"
+    rub_eval.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "id": "rub-1",
+                        "conversation_id": "conv-rub",
+                        "category": NINE_CATEGORIES[0],
+                        "llm_calls": [
+                            {"step": "agent_loop", "model": "synth-fast-rub", "tokens_in": 1000, "tokens_out": 500}
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    rc_rub = ue.main(
+        [
+            "--eval-report",
+            str(rub_eval),
+            "--split-summary",
+            str(split_path),
+            "--pricing",
+            str(rub_pricing),
+            "--template",
+            str(tpl_empty),
+            "--xlsx-out",
+            str(tmp_path / "rub_out.xlsx"),
+            "--report-out",
+            str(tmp_path / "rub_report.md"),
+        ]
+    )
+    assert rc_rub == 0
+
+
+def test_t10_report_zero_llm_dedup_and_incomplete_telemetry_rejected(tmp_path: Path):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    pricing = ue.load_pricing_config(_write_synthetic_pricing(tmp_path / "pricing.yaml"))
+
+    # Формат JSON-отчёта T10: conversation_id, category, llm_calls=[] (0 LLM) и ненулевые llm_calls.
+    eval_path = tmp_path / "t10_eval_report.json"
+    eval_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.3",
+                "cases": [
+                    {
+                        "id": "open-price-61557",
+                        "conversation_id": "c-zero",
+                        "category": NINE_CATEGORIES[0],
+                        "escalated": False,
+                        "llm_calls": [],
+                    },
+                    {
+                        "id": "open-branch-a",
+                        "conversation_id": "c-paid",
+                        "category": NINE_CATEGORIES[0],
+                        "escalated": False,
+                        "llm_calls": [
+                            {"step": "agent_loop", "model": "synth-smart", "tokens_in": 1000, "tokens_out": 500}
+                        ],
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    # Телеметрия тоже содержит c-paid — load_measurements НЕ должен создавать дубль c-paid!
+    tel_small = tmp_path / "tel_small.json"
+    tel_small.write_text(
+        json.dumps(
+            {
+                "recent_calls": [
+                    {
+                        "id": 1,
+                        "session_id": "c-paid",
+                        "category": NINE_CATEGORIES[0],
+                        "step": "agent_loop",
+                        "model": "synth-smart",
+                        "tokens_in": 1000,
+                        "tokens_out": 500,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    dialogs = ue.load_measurements(
+        eval_report_paths=[eval_path],
+        telemetry_paths=[tel_small],
+        split_summary=summary,
+    )
+    assert len(dialogs) == 2
+    by_id = {d.dialog_id: d for d in dialogs}
+    assert set(by_id) == {"c-zero", "c-paid"}
+    assert by_id["c-zero"].calls == ()
+    assert len(by_id["c-paid"].calls) == 1
+
+    # Средняя стоимость по 2 диалогам (0.00 RUB и 0.60 RUB при курсе 100) = 0.30 RUB.
+    res = ue.compute_unit_economics(dialogs, summary, pricing, usd_rub_rate=Decimal("100"))
+    assert res.measured_dialogs == 2
+    assert res.active_variable_cost_rub == Decimal("0.3")
+
+    # Неполное окно /manager/telemetry (20 записей из 30) по умолчанию отклоняется с InputDataError.
+    tel_truncated = tmp_path / "tel_truncated.json"
+    tel_truncated.write_text(
+        json.dumps(
+            {
+                "steps": [{"step": "agent_loop", "calls": 30}],
+                "recent_calls": [
+                    {
+                        "id": i,
+                        "session_id": "c-big",
+                        "step": "agent_loop",
+                        "model": "synth-fast-rub",
+                        "tokens_in": 1000,
+                        "tokens_out": 0,
+                    }
+                    for i in range(20)
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ue.InputDataError, match="Неполное окно"):
+        ue.load_measurements(eval_report_paths=[], telemetry_paths=[tel_truncated], split_summary=summary)
+
+    # При явном allow_incomplete_telemetry=True фиксируется предупреждение.
+    warns: list[str] = []
+    partial_dialogs = ue.load_measurements(
+        eval_report_paths=[],
+        telemetry_paths=[tel_truncated],
+        split_summary=summary,
+        allow_incomplete_telemetry=True,
+        warnings_out=warns,
+    )
+    assert len(partial_dialogs) == 1
+    assert warns and "Неполное окно" in warns[0]
+
+
+def test_pilot_escalated_cases_daily_tokens_and_partial_scope_in_report(tmp_path: Path):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    pricing = ue.load_pricing_config(
+        _write_synthetic_pricing(
+            tmp_path / "pricing.yaml",
+            overrides={
+                "infrastructure": {
+                    "daily_cost": 0.0,
+                    "currency": "RUB",
+                    "source_url": "https://example.invalid/pricing/vps",
+                    "date": "2026-11-26",
+                }
+            },
+        )
+    )
+    # 100% обращений передано менеджеру при нулевых LLM- и инфра-расходах -> чистая экономия 0%, НЕ 100%!
+    dialogs = [
+        ue.DialogMeasurement(
+            dialog_id="d-esc",
+            category=NINE_CATEGORIES[0],
+            calls=(),
+            escalated=True,
+        )
+    ]
+    res = ue.compute_unit_economics(dialogs, summary, pricing, usd_rub_rate=Decimal("100"))
+    assert res.escalation_rate == Decimal("1")
+    assert res.period_residual_operator_cost_rub == Decimal("50000")
+    assert res.net_savings_period_rub == Decimal("0")
+    assert res.net_savings_pct == Decimal("0")
+
+    md = ue.render_markdown_report(res, pricing)
+    assert "**Чистая относительная экономия с учётом передач менеджеру, %** | **0.00%**" in md
+    assert "Верхняя граница относительной экономии (при полном замещении, без эскалаций)" in md
+    assert "Область прогноза (частичная выборка)" in md
+    assert "только к составу замеренных категорий" in md
+
+    # Проверяем суточные входные/выходные токены для базового и нагрузочного объёмов.
+    paid = [
+        ue.DialogMeasurement(
+            dialog_id="d-tok",
+            category=NINE_CATEGORIES[0],
+            calls=(ue.LLMCallRecord("agent_loop", "synth-smart", 1800, 360),),
+            escalated=False,
+        )
+    ]
+    res_tok = ue.compute_unit_economics(
+        paid, summary, pricing, usd_rub_rate=Decimal("100"), requests_per_period=500, period_days=180
+    )
+    # База: 500/180 обр/сут -> in = 1800 * 500 / 180 = 5000, out = 360 * 500 / 180 = 1000.
+    assert res_tok.daily_tokens_in == Decimal("5000")
+    assert res_tok.daily_tokens_out == Decimal("1000")
+    # Нагрузочный (500/сут): in = 900000, out = 180000.
+    assert res_tok.load_scenario.daily_tokens_in == Decimal("900000")
+    assert res_tok.load_scenario.daily_tokens_out == Decimal("180000")
+    md_tok = ue.render_markdown_report(res_tok, pricing)
+    assert "5000.00" in md_tok and "1000.00" in md_tok
+    assert "900000.00" in md_tok and "180000.00" in md_tok
