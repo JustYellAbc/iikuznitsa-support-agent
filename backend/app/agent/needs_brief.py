@@ -56,6 +56,10 @@ def initial_need(text: str) -> bool:
 
 
 def open_intake(text: str) -> bool:
+    if re.search(r"\b(?:подберите|посоветуйте|ищем|нужен|нужна|нужно)\b", text, re.I) and re.search(
+        r"редакт\w*[^.!?]{0,40}pdf|pdf[^.!?]{0,40}редакт|резервн\w* коп|б[эе]кап", text, re.I
+    ):
+        return True
     return bool(
         re.search(
             r"помогите (?:подобрать|выбрать)|не зна(?:ю|ем),? что (?:нужно|выбрать)|"

@@ -165,7 +165,8 @@ def test_choice_survives_reprice_and_numeric_budget(stand_api, need_index):  # n
     assert {p["offerId"] for p in changed["products"]} == {"addr", "files"}
 
 
-def test_generic_brief_compares_two_pdf_editors_from_current_catalog(stand_api, need_index):  # noqa: F811
+@pytest.mark.parametrize("opening", ["Помогите подобрать программу для редактирования PDF", "Подберите редактор PDF"])
+def test_generic_brief_compares_two_pdf_editors_from_current_catalog(stand_api, need_index, opening):  # noqa: F811
     with sqlite3.connect(need_index) as db:
         for vendor in ("A", "B"):
             name = vendor + " PDF Editor"
@@ -176,7 +177,7 @@ def test_generic_brief_compares_two_pdf_editors_from_current_catalog(stand_api, 
             )
             db.execute("INSERT INTO products(rowid,name) VALUES(?,?)", (cur.lastrowid, name))
     cid = stand_api.new_conversation()
-    say(stand_api, cid, "Помогите подобрать программу для редактирования PDF")
+    say(stand_api, cid, opening)
     reply = say(stand_api, cid, "На Windows")
     assert {p["offerId"] for p in reply[-2]["products"]} == {"A", "B"}
     assert "единицу лицензирования" in reply[-1]["text"]
