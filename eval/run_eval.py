@@ -32,16 +32,17 @@ except ImportError:  # pragma: no cover - exercised only in broken environments
     Draft202012Validator = None
     FormatChecker = None
 
-DEFAULT_GOLDEN_OPEN = Path("eval/golden_open.json")
-DEFAULT_SPLIT_SUMMARY = Path("eval/split_summary.json")
-DEFAULT_CATALOG = Path("data/raw/Mindbox.yml.gz.xml")
+# Repo-anchored defaults: the runner (and pytest, whose root conftest chdirs into tmp_path) may start anywhere.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_GOLDEN_OPEN = REPO_ROOT / "eval/golden_open.json"
+DEFAULT_SPLIT_SUMMARY = REPO_ROOT / "eval/split_summary.json"
+DEFAULT_CATALOG = REPO_ROOT / "data/raw/Mindbox.yml.gz.xml"
 DEFAULT_OPEN_OUT = Path(".local/eval_reports/eval_report")
 DEFAULT_SETTLE_SECONDS = 5.0
 EXPECTED_T04_VERSION = "0.3.0"
 T04_OPENAPI_CANDIDATES = (
-    Path("contracts/t04/openapi.yaml"),
-    Path("eval/t04_openapi.yaml"),
-    Path(__file__).resolve().parent / "t04_openapi.yaml",
+    REPO_ROOT / "contracts/t04/openapi.yaml",
+    REPO_ROOT / "eval/t04_openapi.yaml",
 )
 SESSION_COOKIE_NAME = "support_session"
 # T05 returns the 20 most recent LLM calls in /api/v1/manager/telemetry (recent_calls).
@@ -125,6 +126,9 @@ class CatalogOffer:
     price_rub: Decimal
     license_term: str | None
     url: str
+    name: str | None = None
+    # Accepted spellings of the product name («SunRav BookOffice», «BookOffice»); empty = derived from name.
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -356,6 +360,8 @@ def load_catalog_index(
                 price_rub=_normalize_decimal(item["price_rub"]),
                 license_term=item.get("contract_license_term"),
                 url=str(item["url"]),
+                name=item.get("name"),
+                aliases=tuple(str(a) for a in item.get("aliases", [])),
             )
 
     if load_full_xml and catalog_path is not None and catalog_path.is_file():
@@ -377,6 +383,8 @@ def load_catalog_index(
                     price_rub=_normalize_decimal(raw_price),
                     license_term=term,
                     url=(elem.findtext("url") or "").strip(),
+                    name=(elem.findtext("name") or "").strip() or None,
+                    aliases=index[oid].aliases if oid in index else (),
                 )
             elem.clear()
     return index
@@ -705,6 +713,133 @@ def validate_sources_present(events: list[dict], required_urls: list[str] | None
     return errors
 
 
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_NAME_NOISE_RE = re.compile(r"[^\w]+|_+")
+_LATIN_WORD_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]{2,}")
+# Words of a catalog name that do not identify the product (vendor legal forms, license wording).
+_GENERIC_NAME_TOKENS = frozenset(
+    {
+        "software",
+        "systems",
+        "technologies",
+        "technology",
+        "ltd",
+        "inc",
+        "corp",
+        "llc",
+        "gmbh",
+        "лицензия",
+        "лицензии",
+        "версия",
+        "подписка",
+        "для",
+        "на",
+    }
+)
+# Latin words that may sit next to an article in a correct answer without naming another product.
+_NEUTRAL_LATIN_WORDS = frozenset(
+    {"softline", "rub", "rur", "pdf", "url", "https", "http", "www", "store", "sku", "offerid", "vat", "nds"}
+)
+
+
+def _norm_name(text: str) -> str:
+    """Case/ё-insensitive form with punctuation folded to single spaces («Dr.Web» → «dr web»)."""
+    return " ".join(_NAME_NOISE_RE.sub(" ", text.casefold().replace("ё", "е")).split())
+
+
+def offer_name_variants(offer: CatalogOffer) -> list[str]:
+    """Normalized accepted spellings of a catalog product name.
+
+    Explicit aliases from golden_open.json win; otherwise the distinctive words before «(» or «,» of the
+    catalog name are used (vendor legal forms and license wording are not distinctive).
+    """
+    variants: list[str] = [_norm_name(a) for a in offer.aliases]
+    if offer.name:
+        variants.append(_norm_name(offer.name))
+        core = re.split(r"[(,]", offer.name, maxsplit=1)[0]
+        variants.append(_norm_name(core))
+        if not offer.aliases:
+            variants.extend(
+                tok for tok in _norm_name(core).split() if len(tok) >= 3 and tok not in _GENERIC_NAME_TOKENS
+            )
+    seen: set[str] = set()
+    return [v for v in variants if v and not (v in seen or seen.add(v))]
+
+
+def _names_product(text: str, variants: list[str]) -> bool:
+    """A variant occurs in text from a word start; inflected endings («Касперского») are allowed."""
+    haystack = f" {_norm_name(text)}"
+    return any(f" {variant}" in haystack for variant in variants)
+
+
+def _offer_name_tokens(offer: CatalogOffer) -> set[str]:
+    tokens: set[str] = set()
+    for variant in [*(_norm_name(a) for a in offer.aliases), _norm_name(offer.name or "")]:
+        tokens.update(variant.split())
+    return tokens
+
+
+def validate_product_names(
+    events: list[dict],
+    expected_offer_ids: list[str] | None,
+    catalog_index: dict[str, CatalogOffer] | None,
+) -> list[str]:
+    """Catch a correct article/price/link attached to the wrong product name (P2, PR #8).
+
+    * Product cards and quote lines of catalog SKUs must carry that SKU's product name.
+    * Agent text that cites an expected offerId must not name another product on that line, and, unless a
+      card or quote line for that offerId accompanies it, must name the expected product in the message.
+    """
+    errors: list[str] = []
+    catalog = catalog_index or {}
+    named = {oid: offer for oid, offer in catalog.items() if offer.name}
+
+    carded: set[str] = set()
+    items = [("Product", p) for p in _products_from_events(events)]
+    items += [("Quote line", line) for q in _quotes_from_events(events) for line in q.get("lines", [])]
+    for kind, item in items:
+        oid = str(item.get("offerId", ""))
+        offer = named.get(oid)
+        if offer is None:
+            continue
+        name = str(item.get("name", ""))
+        if not _names_product(name, offer_name_variants(offer)):
+            errors.append(f"{kind} {oid} name {name!r} does not match catalog product {offer.name!r}")
+        else:
+            carded.add(oid)
+
+    for oid in [str(o) for o in (expected_offer_ids or [])]:
+        offer = named.get(oid)
+        if offer is None:
+            continue
+        variants = offer_name_variants(offer)
+        allowed_tokens = _offer_name_tokens(offer) | _NEUTRAL_LATIN_WORDS
+        oid_re = re.compile(rf"(?<!\d){re.escape(oid)}(?!\d)")
+        for msg in _agent_messages(events):
+            if msg.get("purpose") == "greeting":
+                continue
+            text = _URL_RE.sub(" ", str(msg.get("text", "")))
+            if not oid_re.search(text):
+                continue
+            foreign_found = False
+            for line in text.splitlines():
+                if not oid_re.search(line) or _names_product(line, variants):
+                    continue
+                foreign = [w for w in _LATIN_WORD_RE.findall(line) if _norm_name(w) not in allowed_tokens]
+                if foreign:
+                    foreign_found = True
+                    errors.append(
+                        f"Agent text cites offerId {oid} with another product name {' '.join(foreign)!r}, "
+                        f"catalog product is {offer.name!r}"
+                    )
+            if not foreign_found and oid not in carded and not _names_product(text, variants):
+                errors.append(
+                    f"Agent text cites offerId {oid} without its product name (catalog: {offer.name!r}) "
+                    "and no product card confirms it"
+                )
+    return errors
+
+
 _PRICE_ASSERTION_KEYS = (
     "allowed_prices_rub",
     "required_prices_rub",
@@ -760,6 +895,9 @@ def validate_case_expectations(
         norm_req = _normalize_decimal(req_price)
         if norm_req not in observed_prices:
             errors.append(f"Expected price {norm_req:f} RUB not found in response")
+
+    if assertions.get("expected_offer_ids") or assertions.get("check_catalog_prices"):
+        errors.extend(validate_product_names(events, assertions.get("expected_offer_ids"), catalog_index))
 
     surfaced_ids, surfaced_text = _surfaced_offer_ids(events)
     for exp_oid in assertions.get("expected_offer_ids", []):
@@ -828,10 +966,13 @@ def validate_case_expectations(
 
 
 def _is_meaningful_event(event: dict) -> bool:
-    """First useful reaction for latency: anything but the echo of customer input and greetings."""
+    """First useful reaction for latency: anything but the customer echo, greetings and action_failed.
+
+    action_failed closes the turn but is a failure, not a reaction, so it never enters the latency sample.
+    """
     data = event.get("data", {})
     dtype = data.get("type")
-    if dtype in {"products", "handoff", "quote", "document", "action_failed"}:
+    if dtype in {"products", "handoff", "quote", "document"}:
         return True
     if dtype == "message":
         return data.get("author") in {"agent", "manager"} and data.get("purpose") != "greeting"
@@ -1213,18 +1354,27 @@ def run_case(
             if sanitize_outgoing and action.get("type") == "message" and "text" in action:
                 action["text"] = scrub_pii(str(action["text"]))
             action_key = f"eval-act-{case_id}-t{turn_idx}-{uuid.uuid4().hex[:8]}"
+            # Latency is measured from the moment the customer presses «Send» (before the POST), while the
+            # wait deadline and the quiet window start at the 202 ack so a slow POST cannot eat the window.
+            t_send = time.perf_counter()
             status, payload, _ = client.submit_action(conv_id, action, key=action_key)
-            t_start = time.perf_counter()
+            t_ack = time.perf_counter()
             if validator.active:
                 result.errors.extend(
                     f"Turn {turn_idx}: {err}"
                     for err in validator.validate("Document" if status == 200 else "Receipt", payload)
                 )
-            turn_info: dict = {"turn": turn_idx, "action_type": action.get("type"), "close": None, "latency_ms": None}
+            turn_info: dict = {
+                "turn": turn_idx,
+                "action_type": action.get("type"),
+                "close": None,
+                "latency_ms": None,
+                "ack_ms": round((t_ack - t_send) * 1000.0, 2),
+            }
             result.turns.append(turn_info)
 
             if status == 200:  # synchronous document re-issue, no journal events for this action
-                turn_info.update(close="sync_document", latency_ms=round((time.perf_counter() - t_start) * 1000.0, 2))
+                turn_info.update(close="sync_document", latency_ms=round((time.perf_counter() - t_send) * 1000.0, 2))
                 result.latency_ms.append(turn_info["latency_ms"])
                 turn_actions.append((turn_idx, None, assertions))
                 continue
@@ -1234,7 +1384,8 @@ def run_case(
             turn_actions.append((turn_idx, action_id, assertions))
             action_events = [ev for ev in history if ev.get("actionId") == action_id]
             first_meaningful_ms: float | None = None
-            deadline = t_start + timeout
+            post_ack_ms: float | None = None
+            deadline = t_ack + timeout
             allow_silent = bool(turn.get("allow_silent"))
 
             while True:
@@ -1247,9 +1398,10 @@ def run_case(
                         if ev.get("actionId") == action_id:
                             action_events.append(ev)
                             if first_meaningful_ms is None and _is_meaningful_event(ev):
-                                first_meaningful_ms = (now - t_start) * 1000.0
+                                first_meaningful_ms = (now - t_send) * 1000.0
+                                post_ack_ms = (now - t_ack) * 1000.0
                 responded = _turn_has_response(action_events)
-                quiet_for = now - max(last_event_at, t_start)
+                quiet_for = now - max(last_event_at, t_ack)
                 if any(e.get("data", {}).get("type") == "action_failed" for e in action_events):
                     turn_info["close"] = "action_failed"
                     break
@@ -1275,6 +1427,7 @@ def run_case(
                 break
             if first_meaningful_ms is not None:
                 turn_info["latency_ms"] = round(first_meaningful_ms, 2)
+                turn_info["post_ack_latency_ms"] = round(post_ack_ms or 0.0, 2)
                 result.latency_ms.append(first_meaningful_ms)
                 if result.first_meaningful_latency_ms is None:
                     result.first_meaningful_latency_ms = first_meaningful_ms
@@ -1297,6 +1450,20 @@ def run_case(
         history.extend(tail)
         result.errors.extend(validate_independent_cursors(history, replay_events, replay_next_after, drained_len))
         result.errors.extend(validate_contract_events(history, conv_id, schema_validator=validator))
+
+        # T04 action_failed = the action was not processed. No scenario expects it, so it always fails the case
+        # (and therefore closed_by_agent), even when the remaining assertions happen to pass.
+        turn_by_action = {aid: idx for idx, aid, _ in turn_actions if aid is not None}
+        for ev in history:
+            data = ev.get("data", {})
+            if data.get("type") != "action_failed":
+                continue
+            err = data.get("error") if isinstance(data.get("error"), dict) else {}
+            idx = turn_by_action.get(str(ev.get("actionId")))
+            where = f"Turn {idx}" if idx is not None else f"actionId {ev.get('actionId')!r}"
+            result.errors.append(
+                f"{where}: action_failed {err.get('code', '<no code>')}: {err.get('message', '<no message>')}"
+            )
 
         for turn_idx, action_id, assertions in turn_actions:
             if action_id is None:
@@ -1856,7 +2023,8 @@ def main(argv: list[str] | None = None) -> int:
     set_schema_validator(validator)
     if validator.active and validator.spec_version != EXPECTED_T04_VERSION:
         print(
-            f"warning: T04 spec {validator.spec_path} is {validator.spec_version}, runner targets {EXPECTED_T04_VERSION}"
+            f"warning: T04 spec {validator.spec_path} is {validator.spec_version}, "
+            f"runner targets {EXPECTED_T04_VERSION}"
         )
     if not validator.active:
         print("warning: T04 OpenAPI schema validation disabled by --no-schema-validation")

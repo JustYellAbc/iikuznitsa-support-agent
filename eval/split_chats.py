@@ -455,9 +455,223 @@ def run_split(
     holdout_ratio: float = 0.20,
 ) -> tuple[dict, dict, dict]:
     """Execute the split and write dev_ids.json + holdout_eval.json (0600, dir 0700) and the public summary."""
+    payloads = compute_split(archive_path, seed=seed, holdout_ratio=holdout_ratio)
+    write_split(holdout_dir, summary_out, payloads)
+    return payloads
+
+
+def run_split_from_manifest(
+    archive_path: Path, manifest_path: Path, holdout_dir: Path, summary_out: Path
+) -> tuple[dict, dict, dict]:
+    """Same outputs and file permissions as run_split(), but dev/holdout come strictly from manifest.json."""
+    payloads = compute_split(archive_path, assignment=load_manifest(manifest_path))
+    write_split(holdout_dir, summary_out, payloads)
+    return payloads
+
+
+# ---------------------------------------------------------------------------
+# Fixed team split (T02 manifest.json): --manifest and --verify-manifest
+# ---------------------------------------------------------------------------
+
+MANIFEST_WRAPPER_KEYS = ("items", "records", "rows", "chats")
+MANIFEST_ID_KEYS = ("id", "chat_id", "conversation_id")
+MANIFEST_SPLIT_VALUES = {
+    "dev": "dev",
+    "open_dev": "dev",
+    "open": "dev",
+    "holdout": "holdout",
+    "private_holdout": "holdout",
+    "private": "holdout",
+}
+
+
+class ManifestError(ValueError):
+    """manifest.json cannot be read unambiguously. Messages name entry positions, never chat IDs."""
+
+
+def _manifest_chat_id(value: object, pos: int) -> int:
+    if isinstance(value, bool):
+        raise ManifestError(f"manifest entry #{pos}: id must be an integer or a digit string")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"#?\d+", value.strip()):
+        return int(value.strip().lstrip("#"))
+    raise ManifestError(f"manifest entry #{pos}: id must be an integer or a digit string")
+
+
+def load_manifest(path: Path) -> dict[int, str]:
+    """Read a T02 manifest.json into {chat_id: "dev" | "holdout"}.
+
+    Accepted: a flat list of entries or {"items"|"records"|"rows"|"chats": [...]}; each entry has one of
+    id / chat_id / conversation_id and a split (dev/open_dev/open or holdout/private_holdout/private).
+    Duplicates, missing fields, unknown split values and unknown layouts are errors.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifestError(f"cannot read manifest {path.name}: {exc.__class__.__name__}") from exc
+    if isinstance(data, dict):
+        keys = [key for key in MANIFEST_WRAPPER_KEYS if key in data]
+        if len(keys) != 1 or not isinstance(data[keys[0]], list):
+            raise ManifestError(
+                f"unknown manifest layout: expected a list or exactly one of {list(MANIFEST_WRAPPER_KEYS)} with a list"
+            )
+        entries = data[keys[0]]
+    elif isinstance(data, list):
+        entries = data
+    else:
+        raise ManifestError("unknown manifest layout: top level must be a list or an object")
+    if not entries:
+        raise ManifestError("manifest has no entries")
+
+    assignment: dict[int, str] = {}
+    for pos, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            raise ManifestError(f"manifest entry #{pos}: expected an object")
+        id_keys = [key for key in MANIFEST_ID_KEYS if key in entry]
+        if len(id_keys) != 1:
+            raise ManifestError(f"manifest entry #{pos}: expected exactly one of {list(MANIFEST_ID_KEYS)}")
+        chat_id = _manifest_chat_id(entry[id_keys[0]], pos)
+        split = MANIFEST_SPLIT_VALUES.get(str(entry.get("split", "")).strip().lower())
+        if split is None:
+            raise ManifestError(f"manifest entry #{pos}: split must be one of {sorted(MANIFEST_SPLIT_VALUES)}")
+        if chat_id in assignment:
+            raise ManifestError(f"manifest entry #{pos}: duplicate id")
+        assignment[chat_id] = split
+    return assignment
+
+
+def split_records_from_manifest(
+    records: list[ChatRecord],
+    clusters: list[list[int]],
+    assignment: dict[int, str],
+    *,
+    archive_filename: str,
+    archive_sha256: str,
+) -> tuple[dict, dict, dict]:
+    """Put every chat into dev/holdout strictly by the manifest (no HMAC order, no seed)."""
+    archive_ids = {rec.chat_id for rec in records}
+    missing = len(archive_ids - assignment.keys())
+    unknown = len(assignment.keys() - archive_ids)
+    if missing or unknown:
+        raise ManifestError(
+            f"manifest does not cover the archive: {missing} archive chat(s) missing from manifest, "
+            f"{unknown} manifest id(s) not in archive"
+        )
+
+    cluster_of = {i: c_idx for c_idx, indices in enumerate(clusters) for i in indices}
+    dev_indices = [i for i, rec in enumerate(records) if assignment[rec.chat_id] == "dev"]
+    holdout_indices = [i for i, rec in enumerate(records) if assignment[rec.chat_id] == "holdout"]
+    dev_ids = sorted(records[i].chat_id for i in dev_indices)
+    holdout_ids = sorted(records[i].chat_id for i in holdout_indices)
+    dev_clusters = {cluster_of[i] for i in dev_indices}
+    holdout_clusters = {cluster_of[i] for i in holdout_indices}
+    # The manifest is authoritative; near-duplicate clusters split across dev/holdout are reported, not moved.
+    overlap_clusters = dev_clusters & holdout_clusters
+
+    cat_totals = Counter(rec.category for rec in records)
+    dev_cat_counts = Counter(records[i].category for i in dev_indices)
+    holdout_cat_counts = Counter(records[i].category for i in holdout_indices)
+
+    dev_payload = {
+        "schema_version": "1.0",
+        "split": "open_dev",
+        "split_source": "manifest",
+        "archive_filename": archive_filename,
+        "archive_sha256": archive_sha256,
+        "count": len(dev_ids),
+        "ids": dev_ids,
+    }
+    holdout_cases = [
+        _build_holdout_case(records[i], f"c-{records[clusters[cluster_of[i]][0]].chat_id}") for i in holdout_indices
+    ]
+    holdout_cases.sort(key=lambda item: item["chat_id"])
+    holdout_payload = {
+        "schema_version": "1.0",
+        "split": "private_holdout",
+        "split_source": "manifest",
+        "archive_filename": archive_filename,
+        "archive_sha256": archive_sha256,
+        "count": len(holdout_ids),
+        "ids": holdout_ids,
+        "category_counts": {cat: holdout_cat_counts[cat] for cat in sorted(cat_totals)},
+        "cases": holdout_cases,
+    }
+    total = len(records)
+    has_anchor = 100646 in archive_ids
+    summary_payload = {
+        "schema_version": "1.2",
+        "archive_filename": archive_filename,
+        "archive_sha256": archive_sha256,
+        "split_source": "manifest",
+        "seed_policy": "fixed team manifest.json (T02); no seed is used",
+        "total_records": total,
+        "unique_ids_count": len(archive_ids),
+        "open_dev_count": len(dev_ids),
+        "private_holdout_count": len(holdout_ids),
+        "open_dev_ratio": round(len(dev_ids) / total, 4) if total else 0.0,
+        "private_holdout_ratio": round(len(holdout_ids) / total, 4) if total else 0.0,
+        "overlap_count": len(set(dev_ids) & set(holdout_ids)),
+        "cluster_overlap_count": len(overlap_clusters),
+        "anchor_100646_in_open_dev": (100646 in dev_ids) if has_anchor else None,
+        "duplicate_clusters": {
+            "total_clusters": len(clusters),
+            "multi_item_clusters": sum(1 for c in clusters if len(c) > 1),
+            "clustered_records": sum(len(c) for c in clusters if len(c) > 1),
+            "open_dev_clusters": len(dev_clusters - holdout_clusters),
+            "private_holdout_clusters": len(holdout_clusters - dev_clusters),
+        },
+        "categories": {
+            cat: {"total": cat_totals[cat], "open_dev": dev_cat_counts[cat], "private_holdout": holdout_cat_counts[cat]}
+            for cat in sorted(cat_totals)
+        },
+    }
+    return dev_payload, holdout_payload, summary_payload
+
+
+def _ids_sha256(ids: set[int]) -> str:
+    """SHA-256 of the sorted ID set, one decimal ID per line (compare sets without printing them)."""
+    return hashlib.sha256("\n".join(str(i) for i in sorted(ids)).encode("ascii")).hexdigest()
+
+
+def verify_against_manifest(dev_ids: set[int], holdout_ids: set[int], assignment: dict[int, str]) -> dict:
+    """Compare computed dev/holdout sets with the manifest. The report holds counts and hashes, never IDs."""
+    manifest_dev = {cid for cid, split in assignment.items() if split == "dev"}
+    manifest_holdout = {cid for cid, split in assignment.items() if split == "holdout"}
+    computed = {cid: "dev" for cid in dev_ids} | {cid: "holdout" for cid in holdout_ids}
+    all_ids = computed.keys() | assignment.keys()
+    mismatches = sum(1 for cid in all_ids if computed.get(cid) != assignment.get(cid))
+    return {
+        "exact_match": dev_ids == manifest_dev and holdout_ids == manifest_holdout,
+        "computed": {"dev": len(dev_ids), "holdout": len(holdout_ids)},
+        "manifest": {"dev": len(manifest_dev), "holdout": len(manifest_holdout)},
+        "mismatch_count": mismatches,
+        "sha256": {
+            "computed_dev": _ids_sha256(dev_ids),
+            "computed_holdout": _ids_sha256(holdout_ids),
+            "manifest_dev": _ids_sha256(manifest_dev),
+            "manifest_holdout": _ids_sha256(manifest_holdout),
+        },
+    }
+
+
+def compute_split(
+    archive_path: Path,
+    *,
+    seed: str | None = None,
+    assignment: dict[int, str] | None = None,
+    holdout_ratio: float = 0.20,
+) -> tuple[dict, dict, dict]:
+    """Build the split in memory: by manifest assignment when given, otherwise by HMAC order with the seed."""
     archive_sha256, records = parse_archive(archive_path)
     clusters = cluster_records(records)
-    dev_payload, holdout_payload, summary_payload = split_records(
+    if assignment is not None:
+        return split_records_from_manifest(
+            records, clusters, assignment, archive_filename=archive_path.name, archive_sha256=archive_sha256
+        )
+    if seed is None:
+        raise ValueError("seed is required when no manifest is given")
+    return split_records(
         records,
         clusters,
         archive_filename=archive_path.name,
@@ -466,6 +680,10 @@ def run_split(
         holdout_ratio=holdout_ratio,
     )
 
+
+def write_split(holdout_dir: Path, summary_out: Path, payloads: tuple[dict, dict, dict]) -> None:
+    """Write dev_ids.json + holdout_eval.json (0600, dir 0700) and the public summary."""
+    dev_payload, holdout_payload, summary_payload = payloads
     holdout_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(holdout_dir, 0o700)
     summary_out.parent.mkdir(parents=True, exist_ok=True)
@@ -473,7 +691,6 @@ def run_split(
     _write_private(holdout_dir / "dev_ids.json", dev_payload)
     _write_private(holdout_dir / "holdout_eval.json", holdout_payload)
     summary_out.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return dev_payload, holdout_payload, summary_payload
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -486,27 +703,69 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--holdout-dir",
         type=Path,
         default=None,
-        help=f"Private directory outside the repo and /tmp (env: EVAL_HOLDOUT_DIR, default ~/.local/share/{HOLDOUT_DIR_NAME})",
+        help=(
+            "Private directory outside the repo and /tmp "
+            f"(env: EVAL_HOLDOUT_DIR, default ~/.local/share/{HOLDOUT_DIR_NAME})"
+        ),
     )
     parser.add_argument("--summary-out", type=Path, default=DEFAULT_SUMMARY_OUT)
     parser.add_argument("--holdout-ratio", type=float, default=0.20)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Fixed team split (T02 manifest.json): put chats into dev/holdout strictly by its split field, no seed",
+    )
+    parser.add_argument(
+        "--verify-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Compare the computed dev/holdout sets with this manifest.json and print counts and SHA-256 only "
+            "(no IDs, nothing is written); exit code 1 on any mismatch"
+        ),
+    )
     return parser
+
+
+def _main_verify(args: argparse.Namespace) -> int:
+    try:
+        expected = load_manifest(args.verify_manifest)
+        if args.manifest is not None:
+            dev, holdout, _ = compute_split(args.archive, assignment=load_manifest(args.manifest))
+        else:
+            dev, holdout, _ = compute_split(args.archive, seed=resolve_seed(), holdout_ratio=args.holdout_ratio)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    report = verify_against_manifest(set(dev["ids"]), set(holdout["ids"]), expected)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["exact_match"] else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.verify_manifest is not None:
+        return _main_verify(args)
     try:
-        seed = resolve_seed()
+        seed = None if args.manifest is not None else resolve_seed()
         holdout_dir = check_holdout_dir(args.holdout_dir if args.holdout_dir is not None else default_holdout_dir())
+        if seed is None:
+            _, _, summary = run_split_from_manifest(args.archive, args.manifest, holdout_dir, args.summary_out)
+        else:
+            _, _, summary = run_split(
+                args.archive,
+                holdout_dir,
+                args.summary_out,
+                seed=seed,
+                holdout_ratio=args.holdout_ratio,
+            )
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
-    _, _, summary = run_split(
-        args.archive,
-        holdout_dir,
-        args.summary_out,
-        seed=seed,
-        holdout_ratio=args.holdout_ratio,
-    )
+    if summary["cluster_overlap_count"]:
+        print(
+            f"warning: manifest splits {summary['cluster_overlap_count']} near-duplicate cluster(s) "
+            "across dev and holdout"
+        )
     print(
         f"Split {summary['total_records']} records -> "
         f"open_dev={summary['open_dev_count']} ({summary['open_dev_ratio']:.1%}), "

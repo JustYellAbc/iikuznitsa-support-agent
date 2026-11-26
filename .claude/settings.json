@@ -1,12 +1,6 @@
 {
   "permissions": {
     "deny": [
-      "Read(data/private/**)",
-      "Edit(data/private/**)",
-      "Write(data/private/**)",
-      "Grep(data/private/**)",
-      "Glob(data/private/**)",
-      "Bash(*data/private*)",
       "Read(~/.local/share/iikuznitsa-eval-private/**)",
       "Edit(~/.local/share/iikuznitsa-eval-private/**)",
       "Write(~/.local/share/iikuznitsa-eval-private/**)",

@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from eval import pii, run_eval, split_chats
+from eval import pii, run_eval, split_chats  # noqa: E402 - needs the sys.path tweak above
 
 ARCHIVE_PATH = REPO_ROOT / "data/raw/чаты поддержки.zip"
 CATALOG_PATH = REPO_ROOT / "data/raw/Mindbox.yml.gz.xml"
@@ -174,12 +174,12 @@ def test_split_summary_is_safe_and_isolation_guards_exist(monkeypatch: pytest.Mo
     # Dotfiles & rules protecting holdout and ignoring .DS_Store.
     claude_cfg = json.loads((REPO_ROOT / ".claude/settings.json").read_text(encoding="utf-8"))
     deny = claude_cfg["permissions"]["deny"]
-    assert "Read(data/private/**)" in deny
-    assert "Bash(*data/private*)" in deny
+    # data/private holds the T07/T14 catalog index, so it must stay readable; only the external holdout is denied.
+    assert not any("data/private" in rule for rule in deny)
     assert "Read(~/.local/share/iikuznitsa-eval-private/**)" in deny
     assert "Bash(*iikuznitsa-eval-private*)" in deny
-    assert "data/private/**" in (REPO_ROOT / ".geminiignore").read_text(encoding="utf-8")
-    assert "data/private/**" in (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "data/private/**" not in (REPO_ROOT / ".geminiignore").read_text(encoding="utf-8")
+    assert "data/private/**" not in (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
     assert ".DS_Store" in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
 
     proc = subprocess.run(

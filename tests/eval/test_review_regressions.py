@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from eval import pii, run_eval, split_chats
+from eval import pii, run_eval, split_chats  # noqa: E402 - needs the sys.path tweak above
 
 GOLDEN_OPEN_PATH = REPO_ROOT / "eval/golden_open.json"
 ARCHIVE_PATH = REPO_ROOT / "data/raw/чаты поддержки.zip"

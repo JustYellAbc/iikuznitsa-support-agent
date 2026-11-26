@@ -5,6 +5,7 @@
   "reference_skus": {
     "61557": {
       "name": "SunRav Software BookOffice (лицензии), Лицензия на 1 ПК",
+      "aliases": ["SunRav BookOffice", "BookOffice"],
       "group_id": "62592",
       "available": true,
       "price_rub": "4900",
@@ -19,6 +20,7 @@
     },
     "504": {
       "name": "Adobe Systems Adobe InCopy CC (лицензии для коммерческих организаций), лицензия, 12 мес.",
+      "aliases": ["Adobe InCopy", "InCopy"],
       "group_id": "556",
       "available": false,
       "price_rub": "0.00",
@@ -33,6 +35,7 @@
     },
     "48093": {
       "name": "Iceni Technology Iceni Infix (лицензия Fast, flexible, flawless PDF editing), версия Server",
+      "aliases": ["Iceni Infix", "Infix", "Iceni"],
       "group_id": "46956",
       "available": false,
       "price_rub": "1523654",
@@ -47,6 +50,7 @@
     },
     "19574": {
       "name": "MDaemon Technologies, Ltd. MDaemon Messaging Server (лицензия с подпиской на обновления на 1 год), 5 пользователей",
+      "aliases": ["MDaemon Messaging Server", "MDaemon"],
       "group_id": "16940",
       "available": true,
       "price_rub": "47808",
@@ -62,6 +66,7 @@
     },
     "19575": {
       "name": "MDaemon Technologies, Ltd. MDaemon Messaging Server (лицензия с подпиской на обновления на 1 год), 10 пользователей",
+      "aliases": ["MDaemon Messaging Server", "MDaemon"],
       "group_id": "16940",
       "available": true,
       "price_rub": "61698",
@@ -77,6 +82,7 @@
     },
     "19576": {
       "name": "MDaemon Technologies, Ltd. MDaemon Messaging Server (лицензия с подпиской на обновления на 1 год), 20 пользователей",
+      "aliases": ["MDaemon Messaging Server", "MDaemon"],
       "group_id": "16940",
       "available": true,
       "price_rub": "77556",
@@ -91,6 +97,7 @@
     },
     "19578": {
       "name": "MDaemon Technologies, Ltd. MDaemon Messaging Server (лицензия с подпиской на обновления на 1 год), 40 пользователей",
+      "aliases": ["MDaemon Messaging Server", "MDaemon"],
       "group_id": "16940",
       "available": true,
       "price_rub": "94341",
@@ -105,6 +112,7 @@
     },
     "19587": {
       "name": "MDaemon Technologies, Ltd. MDaemon Messaging Server (продление подписки на обновления на 1 год), 20 пользователей",
+      "aliases": ["MDaemon Messaging Server", "MDaemon"],
       "group_id": "16940",
       "available": true,
       "price_rub": "38778",
@@ -119,6 +127,7 @@
     },
     "359841": {
       "name": "MDaemon Technologies, Ltd. MDaemon Connector for Outlook (лицензия на 1 год), 20 пользователей",
+      "aliases": ["MDaemon Connector for Outlook", "MDaemon Connector", "Connector for Outlook", "коннектор Outlook"],
       "group_id": "17067",
       "available": true,
       "price_rub": "32643",
@@ -133,6 +142,7 @@
     },
     "359843": {
       "name": "MDaemon Technologies, Ltd. MDaemon Connector for Outlook (лицензия на 1 год), 40 пользователей",
+      "aliases": ["MDaemon Connector for Outlook", "MDaemon Connector", "Connector for Outlook", "коннектор Outlook"],
       "group_id": "17067",
       "available": true,
       "price_rub": "50933",
@@ -147,6 +157,7 @@
     },
     "19645": {
       "name": "MDaemon Technologies, Ltd. Security Gateway for Email Servers (лицензия с подпиской на обновления на 1 год), 50",
+      "aliases": ["MDaemon Security Gateway", "Security Gateway for Email Servers", "Security Gateway"],
       "group_id": "17016",
       "available": true,
       "price_rub": "34727",
@@ -161,6 +172,7 @@
     },
     "3850": {
       "name": "Kaspersky Security для почтовых серверов базовая лицензия на 1 год по количеству почтовых адресов",
+      "aliases": ["Kaspersky Security для почтовых серверов", "Kaspersky Security", "Kaspersky", "Касперск"],
       "group_id": "3707",
       "available": true,
       "price_rub": "1670.94",
@@ -177,6 +189,7 @@
     },
     "532803": {
       "name": "Доктор Веб Dr.Web Server Security Suite, Антивирус + Центр Управления лицензия на 1 год на 1 год на 1 устройство",
+      "aliases": ["Dr.Web Server Security Suite", "Dr.Web", "DrWeb", "Доктор Веб"],
       "group_id": "4092",
       "available": true,
       "price_rub": "6500",
