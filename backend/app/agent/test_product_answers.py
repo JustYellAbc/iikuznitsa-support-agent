@@ -96,6 +96,8 @@ def test_missing_knowledge_article_does_not_supply_delivery_instructions(stand_a
         ("А на 5 пользователей какая цена и срок?", "new5", "321"),
         ("А если продлеваем действующую подписку, какая цена и срок?", "renew", "875"),
         ("Какой срок для компании?", "new20", "12 мес"),
+        ("Какой срок для управляющей компании?", "new20", "12 мес"),
+        ("Какой срок для небольшой частной организации?", "new20", "12 мес"),
         ("Какой срок для юридического лица?", "new20", "12 мес"),
     ],
 )
@@ -105,8 +107,9 @@ def test_question_with_qualifiers_updates_answer_and_handoff(stand_api, index, q
     say(api, cid, "Нужен MDaemon на 20 пользователей для компании, покупаем впервые")
     response = say(api, cid, question)[-1]
     assert amount in response["text"] and response["sources"][0]["url"].endswith("/" + offer)
-    [p] = say(api, cid, "Позовите оператора")[-1]["handoff"]["products"]
-    assert p["offerId"] == offer
+    card = say(api, cid, "Позовите оператора")[-1]["handoff"]
+    [p] = card["products"]
+    assert (card["question"], p["offerId"], p["source"]["url"]) == (question, offer, response["sources"][0]["url"])
 
 
 @pytest.mark.parametrize("clarify", [False, True])
