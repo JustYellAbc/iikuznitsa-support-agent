@@ -128,3 +128,55 @@ def test_missing_file_coverage_cannot_produce_full_bundle(stand_api, need_index)
     answer = say(stand_api, cid, TERMS)
     assert answer[-1]["text"] == OFFER_HELP and "файловая лицензия" in answer[-1]["sources"][0]["label"]
     assert all(e["type"] != "products" for e in answer)
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ("Потолок теперь 0,50 тыс. руб.", set()),
+        ("Бюджет был до 100 000 ₽, теперь до 300 ₽. Позовите оператора.", set()),
+        ("Только файлы, почту уже защитили", {"files"}),
+        ("Нужна исключительно бессрочная лицензия", set()),
+        ("Требуется исключительно облачное решение, почта на Postfix", set()),
+        ("Есть отдельная машина с Linux", {"addr", "files"}),
+    ],
+)
+def test_hard_constraints_remove_inapplicable_products(stand_api, need_index, change, expected):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    say(api, cid, START)
+    say(api, cid, TERMS)
+    events = say(api, cid, change)
+    if events[-1]["type"] != "handoff":
+        events = say(api, cid, "Позовите оператора")
+    assert {p["offerId"] for p in events[-1]["handoff"]["products"]} == expected
+
+
+def test_choice_survives_reprice_and_numeric_budget(stand_api, need_index):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    say(api, cid, START)
+    say(api, cid, TERMS.replace("Postfix", "Postfix на Ubuntu 22.04"))
+    say(api, cid, "Берём второй вариант")
+    assert "предел" in say(api, cid, "Бюджет до 500 ₽")[-1]["text"]
+    answer = say(api, cid, "1500")
+    assert {p["offerId"] for p in answer[-2]["products"]} == {"addr", "files"}
+    changed = say(api, cid, "Будет 55 адресов. Позовите оператора")[-1]["handoff"]
+    assert {p["offerId"] for p in changed["products"]} == {"addr", "files"}
+
+
+def test_generic_brief_compares_two_pdf_editors_from_current_catalog(stand_api, need_index):  # noqa: F811
+    with sqlite3.connect(need_index) as db:
+        for vendor in ("A", "B"):
+            name = vendor + " PDF Editor"
+            cur = db.execute(
+                """INSERT INTO offers SELECT ?,NULL,NULL,?,?,edition,category_id,available,price,currency,price_state,
+                   ?,details,params FROM offers WHERE id='mail'""",
+                (vendor, name, vendor, "https://example.org/" + vendor),
+            )
+            db.execute("INSERT INTO products(rowid,name) VALUES(?,?)", (cur.lastrowid, name))
+    cid = stand_api.new_conversation()
+    say(stand_api, cid, "Помогите подобрать программу для редактирования PDF")
+    reply = say(stand_api, cid, "На Windows")
+    assert {p["offerId"] for p in reply[-2]["products"]} == {"A", "B"}
+    assert "единицу лицензирования" in reply[-1]["text"]

@@ -26,6 +26,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 
+import app.agent.needs as needs
 from app.agent.catalog_selection import Selection, named_request, select, selection_for
 from app.agent.handoff import (
     CONFIRMED,
@@ -36,7 +37,6 @@ from app.agent.handoff import (
     handoff_reason,
     route_action,
 )
-from app.agent.needs import needs_turn
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Session, StepTrace
 from app.contracts.t04 import Product
@@ -67,7 +67,9 @@ async def run_turn(
     products: list[Product] | None = None,
     finding: SearchFinding | None = None,
 ) -> AgentReply:
-    recommendation = await needs_turn(session, history, user_text, emit_step, action_type=action_type, finding=finding)
+    recommendation = await needs.run_turn(
+        session, history, user_text, emit_step, action_type=action_type, finding=finding
+    )
     if recommendation:
         return recommendation
     started = time.perf_counter()

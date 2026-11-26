@@ -10,6 +10,7 @@ from pathlib import Path
 from app.agent.catalog_selection import Result, result
 from app.agent.handoff import OFFER_HELP
 from app.agent.needs_brief import Brief, questions
+from app.agent.needs_discovery import compare_catalog
 from app.contracts.t04 import Product, Source
 
 
@@ -141,9 +142,9 @@ def recommend(index: Path, b: Brief, choice: str = "") -> Result:
     missing = questions(b)
     if missing:
         return result(" ".join(missing))
-    if not index.is_file():
+    if b.cloud_only or not index.is_file() or (b.goal != "discovery" and b.perpetual):
         return result(OFFER_HELP)
-    if b.purchase != "Полная версия":
+    if b.goal != "discovery" and b.purchase != "Полная версия":
         return result("Для продления укажите артикул текущей лицензии и действует ли подписка.")
     options = []
     gaps = []
@@ -151,11 +152,17 @@ def recommend(index: Path, b: Brief, choice: str = "") -> Result:
     with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
         db.execute("BEGIN")
+        if b.goal == "discovery":
+            return result(OFFER_HELP) if b.russian else compare_catalog(db, b, choice, money)
         if b.goal == "mailboxes":
             if b.mail_system == "Windows" and not b.russian:
                 line = find_line(db, MAILBOX, b, b.people)
                 if line:
                     options.append([line])
+        elif b.goal == "files":
+            line = find_line(db, FILES, b, b.servers)
+            if line:
+                options.append([line])
         else:
             mail = []
             if b.gateway and not b.russian and b.mail_system != "облако":
@@ -195,20 +202,20 @@ def recommend(index: Path, b: Brief, choice: str = "") -> Result:
                 ),
             ],
         )
-    totals = [sum(line.total for line in lines) for lines in options]
-    if b.budget_rub is not None:
-        within = [lines for lines, total in zip(options, totals, strict=True) if total <= b.budget_rub * 100]
-        if not within:
-            return result(
-                f"Подтверждённые составы превышают бюджет {money(b.budget_rub * 100)}. "
-                f"Самый доступный стоит {money(min(totals))}. Какой предел можем рассмотреть?",
-                sources=[line.product.source for line in options[totals.index(min(totals))]],
-            )
-        options = within
     if choice:
         options = [lines for lines in options if lines[0].family.name == choice]
         if not options:
             return result(OFFER_HELP)
+    totals = [sum(line.total for line in lines) for lines in options]
+    if b.budget_kopecks is not None:
+        within = [lines for lines, total in zip(options, totals, strict=True) if total <= b.budget_kopecks]
+        if not within:
+            return result(
+                f"Подтверждённые составы превышают бюджет {money(b.budget_kopecks)}. "
+                f"Самый доступный стоит {money(min(totals))}. Какой предел можем рассмотреть?",
+                sources=[line.product.source for line in options[totals.index(min(totals))]],
+            )
+        options = within
     products = {}
     sources = {}
     texts = []

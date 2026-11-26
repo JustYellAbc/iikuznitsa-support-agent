@@ -402,6 +402,13 @@ async def list_turns(session_id: str) -> list[AgentTurn]:
 # --- Черновики pilot -------------------------------------------------------------------
 
 
+async def sent_draft_actions(conversation_id: str) -> set[str]:
+    rows = await get_db().fetchall(
+        "SELECT action_id FROM drafts WHERE conversation_id=? AND status='sent'", (conversation_id,)
+    )
+    return {row["action_id"] for row in rows}
+
+
 def _draft(row: aiosqlite.Row) -> Draft:
     return Draft(
         id=row["id"],
