@@ -25,6 +25,10 @@ BUYER = "Пользователь"
 KIND = "Тип лицензии"
 CAPACITY = "К-во пользователей до"
 LIMIT = 200
+TRANSACTION_ONLY = re.compile(
+    r"(?:продлени[еяюия]|продлить|нов(?:ая|ое|ую|ой|ые)|перв(?:ая|ую|ичной|ичную|ичная)|покупк\w*|лицензи\w*|подписк\w*|"
+    r"действующ\w*|действует|активн\w*|просроч\w*|ист[её]к\w*|уже|ещ[её]|не|на|для)"
+)
 
 
 @dataclass
@@ -76,7 +80,9 @@ class Selection:
             updated.kind = "Продление"
         elif followup and re.fullmatch(r"(?:новая|новую|первичная|первый раз)[.! ]*", s):
             updated.kind = "Полная версия"
-        if re.search(r"не (?:истек|истёк|истекла|просроч)|ещ[её] действ|\bдействует\b|действующ|активная", s):
+        if re.search(r"\bне\s+(?:действует|активна)|\bнедействующ", s):
+            updated.expired = True
+        elif re.search(r"не (?:истек|истёк|истекла|просроч)|ещ[её] действ|\bдействует\b|действующ|активная", s):
             updated.expired = False
         elif re.search(r"просроч|истек|истёк|закончилась|истекла", s):
             updated.expired = True
@@ -111,7 +117,14 @@ def named_request(text: str) -> Selection | None:
         return Selection(name, standard=standard)
     quoted = re.search(r'[«"]([^»"]{2,100})[»"]', text)
     intent = NAMED.search(text)
-    request_name = re.sub(r"^лицензи[яюи]\s+(?:на|для)\s+", "", text[intent.end() :], flags=re.I) if intent else ""
+    request_name = text[intent.end() :] if intent else ""
+    request_name = re.sub(
+        r"^(?:(?:продление|покупка|покупку)\s+)?(?:лицензи[яюи]\s+)?(?:на|для)\s+"
+        r"|^(?:продление|покупка|покупку)\s+(?:лицензи[ияю]\s+)?(?=[A-Za-z«\"])",
+        "",
+        request_name,
+        flags=re.I,
+    )
     head = STOP_NAME.split(request_name, maxsplit=1)[0].strip(" .") if intent else text.strip(" .")
     latin = LATIN.search(head)
     if quoted:
@@ -164,6 +177,8 @@ def selection_for(text: str, previous: Selection | None, suggestion: str = "", o
                 return replace(updated, name=options[i], code=True)
         if found and found.code and found.name in options:
             return replace(updated, name=found.name, code=True)
+        if found and not found.code and all(TRANSACTION_ONLY.fullmatch(w) for w in WORD.findall(found.name.casefold())):
+            return updated
         if found and SEATS.match(found.name):
             return updated
         if re.fullmatch(r"v\d+(?:\.\d+)*", text.strip(), re.I):

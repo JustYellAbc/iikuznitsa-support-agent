@@ -197,7 +197,7 @@ async def last_products(conversation_id: str) -> list[dict[str, Any]]:
     # A pending pilot draft has no published answer/clarification and does not change it.
     row = await get_db().fetchone(
         """WITH searches AS (
-               SELECT json_extract(s.value, '$.args.journal_action_id') AS action_id
+               SELECT json_extract(s.value, '$.args.journal_action_id') AS action_id, t.decision
                FROM turns t, json_each(t.steps) s
                WHERE t.session_id = ? AND json_extract(s.value, '$.tool') = 'catalog_search'
            ), latest AS (
@@ -205,7 +205,9 @@ async def last_products(conversation_id: str) -> list[dict[str, Any]]:
                    json_extract(data, '$.type') = 'products' OR
                    (action_id IN (SELECT action_id FROM searches)
                     AND json_extract(data, '$.author') = 'agent'
-                    AND json_extract(data, '$.purpose') IN ('answer','clarification'))
+                    AND (json_extract(data, '$.purpose') IN ('answer','clarification')
+                         OR (json_extract(data, '$.purpose') = 'notice' AND action_id IN (
+                             SELECT action_id FROM searches WHERE decision = 'escalate'))))
                ) ORDER BY seq DESC LIMIT 1
            )
            SELECT data FROM events WHERE conversation_id = ? AND action_id = (SELECT action_id FROM latest)

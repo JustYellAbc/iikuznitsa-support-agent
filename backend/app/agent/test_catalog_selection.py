@@ -25,7 +25,7 @@ def index(tmp_path):
     for code, name, price, size, kind in [
         ("new20", family, "1234.56", "20", "Полная версия"),
         ("new5", family, "321", "5", "Полная версия"),
-        ("renew", family + " продление действующей подписки", "875", "20", "Продление"),
+        ("renew", family + " продление подписки на обновления", "875", "20", "Продление"),
         ("late", family + " продление просроченной подписки", "975", "20", "Продление"),
         ("desk", "PaperDesk Pro", "790", None, "Полная версия"),
         ("verify", "Widget Server", "120", None, "Полная версия"),
@@ -79,6 +79,57 @@ def test_selection_survives_multiple_turns_and_reaches_manager(stand_api, index)
     api.login()
     [handoff] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
     assert (handoff["conversationId"], handoff["reason"], handoff["products"]) == (cid, "tender", [p])
+
+
+@pytest.mark.parametrize(
+    ("change", "combined", "expected"),
+    [
+        ("Продлеваем, подписка действует.", True, ("renew", 87500)),
+        ("Теперь нужно продление действующей подписки.", False, ("renew", 87500)),
+        ("Теперь нужно продление действующей подписки.", True, ("renew", 87500)),
+        ("Продлеваем, подписка действует.", False, ("renew", 87500)),
+        ("Продлеваем, подписка уже не действует.", True, ("late", 97500)),
+        ("Оформляем на физлицо.", True, None),
+        ("Оформляем на физлицо.", False, None),
+        ("Продлеваем.", True, None),
+        ("Нужен PaperDesk.", True, ("desk", 79000)),
+        ("Нужен Новатор.", True, None),
+        ("Нужно продление лицензии на Dr.Web, подписка действует.", True, None),
+        ("Нужно продление для Adobe InCopy, подписка действует.", True, None),
+        ("Продлеваем, подписка действует. Это тендер.", True, ("renew", 87500)),
+        ("Нужен Adobe InCopy для тендера.", True, None),
+        ("Продлеваем для тендера, подписка действует. Спасибо.", True, ("renew", 87500)),
+    ],
+)
+def test_changed_terms_in_manager_card(stand_api, index, change, combined, expected):  # noqa: F811
+    api = stand_api
+    cid = api.new_conversation()
+    say(api, cid, "Нужен MDaemon на 20 пользователей")
+    assert say(api, cid, "Компания, покупаем впервые.")[1]["products"][0]["offerId"] == "new20"
+    call = "Позовите оператора."
+    text = f"{change} {call}" if combined else change
+    response = say(api, cid, text)
+    if not combined:
+        if expected:
+            assert response[-1]["purpose"] == "answer"
+        response = say(api, cid, call)
+    assert response[-1]["type"] == "handoff"
+    api.login()
+    [card] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+    reason = "tender" if "тендер" in change else "customer_request"
+    assert (card["conversationId"], card["reason"], card["question"]) == (cid, reason, text)
+    assert [(p["offerId"], p["unitPriceKopecks"]) for p in card["products"]] == ([expected] if expected else [])
+    if combined and expected is None:
+        close = f"/api/v1/manager/handoffs/{card['handoffId']}/resolution"
+        assert api.call("manager", "POST", close, json={"type": "close", "reply": "Проверили"}).status_code == 202
+        assert (
+            api.call(
+                "customer", "POST", f"/api/v1/conversations/{cid}/actions", json={"type": "request_operator"}
+            ).status_code
+            == 202
+        )
+        [reopened] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+        assert reopened["products"] == []
 
 
 @pytest.mark.parametrize("status,offer", [("ещё действует", "renew"), ("уже истекла", "late")])
