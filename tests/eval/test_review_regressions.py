@@ -65,14 +65,14 @@ def _product(oid: str) -> dict:
     }
 
 
-def _handoff(reason: str, products: list[dict], hid: str = "h1") -> dict:
+def _handoff(reason: str, products: list[dict], hid: str = "h1", question: str = "Вопрос оператору") -> dict:
     return {
         "type": "handoff",
         "handoff": {
             "handoffId": hid,
             "conversationId": "c1",
             "reason": reason,
-            "question": "Вопрос оператору",
+            "question": question,
             "products": products,
             "status": "open",
         },
@@ -264,10 +264,10 @@ def test_b1_tender_repeat_without_new_agent_text(repeat_emits_handoff: bool) -> 
                         "sources": [],
                     },
                 ),
-                (0.2, _handoff("tender", [product])),
+                (0.2, _handoff("tender", [product], question="Закупаем по тендеру. Пришлите пакет документов.")),
             ]
         elif repeat_emits_handoff:
-            out += [(0.1, _handoff("tender", [product]))]
+            out += [(0.1, _handoff("tender", [product], question="Закупаем по тендеру. Пришлите пакет документов."))]
         return out
 
     res = run_eval.run_case(

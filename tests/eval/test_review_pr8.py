@@ -316,19 +316,21 @@ def test_p1_holdout_id_never_leaks_to_stand_headers_or_cli_output(
     assert action_keys_seen[0] is not None
     assert action_keys_seen[0] == action_keys_seen[1]
 
-    # Source holdout ID must not appear in CLI stdout or stderr; only technical alias is printed.
+    # Source holdout ID must not appear in CLI stdout or stderr; holdout CLI prints only aggregates.
     assert secret_id not in captured.out
     assert secret_num not in captured.out
     assert secret_id not in captured.err
     assert secret_num not in captured.err
-    assert "holdout-alias-" in captured.out
+    assert "| Total cases | 1 |" in captured.out
+    assert "## Failed Case Responses" not in captured.out
+    assert "SunRav BookOffice" not in captured.out
 
-    # Private report inside holdout output directory keeps the alias -> source ID mapping.
+    # Private report inside holdout output directory keeps the alias -> source ID mapping and conversation_id.
     private_report = json.loads(Path(f"{out_prefix}.json").read_text(encoding="utf-8"))
     alias = private_report["cases"][0]["alias"]
     assert alias.startswith("holdout-alias-")
-    assert alias in captured.out
     assert private_report["cases"][0]["id"] == secret_id
+    assert private_report["cases"][0]["conversation_id"] == "c1"
     assert private_report["holdout_alias_map"] == {alias: secret_id}
 
 
@@ -529,3 +531,382 @@ def test_p2_quote_recalc_rejects_different_quote_id_or_same_revision() -> None:
     same_rev = run_pair("q1", 1, ["19576", "359841"], "q1", 1, ["19578", "359843"])
     assert same_rev.passed is False
     assert any("revision" in e for e in same_rev.errors), same_rev.errors
+
+
+# ---------------------------------------------------------------------------
+# [P1] Clarification-only or manager-only reply must NEVER count as closed_by_agent
+# ---------------------------------------------------------------------------
+
+
+def test_p1_clarification_or_manager_reply_never_credits_closed_by_agent() -> None:
+    case = {
+        "id": "synthetic-price-only",
+        "suite": "holdout",
+        "category": "Просто цена конкретного товара",
+        "turns": [{"action": {"type": "message", "text": "Подскажите цену?"}, "assertions": HOLDOUT_STD_ASSERTIONS}],
+        "assertions": HOLDOUT_STD_ASSERTIONS,
+    }
+    clar_res = _run(ScriptedClient(lambda body: [_input(body["text"]), _clarify("Назовите версию")]), case)
+    assert clar_res.passed is True, clar_res.errors
+    assert clar_res.escalated is False
+    assert clar_res.closed_by_agent is False
+
+    mgr_reply = {
+        "type": "message",
+        "author": "manager",
+        "purpose": "answer",
+        "text": "Ответил менеджер: цена 4 900 ₽.",
+        "sources": [{"url": URL_61557, "label": "Карточка Softline"}],
+    }
+    mgr_res = _run(ScriptedClient(lambda body: [_input(body["text"]), mgr_reply]), case)
+    assert mgr_res.passed is True, mgr_res.errors
+    assert mgr_res.escalated is False
+    assert mgr_res.closed_by_agent is False
+
+    summary = run_eval.summarize_results([clar_res, mgr_res], suite="open", mode="mvp")
+    assert summary["passed_cases"] == 2
+    assert summary["closed_by_agent_count"] == 0
+    assert summary["closed_by_agent_rate"] == 0.0
+    assert all(c["closed_by_agent"] is False for c in summary["cases"])
+    md = run_eval.format_markdown_report(summary)
+    assert "| agent |" not in md
+    assert "| unresolved |" in md
+
+
+# ---------------------------------------------------------------------------
+# [P1] open-tender-repeat must verify handoff.products and handoff.question
+# ---------------------------------------------------------------------------
+
+
+def test_p1_open_tender_repeat_checks_handoff_product_and_question() -> None:
+    case = CASES["open-tender-repeat"]
+    sku = GOLDEN["reference_skus"]["19576"]
+    prod_19576 = {
+        "offerId": "19576",
+        "name": sku["name"],
+        "source": {"url": sku["url"], "label": "Карточка Softline"},
+        "available": True,
+        "priceState": "listed",
+        "unitPriceKopecks": 7755600,
+        "licenseTerm": "12 мес.",
+    }
+
+    def run_tender(handoff_products: list[dict], handoff_question: str):
+        turns = iter(
+            [
+                lambda body: [
+                    _input(body["text"]),
+                    {"type": "products", "products": [prod_19576]},
+                    _answer("MDaemon на 20 пользователей стоит 77 556 ₽.", sku["url"]),
+                ],
+                lambda body: [
+                    _input(body["text"]),
+                    {
+                        "type": "message",
+                        "author": "agent",
+                        "purpose": "notice",
+                        "text": "Передал менеджеру.",
+                        "sources": [],
+                    },
+                    _handoff_ev("tender", handoff_question, products=handoff_products, hid="h1"),
+                ],
+                lambda body: [_input(body["text"])],
+            ]
+        )
+        return _run(ScriptedClient(lambda body: next(turns)(body)), case)
+
+    # Empty products=[] or unrelated question must FAIL.
+    bad = run_tender([], "Как выбрать калькулятор?")
+    assert bad.passed is False
+    assert any("19576" in e and "handoff.products" in e for e in bad.errors), bad.errors
+    assert any("handoff question" in e for e in bad.errors), bad.errors
+
+    # Valid SKU + price + URL + tender question must PASS.
+    ok = run_tender([prod_19576], "Закупаем по тендеру. Пришлите пакет документов.")
+    assert ok.passed is True, ok.errors
+
+
+# ---------------------------------------------------------------------------
+# [P1] Product substitution when article appears ONLY in URL
+# ---------------------------------------------------------------------------
+
+
+def test_p1_url_only_article_catches_product_substitution() -> None:
+    case = CASES["open-price-61557"]
+    spoofed = "Adobe Photoshop стоит 4 900 ₽. https://store.softline.ru/sunrav/-61557/"
+    bad = _run(ScriptedClient(lambda body: [_input(body["text"]), _answer(spoofed)]), case)
+    assert bad.passed is False
+    assert any("61557" in e and "Adobe Photoshop" in e for e in bad.errors), bad.errors
+
+    legit = "SunRav BookOffice стоит 4 900 ₽. https://store.softline.ru/sunrav/-61557/"
+    ok = _run(ScriptedClient(lambda body: [_input(body["text"]), _answer(legit)]), case)
+    assert ok.passed is True, ok.errors
+
+
+# ---------------------------------------------------------------------------
+# [P2] Late action_failed after a meaningful answer must be excluded from latency
+# ---------------------------------------------------------------------------
+
+
+def test_p2_late_action_failed_after_answer_excluded_from_latency() -> None:
+    case = {
+        "id": "synthetic-late-fail",
+        "suite": "open",
+        "category": "Просто цена конкретного товара",
+        "turns": [{"action": {"type": "message", "text": "Сколько стоит?"}, "assertions": HOLDOUT_STD_ASSERTIONS}],
+        "assertions": HOLDOUT_STD_ASSERTIONS,
+    }
+    failed = {"type": "action_failed", "error": {"code": "internal_error", "message": "Сбой после ответа"}}
+
+    class LateFailClient:
+        def __init__(self) -> None:
+            self.polls = 0
+            self.events: list[dict] = []
+
+        def create_conversation(self, key: str) -> str:
+            return "c-late"
+
+        def submit_action(self, cid: str, body: dict, key: str):
+            self.events.append(_ev(1, _input(body["text"]), "a1"))
+            self.events.append(_ev(2, _answer("SunRav BookOffice стоит 4 900 ₽."), "a1"))
+            return 202, {"conversationId": cid, "actionId": "a1"}, {}
+
+        def read_all_from(self, cid: str, after: int = 0, **_: object):
+            self.polls += 1
+            # Answer arrives on poll 1; action_failed arrives later on poll 3 (during settle/drain).
+            if self.polls == 3 and len(self.events) == 2:
+                self.events.append(_ev(3, failed, "a1"))
+            return self.events[after:], len(self.events)
+
+    res = run_eval.run_case(LateFailClient(), case, CATALOG, timeout=3, poll_interval=0.01, settle_seconds=0.05)
+    assert res.passed is False
+    assert res.closed_by_agent is False
+    assert res.latency_ms == []
+    assert res.first_meaningful_latency_ms is None
+    assert res.turns[0]["close"] == "action_failed"
+    assert res.turns[0]["latency_ms"] is None
+
+    summary = run_eval.summarize_results([res], suite="open", mode="mvp")
+    assert summary["latency_ms"] == {"samples": 0, "mean": None, "p50": None, "p95": None}
+
+
+# ---------------------------------------------------------------------------
+# [P2] T19 export (conversation_id + llm_calls including []) & holdout console privacy
+# ---------------------------------------------------------------------------
+
+
+def test_p2_t19_export_and_holdout_console_aggregates_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret_response = "СЕКРЕТНЫЙ_ФРАГМЕНТ_ПРОВАЛЕННОГО_ОТВЕТА"
+    holdout_file = tmp_path / "holdout_eval.json"
+    holdout_file.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "id": "holdout-zero-llm-111",
+                        "suite": "holdout",
+                        "sanitize_pii": True,
+                        "modes": ["mvp", "full"],
+                        "category": "Просто цена конкретного товара",
+                        "turns": [
+                            {
+                                "action": {"type": "message", "text": "Нужен SunRav 61557"},
+                                "assertions": HOLDOUT_STD_ASSERTIONS,
+                            }
+                        ],
+                        "assertions": HOLDOUT_STD_ASSERTIONS,
+                    },
+                    {
+                        "id": "holdout-fail-222",
+                        "suite": "holdout",
+                        "sanitize_pii": True,
+                        "modes": ["mvp", "full"],
+                        "category": "Прочее (покупка)",
+                        "turns": [
+                            {
+                                "action": {"type": "message", "text": "Проверить сбой"},
+                                "assertions": HOLDOUT_STD_ASSERTIONS,
+                            }
+                        ],
+                        "assertions": HOLDOUT_STD_ASSERTIONS,
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state: dict = {"counter": 0, "convs": {}, "calls": []}
+    token = "mgr-tok"
+
+    class T19Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+        def _send(self, code: int, payload: object, cookie: str | None = None) -> None:
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self) -> None:
+            if self.path == "/api/v1/manager/telemetry":
+                self._send(200, {"today_spend_rub": 0.1, "recent_calls": list(reversed(state["calls"]))})
+                return
+            m_tr = re.match(r"^/api/v1/manager/conversations/([^/]+)/trace$", self.path)
+            if m_tr:
+                cid = m_tr.group(1)
+                if cid == "conv-1":
+                    # Deterministic T07 turn: 0 LLM calls in trace!
+                    self._send(
+                        200,
+                        [
+                            {
+                                "turn_id": "t1",
+                                "total_cost_rub": 0.0,
+                                "steps": [
+                                    {
+                                        "tool": "catalog_search",
+                                        "args": {},
+                                        "result_summary": "ok",
+                                        "tokens_in": 0,
+                                        "tokens_out": 0,
+                                        "cost_rub": 0.0,
+                                        "latency_ms": 5,
+                                    }
+                                ],
+                            }
+                        ],
+                    )
+                    return
+                self._send(404, {"code": "not_found", "message": "no trace"})
+                return
+            m_ev = re.match(r"^/api/v1/conversations/([^/]+)/events", self.path)
+            if m_ev:
+                cid = m_ev.group(1)
+                after = int(self.path.split("after=")[-1]) if "after=" in self.path else 0
+                evs = state["convs"][cid][after:]
+                self._send(200, {"events": evs, "nextAfter": after + len(evs), "hasMore": False})
+                return
+            self._send(404, {"code": "not_found", "message": "not found"})
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            if self.path == "/api/v1/conversations":
+                state["counter"] += 1
+                cid = f"conv-{state['counter']}"
+                state["convs"][cid] = []
+                self._send(201, {"conversationId": cid})
+                return
+            m_act = re.match(r"^/api/v1/conversations/([^/]+)/actions$", self.path)
+            if m_act:
+                cid = m_act.group(1)
+                if cid == "conv-1":
+                    state["convs"][cid].append(_ev(1, _input(body["text"]), "a1"))
+                    state["convs"][cid].append(_ev(2, _answer("SunRav BookOffice стоит 4 900 ₽."), "a1"))
+                else:
+                    state["calls"].append(
+                        {
+                            "id": 1,
+                            "session_id": cid,
+                            "step": "agent_loop",
+                            "model": "gpt-4.1-mini",
+                            "tokens_in": 500,
+                            "tokens_out": 120,
+                            "cost_rub": 0.1,
+                            "latency_ms": 40,
+                        }
+                    )
+                    state["convs"][cid].append(_ev(1, _input(body["text"]), "a1"))
+                    # Missing sources -> fails holdout assertion so response text goes to Failed Case Responses.
+                    state["convs"][cid].append(
+                        _ev(
+                            2,
+                            {
+                                "type": "message",
+                                "author": "agent",
+                                "purpose": "answer",
+                                "text": f"{secret_response} 0 ₽",
+                                "sources": [],
+                            },
+                            "a1",
+                        )
+                    )
+                self._send(202, {"conversationId": cid, "actionId": "a1"})
+                return
+            self._send(404, {"code": "not_found", "message": "not found"})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), T19Handler)
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("EVAL_SESSION_COOKIE", token)
+    out_prefix = tmp_path / "private_holdout" / "report"
+    try:
+        rc = run_eval.main(
+            [
+                "--base-url",
+                f"http://{host}:{port}",
+                "--suite",
+                "holdout",
+                "--mode",
+                "mvp",
+                "--holdout-file",
+                str(holdout_file),
+                "--golden-open",
+                str(GOLDEN_OPEN_PATH),
+                "--out",
+                str(out_prefix),
+                "--poll-interval",
+                "0.01",
+                "--settle-seconds",
+                "0.02",
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    captured = capsys.readouterr()
+    assert rc == 1  # second case failed
+
+    # Console for holdout prints aggregates only: no failed response texts and no source holdout IDs.
+    assert "| Total cases | 2 |" in captured.out
+    assert secret_response not in captured.out
+    assert "holdout-zero-llm-111" not in captured.out
+    assert "holdout-fail-222" not in captured.out
+    assert "## Failed Case Responses" not in captured.out
+
+    # Private report in holdout dir contains full details, conversation_id, and llm_calls (including [] for 0 LLM).
+    private_md = Path(f"{out_prefix}.md").read_text(encoding="utf-8")
+    assert secret_response in private_md
+
+    report = json.loads(Path(f"{out_prefix}.json").read_text(encoding="utf-8"))
+    by_id = {c["id"]: c for c in report["cases"]}
+    c1 = by_id["holdout-zero-llm-111"]
+    assert c1["conversation_id"] == "conv-1"
+    assert c1["cost_status"] == "exact"
+    assert c1["llm_calls"] == []
+    assert c1["turns"][0]["steps"][0]["tool"] == "catalog_search"
+
+    c2 = by_id["holdout-fail-222"]
+    assert c2["conversation_id"] == "conv-2"
+    assert c2["cost_status"] == "exact"
+    assert c2["llm_calls"] == [
+        {
+            "step": "agent_loop",
+            "model": "gpt-4.1-mini",
+            "tokens_in": 500,
+            "tokens_out": 120,
+            "cost_rub": 0.1,
+            "latency_ms": 40,
+        }
+    ]

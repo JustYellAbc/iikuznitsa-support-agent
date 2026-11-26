@@ -677,6 +677,14 @@
             "allowed_prices_rub": ["77556"],
             "expect_handoff": true,
             "allowed_handoff_reasons": ["tender", "special_terms"],
+            "expected_handoff_products": [
+              {
+                "offer_id": "19576",
+                "unit_price_kopecks": 7755600,
+                "url": "https://store.softline.ru/alt-n-technologies-ltd/-19576/"
+              }
+            ],
+            "expected_handoff_question_patterns": ["тендер", "документ"],
             "forbid_document": true
           }
         },
@@ -697,6 +705,14 @@
         "allowed_prices_rub": ["77556"],
         "expect_handoff": true,
         "allowed_handoff_reasons": ["tender", "special_terms"],
+        "expected_handoff_products": [
+          {
+            "offer_id": "19576",
+            "unit_price_kopecks": 7755600,
+            "url": "https://store.softline.ru/alt-n-technologies-ltd/-19576/"
+          }
+        ],
+        "expected_handoff_question_patterns": ["тендер", "документ"],
         "expect_unique_open_handoff_count": 1,
         "forbid_document": true
       }

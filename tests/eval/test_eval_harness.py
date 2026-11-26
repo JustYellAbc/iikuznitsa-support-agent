@@ -898,7 +898,24 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path, monkeypatch: pyt
                 m_trace = re.match(r"^/api/v1/manager/conversations/([^/]+)/trace$", parsed.path)
                 if m_trace and convs.get(m_trace.group(1), {}).get("handoff"):  # type: ignore[union-attr]
                     own = [c for c in calls if c["session_id"] == m_trace.group(1)]
-                    turns = [{"turn_id": f"t{c['id']}", "total_cost_rub": c["cost_rub"]} for c in own]
+                    turns = [
+                        {
+                            "turn_id": f"t{c['id']}",
+                            "total_cost_rub": c["cost_rub"],
+                            "steps": [
+                                {
+                                    "tool": f"llm:{c['step']}",
+                                    "args": {"model": c["model"]},
+                                    "result_summary": "ok",
+                                    "tokens_in": c["tokens_in"],
+                                    "tokens_out": c["tokens_out"],
+                                    "cost_rub": c["cost_rub"],
+                                    "latency_ms": 10,
+                                }
+                            ],
+                        }
+                        for c in own
+                    ]
                     self._send(200, turns)
                     return
                 self._send(404, {"code": "not_found", "message": "no access"})
@@ -945,7 +962,17 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path, monkeypatch: pyt
                 aid = f"a-{conv['turn']}"
                 events: list[dict] = conv["events"]
                 calls: list[dict] = state["calls"]  # type: ignore[assignment]
-                calls.append({"id": len(calls) + 1, "session_id": cid, "step": "agent", "cost_rub": 0.25})
+                calls.append(
+                    {
+                        "id": len(calls) + 1,
+                        "session_id": cid,
+                        "step": "agent",
+                        "model": "gpt-4.1-mini",
+                        "tokens_in": 400,
+                        "tokens_out": 100,
+                        "cost_rub": 0.25,
+                    }
+                )
 
                 def push(data: dict) -> None:
                     if data["type"] == "handoff":
@@ -1139,8 +1166,12 @@ def test_run_eval_cli_full_open_suite_over_http(tmp_path: Path, monkeypatch: pyt
     # One mocked LLM call (0.25 RUB) per action: exact cost, no double counting.
     assert by_id["open-tender-repeat"]["cost_rub"] == 0.75
     assert by_id["open-tender-repeat"]["cost_source"] == "trace"
+    assert by_id["open-tender-repeat"]["conversation_id"]
+    assert len(by_id["open-tender-repeat"]["llm_calls"]) == 3
     assert by_id["open-price-61557"]["cost_rub"] == 0.25
     assert by_id["open-price-61557"]["cost_source"] == "telemetry"
+    assert by_id["open-price-61557"]["conversation_id"]
+    assert len(by_id["open-price-61557"]["llm_calls"]) == 1
     assert econ["avg_cost_per_case_rub"] == round(sum(c["cost_rub"] for c in report["cases"]) / 16, 4)
     assert (tmp_path / "eval_out.md").is_file()
 

@@ -145,6 +145,8 @@ class CostInfo:
     total_rub: float | None = None
     turns_rub: list[float] = field(default_factory=list)
     reason: str | None = None
+    llm_calls: list[dict] | None = None
+    trace_turns: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -170,6 +172,7 @@ class CaseResult:
     events_count: int = 0
     turns: list[dict] = field(default_factory=list)
     public_id: str | None = None
+    llm_calls: list[dict] | None = None
 
 
 def default_holdout_file() -> Path:
@@ -824,14 +827,20 @@ def validate_product_names(
         for msg in _agent_messages(events):
             if msg.get("purpose") == "greeting":
                 continue
-            text = _URL_RE.sub(" ", str(msg.get("text", "")))
-            if not oid_re.search(text):
+            raw_text = str(msg.get("text", ""))
+            source_urls = " ".join(str(s.get("url", "")) for s in msg.get("sources", []) if isinstance(s, dict))
+            # Match the same SKU identification rule as _offer_id_surfaced, including URLs in text or sources.
+            cites_in_raw = bool(oid_re.search(raw_text))
+            cites_in_sources = bool(oid_re.search(source_urls))
+            if not cites_in_raw and not (cites_in_sources and oid not in carded):
                 continue
+            text = _URL_RE.sub(" ", raw_text)
             foreign_found = False
-            for line in text.splitlines():
-                if not oid_re.search(line) or _names_product(line, variants):
+            for raw_line in raw_text.splitlines():
+                clean_line = _URL_RE.sub(" ", raw_line)
+                if (cites_in_raw and not oid_re.search(raw_line)) or _names_product(clean_line, variants):
                     continue
-                foreign = [w for w in _LATIN_WORD_RE.findall(line) if _norm_name(w) not in allowed_tokens]
+                foreign = [w for w in _LATIN_WORD_RE.findall(clean_line) if _norm_name(w) not in allowed_tokens]
                 if foreign:
                     foreign_found = True
                     errors.append(
@@ -1026,6 +1035,27 @@ def validate_case_expectations(
                 errors.append(f"Handoff reason {[h.get('reason') for h in handoffs]} not in {sorted(allowed_reasons)}")
             if assertions.get("expect_empty_handoff_products") and not any(h.get("products") == [] for h in handoffs):
                 errors.append("Expected handoff with empty products=[] on immediate operator request")
+            for exp_prod in assertions.get("expected_handoff_products", []):
+                exp_oid = str(exp_prod["offer_id"])
+                exp_kopecks = exp_prod.get("unit_price_kopecks")
+                exp_url = exp_prod.get("url")
+                matched_prod = any(
+                    str(p.get("offerId")) == exp_oid
+                    and (exp_kopecks is None or p.get("unitPriceKopecks") == exp_kopecks)
+                    and (exp_url is None or (p.get("source") or {}).get("url") == exp_url)
+                    for h in handoffs
+                    for p in h.get("products", [])
+                    if isinstance(p, dict)
+                )
+                if not matched_prod:
+                    errors.append(
+                        f"Expected handoff product offerId={exp_oid} "
+                        f"(price={exp_kopecks}, url={exp_url}) not found in handoff.products"
+                    )
+            for pattern in assertions.get("expected_handoff_question_patterns", []):
+                if not any(re.search(str(pattern), str(h.get("question", "")), re.IGNORECASE) for h in handoffs):
+                    questions = [h.get("question") for h in handoffs]
+                    errors.append(f"Expected handoff question matching {pattern!r}, got {questions}")
 
     if "expect_unique_open_handoff_count" in assertions:
         latest_status: dict[str, str] = {}
@@ -1366,11 +1396,92 @@ class ManagerCostClient:
         calls = self._recent_calls()
         return None if calls is None else {self._call_key(c) for c in calls}
 
+    @staticmethod
+    def _extract_trace_llm_calls(turns_payload: list[dict]) -> list[dict] | None:
+        """Extract normalized LLM call records (compatible with T19) from T05 trace turns."""
+        has_steps_field = any(isinstance(t.get("steps"), list) for t in turns_payload)
+        calls: list[dict] = []
+        for turn in turns_payload:
+            steps = turn.get("steps")
+            if not isinstance(steps, list):
+                continue
+            for st in steps:
+                if not isinstance(st, dict):
+                    continue
+                tool = str(st.get("tool") or "")
+                args = st.get("args") if isinstance(st.get("args"), dict) else {}
+                tokens_in = int(st.get("tokens_in") or 0)
+                tokens_out = int(st.get("tokens_out") or 0)
+                if not tool.startswith("llm:") and tokens_in == 0 and tokens_out == 0:
+                    continue
+                model = args.get("model") or st.get("model")
+                if not isinstance(model, str) or not model.strip():
+                    continue
+                calls.append(
+                    {
+                        "step": tool.removeprefix("llm:").strip() or "llm",
+                        "model": model.strip(),
+                        "tokens_in": tokens_in,
+                        "tokens_out": tokens_out,
+                        "cost_rub": float(st.get("cost_rub", 0.0)),
+                        "latency_ms": int(st.get("latency_ms", 0)),
+                    }
+                )
+        if has_steps_field:
+            return calls
+        if all(float(t.get("total_cost_rub", 0.0)) == 0.0 for t in turns_payload):
+            return []
+        return None
+
+    @staticmethod
+    def _extract_telemetry_llm_calls(own_calls: list[dict]) -> list[dict]:
+        """Extract normalized LLM call records (compatible with T19) from T05 telemetry calls."""
+        records: list[dict] = []
+        for call in reversed(own_calls):
+            model = call.get("model")
+            step = call.get("step")
+            if not isinstance(model, str) or not model.strip() or not isinstance(step, str) or not step.strip():
+                continue
+            tokens_in = call.get("tokens_in")
+            tokens_out = call.get("tokens_out")
+            if isinstance(tokens_in, bool) or not isinstance(tokens_in, int) or tokens_in < 0:
+                continue
+            if isinstance(tokens_out, bool) or not isinstance(tokens_out, int) or tokens_out < 0:
+                continue
+            rec: dict = {
+                "step": step.strip(),
+                "model": model.strip(),
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "cost_rub": float(call.get("cost_rub", 0.0)),
+            }
+            if call.get("latency_ms") is not None:
+                rec["latency_ms"] = int(call["latency_ms"])
+            records.append(rec)
+        return records
+
     def conversation_cost(self, conversation_id: str, baseline: set[tuple] | None) -> CostInfo:
         status, payload = self._get(f"/manager/conversations/{urllib.parse.quote(conversation_id)}/trace")
         if status == 200 and isinstance(payload, list):
-            turns = [float(t.get("total_cost_rub", 0.0)) for t in payload if isinstance(t, dict)]
-            return CostInfo("exact", "trace", round(sum(turns), 6), turns)
+            trace_turns = [t for t in payload if isinstance(t, dict)]
+            turns = [float(t.get("total_cost_rub", 0.0)) for t in trace_turns]
+            llm_calls = self._extract_trace_llm_calls(trace_turns)
+            if llm_calls is None:
+                # Minimal trace without steps (e.g. legacy mock): try matching telemetry calls for this session.
+                calls = self._recent_calls()
+                if calls is not None:
+                    own_raw = [c for c in calls if c.get("session_id") == conversation_id]
+                    extracted = self._extract_telemetry_llm_calls(own_raw)
+                    if extracted or not own_raw:
+                        llm_calls = extracted
+            return CostInfo(
+                "exact",
+                "trace",
+                round(sum(turns), 6),
+                turns,
+                llm_calls=llm_calls,
+                trace_turns=trace_turns,
+            )
         if status in (401, 403):
             return CostInfo("unavailable", reason=f"trace HTTP {status}: manager session rejected")
         calls = self._recent_calls()
@@ -1383,13 +1494,42 @@ class ManagerCostClient:
                 "unavailable",
                 reason=f"trace HTTP {status}; telemetry window ({len(calls)} calls) does not cover the case",
             )
-        own = [float(c.get("cost_rub", 0.0)) for c in calls if c.get("session_id") == conversation_id]
-        return CostInfo("exact", "telemetry", round(sum(own), 6), own)
+        own_raw = [c for c in calls if c.get("session_id") == conversation_id]
+        own = [float(c.get("cost_rub", 0.0)) for c in own_raw]
+        llm_calls = self._extract_telemetry_llm_calls(own_raw)
+        if own_raw and not llm_calls:
+            # Minimal mock calls without model/tokens: avoid claiming 0 LLM calls when cost > 0.
+            llm_calls = None
+        return CostInfo("exact", "telemetry", round(sum(own), 6), own, llm_calls=llm_calls)
 
 
 # ---------------------------------------------------------------------------
 # Case runner
 # ---------------------------------------------------------------------------
+
+
+def _has_confirmed_agent_resolution(history: list[dict], last_action_id: str | None = None) -> bool:
+    """True only when the conversation ended with a confirmed final outcome from the agent itself.
+
+    Clarification-only replies, notices/greetings, handoffs, action_failed, or manager replies are NOT
+    autonomous agent closures.
+    """
+    for ev in history:
+        data = ev.get("data", {})
+        dtype = data.get("type")
+        if dtype in {"handoff", "action_failed"}:
+            return False
+        if dtype == "message" and data.get("author") == "manager":
+            return False
+    target = [ev for ev in history if ev.get("actionId") == last_action_id] if last_action_id is not None else history
+    for ev in target:
+        data = ev.get("data", {})
+        dtype = data.get("type")
+        if dtype in {"quote", "document"}:
+            return True
+        if dtype == "message" and data.get("author") == "agent" and data.get("purpose") == "answer":
+            return True
+    return False
 
 
 def _drain_until_quiet(
@@ -1537,7 +1677,7 @@ def run_case(
                 turn_info["latency_ms"] = round(timeout * 1000.0, 2)
                 result.latency_ms.append(turn_info["latency_ms"])
                 break
-            if first_meaningful_ms is not None:
+            if first_meaningful_ms is not None and turn_info["close"] != "action_failed":
                 turn_info["latency_ms"] = round(first_meaningful_ms, 2)
                 turn_info["post_ack_latency_ms"] = round(post_ack_ms or 0.0, 2)
                 result.latency_ms.append(first_meaningful_ms)
@@ -1564,18 +1704,37 @@ def run_case(
         result.errors.extend(validate_contract_events(history, conv_id, schema_validator=validator))
 
         # T04 action_failed = the action was not processed. No scenario expects it, so it always fails the case
-        # (and therefore closed_by_agent), even when the remaining assertions happen to pass.
+        # (and excludes that turn from latency samples, even if action_failed arrived after a meaningful reply).
         turn_by_action = {aid: idx for idx, aid, _ in turn_actions if aid is not None}
+        failed_action_ids: set[str] = set()
         for ev in history:
             data = ev.get("data", {})
             if data.get("type") != "action_failed":
                 continue
+            aid_str = str(ev.get("actionId"))
+            failed_action_ids.add(aid_str)
             err = data.get("error") if isinstance(data.get("error"), dict) else {}
-            idx = turn_by_action.get(str(ev.get("actionId")))
+            idx = turn_by_action.get(aid_str)
             where = f"Turn {idx}" if idx is not None else f"actionId {ev.get('actionId')!r}"
             result.errors.append(
                 f"{where}: action_failed {err.get('code', '<no code>')}: {err.get('message', '<no message>')}"
             )
+
+        if failed_action_ids:
+            for t_info in result.turns:
+                if t_info.get("action_id") in failed_action_ids:
+                    t_info["close"] = "action_failed"
+                    t_info["latency_ms"] = None
+                    t_info.pop("post_ack_latency_ms", None)
+        result.latency_ms = [float(t["latency_ms"]) for t in result.turns if t.get("latency_ms") is not None]
+        result.first_meaningful_latency_ms = next(
+            (
+                float(t["latency_ms"])
+                for t in result.turns
+                if t.get("latency_ms") is not None and t.get("close") != "timeout"
+            ),
+            None,
+        )
 
         turn_action_ids: dict[int, str] = {}
         for turn_idx, action_id, assertions in turn_actions:
@@ -1595,19 +1754,25 @@ def run_case(
         result.events_count = len(history)
         result.agent_responses = [str(m.get("text", "")) for m in _agent_messages(history)]
         result.escalated = bool(_handoffs_from_events(history))
+        last_action_id = next((aid for _, aid, _ in reversed(turn_actions) if aid is not None), None)
+        agent_resolved = _has_confirmed_agent_resolution(history, last_action_id)
         if cost_client is not None:
             cost = cost_client.conversation_cost(conv_id, baseline)
             result.cost_status, result.cost_source, result.cost_reason = cost.status, cost.source, cost.reason
             result.cost_rub = cost.total_rub
-            for turn_info, turn_cost in zip(
-                result.turns, cost.turns_rub if cost.source == "trace" else [], strict=False
+            result.llm_calls = cost.llm_calls
+            for turn_info, trace_turn in zip(
+                result.turns, cost.trace_turns if cost.source == "trace" else [], strict=False
             ):
-                turn_info["trace_cost_rub"] = turn_cost
+                turn_info["trace_cost_rub"] = float(trace_turn.get("total_cost_rub", 0.0))
+                if isinstance(trace_turn.get("steps"), list):
+                    turn_info["steps"] = trace_turn["steps"]
     except Exception as exc:  # noqa: BLE001 - any stand/runner failure fails the case, never the suite
+        agent_resolved = False
         result.errors.append(f"Runner error: {exc}")
     result.passed = not result.errors
-    # Failed scenarios are never credited as closed by the agent.
-    result.closed_by_agent = result.passed and not result.escalated
+    # Closed by agent only on a confirmed final agent outcome (never on clarification, manager reply, or failure).
+    result.closed_by_agent = result.passed and not result.escalated and agent_resolved
     return result
 
 
@@ -1657,7 +1822,7 @@ def summarize_results(
     total = len(results)
     passed = sum(1 for r in results if r.passed)
     escalated = sum(1 for r in results if r.escalated)
-    closed_by_agent = sum(1 for r in results if r.passed and not r.escalated)
+    closed_by_agent = sum(1 for r in results if r.passed and r.closed_by_agent and not r.escalated)
     timed_out = sum(1 for r in results if r.timed_out)
 
     all_latencies = [ms for r in results for ms in r.latency_ms]
@@ -1727,16 +1892,18 @@ def summarize_results(
             {
                 "id": r.case_id,
                 "alias": r.public_id or r.case_id,
+                "conversation_id": r.conversation_id,
                 "suite": r.suite,
                 "category": r.category,
                 "passed": r.passed,
                 "escalated": r.escalated,
-                "closed_by_agent": r.passed and not r.escalated,
+                "closed_by_agent": bool(r.passed and r.closed_by_agent and not r.escalated),
                 "timed_out": r.timed_out,
                 "latency_ms": [round(x, 2) for x in r.latency_ms],
                 "cost_rub": r.cost_rub,
                 "cost_status": r.cost_status,
                 "cost_source": r.cost_source,
+                "llm_calls": r.llm_calls,
                 "turns": r.turns,
                 "events_count": r.events_count,
                 "errors": r.errors,
@@ -1750,11 +1917,17 @@ def summarize_results(
     return summary
 
 
-def format_markdown_report(summary: dict, *, mask_holdout_ids: bool = False) -> str:
+def format_markdown_report(
+    summary: dict,
+    *,
+    mask_holdout_ids: bool = False,
+    hide_holdout_details: bool = False,
+) -> str:
     """Render concise Markdown report including actual text of every failed response.
 
-    When ``mask_holdout_ids=True`` (used for console stdout), holdout rows display only their random
-    technical alias; the alias -> source ID mapping stays strictly inside the private holdout report.
+    When ``hide_holdout_details=True`` (used for console stdout), holdout runs print only aggregate
+    metrics (without per-case response texts); full holdout details and alias mappings stay in the
+    private report files inside the holdout directory.
     """
     lat = summary["latency_ms"]
     econ = summary["economics"]
@@ -1780,24 +1953,41 @@ def format_markdown_report(summary: dict, *, mask_holdout_ids: bool = False) -> 
         f"| Timed out | {summary.get('timed_out_cases', 0)} |",
         f"| Latency p50 / p95 (ms) | {lat['p50']} / {lat['p95']} (samples={lat['samples']}) |",
         f"| Avg cost / 500 cases per half-year proj (RUB) | {cost_line} |",
-        "",
-        "| Case ID | Status | Outcome | Latency (ms) | Cost (RUB) | Errors |",
-        "|---|---|---|---|---|---|",
     ]
+    if hide_holdout_details and summary.get("suite") == "holdout":
+        lines.extend(
+            [
+                "",
+                "_Holdout per-case details and failed responses are saved only in the private report._",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    lines.extend(
+        [
+            "",
+            "| Case ID | Status | Outcome | Latency (ms) | Cost (RUB) | Errors |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
     failed_items: list[tuple[str, dict]] = []
     for item in summary["cases"]:
-        display_id = (
-            str(item.get("alias") or "<holdout>")
-            if mask_holdout_ids and item.get("suite") == "holdout"
-            else str(item["id"])
-        )
+        is_holdout = item.get("suite") == "holdout"
+        display_id = str(item.get("alias") or "<holdout>") if mask_holdout_ids and is_holdout else str(item["id"])
         status_str = "PASS" if item["passed"] else "FAIL"
-        outcome = "escalated" if item["escalated"] else ("agent" if item["passed"] else "failed")
+        if item["escalated"]:
+            outcome = "escalated"
+        elif item["passed"] and item.get("closed_by_agent"):
+            outcome = "agent"
+        elif item["passed"]:
+            outcome = "unresolved"
+        else:
+            outcome = "failed"
         lat_str = ", ".join(str(x) for x in item["latency_ms"]) or "-"
         cost_str = str(item["cost_rub"]) if item.get("cost_status") == "exact" else "unavailable"
         err_str = "; ".join(item["errors"]) if item["errors"] else "-"
         lines.append(f"| {display_id} | {status_str} | {outcome} | {lat_str} | {cost_str} | {err_str} |")
-        if not item["passed"]:
+        if not item["passed"] and not (hide_holdout_details and is_holdout):
             failed_items.append((display_id, item))
 
     if failed_items:
@@ -2334,7 +2524,7 @@ def main(argv: list[str] | None = None) -> int:
         code: client.rejections.count(code) for code in sorted(set(client.rejections))
     }
     json_path, md_path = write_reports(summary, args.out if args.out is not None else _default_out(args.suite))
-    print(format_markdown_report(summary, mask_holdout_ids=True))
+    print(format_markdown_report(summary, mask_holdout_ids=True, hide_holdout_details=True))
     print(f"Reports written: {json_path}, {md_path}")
     return 0 if summary["failed_cases"] == 0 else 1
 
