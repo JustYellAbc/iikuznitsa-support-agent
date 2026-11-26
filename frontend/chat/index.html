@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f6f2">
+  <title>MDaemon Messaging Server · Softline Store</title>
+  <link rel="stylesheet" href="chat.css">
+  <script type="module" src="chat.js"></script>
+</head>
+<body>
+  <header class="storebar"><div class="frame">
+    <a class="brand" href="https://store.softline.ru/" aria-label="Магазин Softline">softline<span>store</span></a>
+    <nav aria-label="Магазин"><a href="https://store.softline.ru/catalog/">Каталог</a><a href="https://store.softline.ru/delivery_info/">Оплата и доставка</a></nav>
+  </div></header>
+  <main class="frame">
+    <nav class="crumbs" aria-label="Путь к товару"><a href="https://store.softline.ru/catalog/">Каталог</a><span>/</span> Почтовые серверы</nav>
+    <article class="product">
+      <div class="cover" aria-hidden="true"><div class="envelope"></div><b>MDaemon</b><span>Messaging Server</span></div>
+      <div class="description"><h1>MDaemon<br>Messaging Server</h1><p class="subtitle">Корпоративный почтовый сервер для Windows</p>
+        <dl><div><dt>Вариант лицензии</dt><dd>Новая покупка</dd></div><div><dt>Количество пользователей</dt><dd>До 20</dd></div><div><dt>Обновления</dt><dd>12 месяцев</dd></div></dl>
+        <a href="https://store.softline.ru/alt-n-technologies-ltd/-19576/">Карточка в каталоге Softline ↗</a>
+      </div>
+    </article>
+  </main>
+  <button class="launcher" id="launch" aria-controls="chat" aria-expanded="false"><span aria-hidden="true">◌</span> Чат с поддержкой</button>
+  <section id="chat" aria-labelledby="chat-title" hidden>
+    <header class="chatbar"><div><span class="wordmark">softline</span><h2 id="chat-title">Поддержка магазина</h2></div>
+      <button id="close" class="icon" aria-label="Свернуть чат">−</button></header>
+    <div class="scroller" id="scroller">
+      <div id="welcome"><h3>Чем помочь?</h3><p>Спросите о лицензии, цене или условиях покупки.</p></div>
+      <div id="log" role="log" aria-label="История диалога" aria-live="polite" aria-relevant="additions"></div>
+    </div>
+    <footer>
+      <div class="actions"><button id="operator" type="button">Позвать оператора</button></div>
+      <label id="target-label" hidden>Обращение <select id="target"></select></label>
+      <form id="compose"><textarea id="message" rows="2" maxlength="8000" aria-label="Ваше сообщение" placeholder="Ваше сообщение"></textarea><button id="send" class="icon" aria-label="Отправить сообщение">↑</button></form>
+      <div id="feedback" role="status"></div><button id="retry" hidden>Повторить</button>
+    </footer>
+  </section>
+</body></html>
