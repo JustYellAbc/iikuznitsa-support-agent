@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(data/private/**)",
+      "Edit(data/private/**)",
+      "Write(data/private/**)",
+      "Grep(data/private/**)",
+      "Glob(data/private/**)"
+    ]
+  }
+}

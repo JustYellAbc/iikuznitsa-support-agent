@@ -5,12 +5,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import tempfile
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+
+from eval.pii import scrub_pii
 
 LINE_RE = re.compile(r"^#(\d+)\s+\[([^\]]+)\]\s+\[([^\]]*)\]\s*(.*)$")
 MASK_TOKEN_RE = re.compile(r"\[(?:email|номер|отправил файл|тел)\]", re.IGNORECASE)
@@ -25,8 +29,57 @@ WHITESPACE_RE = re.compile(r"\s+")
 DEFAULT_ARCHIVE = Path("data/raw/чаты поддержки.zip")
 DEFAULT_PRIVATE_DIR = Path("data/private")
 DEFAULT_SUMMARY_OUT = Path("eval/split_summary.json")
-DEFAULT_PINNED_IDS = (100646, 100625, 103038)
+DEFAULT_SEED = 20261126
+# Pinned into open_dev:
+# - T02/T03 explicit references (#100646, #100625, #103038)
+# - Paraphrased examples & typos from docs/data_audit.md
+# - Repeat "Эшелон" inquiries in part 2 (part 3 is also pinned)
+DEFAULT_PINNED_IDS = (
+    100646,
+    100625,
+    103038,
+    102976,
+    103016,
+    102790,
+    101490,
+    102802,
+    102937,
+    101766,
+    102972,
+    102847,
+    102888,
+    102635,
+    102549,
+    103012,
+    101730,
+    101796,
+    101860,
+    101838,
+    101976,
+    102151,
+)
 DEFAULT_PINNED_FILES = ("buy_part_3_masked.txt",)
+
+
+def default_holdout_dir() -> Path:
+    """Return external holdout directory outside the repository tree."""
+    env_dir = os.environ.get("EVAL_HOLDOUT_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser()
+    return Path(tempfile.gettempdir()) / "iikuznitsa-eval-private"
+
+
+def resolve_seed(cli_seed: int | None) -> tuple[int, str]:
+    """Resolve split seed from CLI, EVAL_SPLIT_SEED env var, or fallback default."""
+    if cli_seed is not None:
+        return cli_seed, "cli"
+    env_seed = os.environ.get("EVAL_SPLIT_SEED")
+    if env_seed is not None and env_seed.strip():
+        try:
+            return int(env_seed.strip()), "env:EVAL_SPLIT_SEED"
+        except ValueError as exc:
+            raise ValueError(f"EVAL_SPLIT_SEED must be an integer, got {env_seed!r}") from exc
+    return DEFAULT_SEED, "default"
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,7 +222,7 @@ def cluster_records(
 
 
 def _build_holdout_case(record: ChatRecord, cluster_id: str) -> dict:
-    """Convert a holdout chat record into an evaluation case for run_eval.py."""
+    """Convert a holdout chat record into a PII-scrubbed evaluation case for run_eval.py."""
     case_assertions: dict[str, object] = {
         "forbid_zero_price": True,
         "require_sources_on_answer": True,
@@ -182,6 +235,7 @@ def _build_holdout_case(record: ChatRecord, cluster_id: str) -> dict:
         "id": f"holdout-{record.chat_id}",
         "chat_id": record.chat_id,
         "suite": "holdout",
+        "sanitize_pii": True,
         "modes": ["mvp", "full"],
         "category": record.category,
         "source_file": record.source_file,
@@ -189,7 +243,7 @@ def _build_holdout_case(record: ChatRecord, cluster_id: str) -> dict:
         "cluster_id": cluster_id,
         "turns": [
             {
-                "action": {"type": "message", "text": record.text},
+                "action": {"type": "message", "text": scrub_pii(record.text)},
                 "assertions": {
                     "forbid_zero_price": True,
                     "require_sources_on_answer": True,
@@ -208,7 +262,8 @@ def split_records(
     archive_filename: str,
     archive_sha256: str,
     holdout_ratio: float = 0.20,
-    seed: int = 20261126,
+    seed: int = DEFAULT_SEED,
+    seed_source: str = "default",
     pinned_ids: tuple[int, ...] = DEFAULT_PINNED_IDS,
     pinned_files: tuple[str, ...] = DEFAULT_PINNED_FILES,
 ) -> tuple[dict, dict, dict]:
@@ -329,11 +384,13 @@ def split_records(
     }
 
     total = len(records)
+    seed_sha256_prefix = hashlib.sha256(str(seed).encode()).hexdigest()[:12]
     summary_payload = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "archive_filename": archive_filename,
         "archive_sha256": archive_sha256,
-        "seed": seed,
+        "seed_source": seed_source,
+        "seed_sha256_prefix": seed_sha256_prefix,
         "holdout_ratio_target": holdout_ratio,
         "similarity_rules": {
             "shingle_k": 4,
@@ -350,6 +407,7 @@ def split_records(
         "private_holdout_ratio": round(len(holdout_ids) / total, 4) if total else 0.0,
         "overlap_count": len(overlap_ids),
         "cluster_overlap_count": len(overlap_clusters),
+        "pinned_ids_count": len(pinned_id_set & {r.chat_id for r in records}),
         "pinned_files_applied": sorted(pinned_file_set) if use_file_pin else [],
         "anchor_100646_in_open_dev": (100646 in dev_ids) if any(r.chat_id == 100646 for r in records) else None,
         "anchor_100646_cluster_in_open_dev": (
@@ -373,10 +431,13 @@ def run_split(
     private_dir: Path,
     summary_out: Path,
     *,
+    holdout_dir: Path | None = None,
     holdout_ratio: float = 0.20,
-    seed: int = 20261126,
+    seed: int | None = None,
 ) -> tuple[dict, dict, dict]:
-    """Execute the full split pipeline and write private and public outputs."""
+    """Execute the full split pipeline and write private, holdout, and public outputs."""
+    resolved_seed, seed_source = resolve_seed(seed)
+    target_holdout_dir = holdout_dir if holdout_dir is not None else private_dir
     archive_sha256, records = parse_archive(archive_path)
     clusters = cluster_records(records)
     dev_payload, holdout_payload, summary_payload = split_records(
@@ -385,16 +446,18 @@ def run_split(
         archive_filename=archive_path.name,
         archive_sha256=archive_sha256,
         holdout_ratio=holdout_ratio,
-        seed=seed,
+        seed=resolved_seed,
+        seed_source=seed_source,
     )
 
     private_dir.mkdir(parents=True, exist_ok=True)
+    target_holdout_dir.mkdir(parents=True, exist_ok=True)
     summary_out.parent.mkdir(parents=True, exist_ok=True)
 
     (private_dir / "dev_ids.json").write_text(
         json.dumps(dev_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    (private_dir / "holdout_eval.json").write_text(
+    (target_holdout_dir / "holdout_eval.json").write_text(
         json.dumps(holdout_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     summary_out.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -405,18 +468,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
     parser.add_argument("--private-dir", type=Path, default=DEFAULT_PRIVATE_DIR)
+    parser.add_argument(
+        "--holdout-dir",
+        type=Path,
+        default=None,
+        help="External directory outside the repo for holdout_eval.json (env: EVAL_HOLDOUT_DIR)",
+    )
     parser.add_argument("--summary-out", type=Path, default=DEFAULT_SUMMARY_OUT)
     parser.add_argument("--holdout-ratio", type=float, default=0.20)
-    parser.add_argument("--seed", type=int, default=20261126)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Deterministic split seed (defaults to EVAL_SPLIT_SEED env var, then fallback default)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    holdout_dir = args.holdout_dir if args.holdout_dir is not None else default_holdout_dir()
     _, _, summary = run_split(
         args.archive,
         args.private_dir,
         args.summary_out,
+        holdout_dir=holdout_dir,
         holdout_ratio=args.holdout_ratio,
         seed=args.seed,
     )
@@ -425,7 +501,9 @@ def main(argv: list[str] | None = None) -> int:
         f"open_dev={summary['open_dev_count']} ({summary['open_dev_ratio']:.1%}), "
         f"private_holdout={summary['private_holdout_count']} ({summary['private_holdout_ratio']:.1%}), "
         f"clusters={summary['duplicate_clusters']['total_clusters']}, "
-        f"overlap_count={summary['overlap_count']}"
+        f"overlap_count={summary['overlap_count']}, "
+        f"seed_source={summary['seed_source']}, "
+        f"holdout_path={holdout_dir / 'holdout_eval.json'}"
     )
     return 0
 

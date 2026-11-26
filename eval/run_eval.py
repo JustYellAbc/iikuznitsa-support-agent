@@ -6,6 +6,7 @@ import argparse
 import http.cookiejar
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -19,14 +20,39 @@ from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from eval.pii import scrub_pii
+from eval.split_chats import default_holdout_dir
+
+try:
+    import yaml
+    from jsonschema import Draft202012Validator, FormatChecker
+except ImportError:  # pragma: no cover - optional stdlib-only fallback
+    yaml = None
+    Draft202012Validator = None
+    FormatChecker = None
+
 DEFAULT_GOLDEN_OPEN = Path("eval/golden_open.json")
-DEFAULT_HOLDOUT_FILE = Path("data/private/holdout_eval.json")
+DEFAULT_SPLIT_SUMMARY = Path("eval/split_summary.json")
 DEFAULT_CATALOG = Path("data/raw/Mindbox.yml.gz.xml")
 DEFAULT_OUT = Path("data/private/eval_report")
+T04_OPENAPI_CANDIDATES = (
+    Path("contracts/t04/openapi.yaml"),
+    Path("eval/t04_openapi.yaml"),
+    Path(__file__).resolve().parent / "t04_openapi.yaml",
+)
 
 PRICE_IN_TEXT_RE = re.compile(
-    r"(?<!\d)(\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
-    r"\s*(?:₽|руб(?:л(?:я|ей))?\.?|RUR|RUB)(?!\w)",
+    r"(?<!\d)"
+    r"(?P<num>\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d{1,2})?"
+    r"|\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?"
+    r"|\d+(?:[.,]\d{1,2})?)"
+    r"(?:\s*(?P<mult>тыс\.?))?"
+    r"\s*(?:₽|руб(?:л(?:я|ей))?\.?|р\.|RUR|RUB)(?!\w)",
+    re.IGNORECASE,
+)
+LEGAL_ENTITY_CAVEAT_RE = re.compile(
+    r"(?:юр\s*лиц|юридическ\w*\s+лиц|только\s+для\s+(?:организац|компан|юр)|"
+    r"для\s+физ\w*\s+не\s+подход|ограничен\w*|оператор|менеджер|специалист)",
     re.IGNORECASE,
 )
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -88,16 +114,34 @@ class CaseResult:
     passed: bool
     escalated: bool
     closed_by_agent: bool
+    timed_out: bool = False
     latency_ms: list[float] = field(default_factory=list)
     first_meaningful_latency_ms: float | None = None
     cost_rub: float | None = None
     errors: list[str] = field(default_factory=list)
+    agent_responses: list[str] = field(default_factory=list)
     conversation_id: str | None = None
     events_count: int = 0
 
 
+def default_holdout_file() -> Path:
+    """Resolve holdout_eval.json path from env or external holdout directory."""
+    env_file = os.environ.get("EVAL_HOLDOUT_FILE")
+    if env_file:
+        return Path(env_file).expanduser()
+    external = default_holdout_dir() / "holdout_eval.json"
+    if external.is_file():
+        return external
+    legacy = Path("data/private/holdout_eval.json")
+    return legacy if legacy.is_file() else external
+
+
 def _normalize_decimal(value: str | int | float | Decimal) -> Decimal:
-    text = str(value).replace("\u00a0", "").replace("\u202f", "").replace(" ", "").replace(",", ".").strip()
+    text = str(value).replace("\u00a0", "").replace("\u202f", "").replace(" ", "").strip()
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?", text):
+        text = text.replace(".", "").replace(",", ".")
+    else:
+        text = text.replace(",", ".")
     try:
         dec = Decimal(text)
     except InvalidOperation as exc:
@@ -106,11 +150,62 @@ def _normalize_decimal(value: str | int | float | Decimal) -> Decimal:
 
 
 def extract_prices_rub(text: str) -> list[Decimal]:
-    """Extract currency-tagged ruble amounts from free-form Russian text."""
+    """Extract currency-tagged ruble amounts (including 'тыс.', 'р.', '0,00', dot thousands)."""
     prices: list[Decimal] = []
     for match in PRICE_IN_TEXT_RE.finditer(text):
-        prices.append(_normalize_decimal(match.group(1)))
+        amount = _normalize_decimal(match.group("num"))
+        if match.group("mult"):
+            amount = (amount * Decimal(1000)).normalize()
+        prices.append(amount)
     return prices
+
+
+class T04SchemaValidator:
+    """JSON Schema validator backed by T04 0.2.0 OpenAPI components (same engine as contracts/t04/verify.py)."""
+
+    def __init__(self, spec_path: Path | None = None) -> None:
+        self._components: dict | None = None
+        self._validators: dict[str, object] = {}
+        self.spec_path: Path | None = None
+        if yaml is None or Draft202012Validator is None or FormatChecker is None:
+            return
+        candidates = [spec_path] if spec_path is not None else list(T04_OPENAPI_CANDIDATES)
+        for cand in candidates:
+            if cand is not None and cand.is_file():
+                spec = yaml.safe_load(cand.read_text(encoding="utf-8"))
+                self._components = spec.get("components")
+                self.spec_path = cand
+                break
+
+    @property
+    def active(self) -> bool:
+        return self._components is not None
+
+    def validate(self, schema_name: str, payload: object) -> list[str]:
+        if not self.active or self._components is None:
+            return []
+        validator = self._validators.get(schema_name)
+        if validator is None:
+            schema = self._components["schemas"][schema_name]
+            root = {"components": self._components, **schema}
+            validator = Draft202012Validator(root, format_checker=FormatChecker())
+            self._validators[schema_name] = validator
+        errors: list[str] = []
+        for err in validator.iter_errors(payload):  # type: ignore[attr-defined]
+            loc = ".".join(str(part) for part in err.path) or "<root>"
+            errors.append(f"OpenAPI {schema_name} schema violation at {loc}: {err.message}")
+        return errors
+
+
+_DEFAULT_SCHEMA_VALIDATOR: T04SchemaValidator | None = None
+
+
+def get_schema_validator() -> T04SchemaValidator:
+    """Return cached T04 0.2.0 OpenAPI schema validator."""
+    global _DEFAULT_SCHEMA_VALIDATOR
+    if _DEFAULT_SCHEMA_VALIDATOR is None:
+        _DEFAULT_SCHEMA_VALIDATOR = T04SchemaValidator()
+    return _DEFAULT_SCHEMA_VALIDATOR
 
 
 def load_catalog_index(
@@ -202,11 +297,18 @@ def _documents_from_events(events: list[dict]) -> list[dict]:
     return items
 
 
-def validate_contract_events(events: list[dict], conversation_id: str) -> list[str]:
-    """Validate basic T04 0.2.0 event invariants on a collected journal."""
+def validate_contract_events(
+    events: list[dict],
+    conversation_id: str,
+    schema_validator: T04SchemaValidator | None = None,
+) -> list[str]:
+    """Validate T04 0.2.0 OpenAPI schema and cross-event invariants on a collected journal."""
     errors: list[str] = []
+    validator = schema_validator if schema_validator is not None else get_schema_validator()
     valid_types = {"message", "products", "handoff", "quote", "document", "action_failed"}
     for idx, event in enumerate(events, start=1):
+        if validator.active:
+            errors.extend(f"seq={event.get('seq')}: {msg}" for msg in validator.validate("Event", event))
         if event.get("seq") != idx:
             errors.append(f"Non-contiguous seq: expected {idx}, got {event.get('seq')!r}")
         if not event.get("at") or not event.get("actionId"):
@@ -483,13 +585,20 @@ def validate_case_expectations(
     for quote in _quotes_from_events(events):
         observed_offer_ids.update(str(line.get("offerId")) for line in quote.get("lines", []))
     for exp_oid in assertions.get("expected_offer_ids", []):
-        if str(exp_oid) not in observed_offer_ids and str(exp_oid) not in agent_text:
-            errors.append(f"Expected offerId {exp_oid} not surfaced in products, quotes, or text")
+        oid_str = str(exp_oid)
+        in_structured = oid_str in observed_offer_ids
+        in_text_boundary = bool(re.search(rf"(?<!\d){re.escape(oid_str)}(?!\d)", agent_text))
+        if not in_structured and not in_text_boundary:
+            errors.append(f"Expected offerId {oid_str} not surfaced in products, quotes, or text")
 
     if assertions.get("expect_clarification"):
-        has_clarif = any(m.get("purpose") == "clarification" or "?" in m.get("text", "") for m in agent_msgs)
+        has_clarif = any(m.get("purpose") == "clarification" for m in agent_msgs)
         if not has_clarif:
-            errors.append("Expected clarifying question from agent")
+            errors.append("Expected clarifying question with purpose='clarification' from agent")
+
+    if assertions.get("expect_legal_entity_caveat"):
+        if not LEGAL_ENTITY_CAVEAT_RE.search(agent_text) and not _handoffs_from_events(events):
+            errors.append("Expected legal-entity restriction caveat or operator handoff for individual buyer")
 
     if assertions.get("forbid_standard_sku_claim") and FAKE_STANDARD_CLAIM_RE.search(agent_text):
         errors.append("Agent falsely claimed a literal 'MDaemon Standard' SKU exists")
@@ -513,6 +622,17 @@ def validate_case_expectations(
                 errors.append(f"Handoff reason {[h.get('reason') for h in handoffs]} not in {sorted(allowed_reasons)}")
             if assertions.get("expect_empty_handoff_products") and not any(h.get("products") == [] for h in handoffs):
                 errors.append("Expected handoff with empty products=[] on immediate operator request")
+
+    if "expect_unique_open_handoff_count" in assertions:
+        latest_status: dict[str, str] = {}
+        for h in handoffs:
+            hid = str(h.get("handoffId", ""))
+            if hid:
+                latest_status[hid] = str(h.get("status", ""))
+        open_ids = [hid for hid, st in latest_status.items() if st == "open"]
+        expected_cnt = int(assertions["expect_unique_open_handoff_count"])
+        if len(open_ids) != expected_cnt:
+            errors.append(f"Expected {expected_cnt} unique open handoff(s), got {len(open_ids)} ({open_ids})")
 
     expected_totals = assertions.get("expected_quote_totals_kopecks", [])
     if expected_totals:
@@ -601,11 +721,21 @@ class T04HttpClient:
             raise RuntimeError(f"readEvents failed: HTTP {status} {payload}")
         return payload
 
-    def read_all_from(self, conversation_id: str, after: int = 0) -> tuple[list[dict], int]:
+    def read_all_from(
+        self,
+        conversation_id: str,
+        after: int = 0,
+        schema_validator: T04SchemaValidator | None = None,
+    ) -> tuple[list[dict], int]:
+        validator = schema_validator if schema_validator is not None else get_schema_validator()
         cursor = after
         collected: list[dict] = []
         while True:
             page = self.read_events(conversation_id, after=cursor)
+            if validator.active:
+                schema_errs = validator.validate("EventPage", page)
+                if schema_errs:
+                    raise RuntimeError("; ".join(schema_errs[:3]))
             page_events = page.get("events", [])
             next_after = int(page.get("nextAfter", cursor))
             expected_next = cursor + len(page_events)
@@ -663,9 +793,13 @@ def run_case(
     *,
     timeout: float = 30.0,
     poll_interval: float = 0.25,
+    settle_seconds: float = 0.4,
+    schema_validator: T04SchemaValidator | None = None,
 ) -> CaseResult:
     """Execute one evaluation scenario against a T04 HTTP endpoint."""
+    validator = schema_validator if schema_validator is not None else get_schema_validator()
     case_id = str(case["id"])
+    sanitize_outgoing = bool(case.get("sanitize_pii")) or case.get("suite") == "holdout"
     result = CaseResult(
         case_id=case_id,
         suite=str(case.get("suite", "open")),
@@ -682,38 +816,74 @@ def run_case(
         turn_costs: list[float] = []
 
         for turn_idx, turn in enumerate(case.get("turns", []), start=1):
-            action = turn["action"]
+            action = dict(turn["action"])
+            if sanitize_outgoing and action.get("type") == "message" and "text" in action:
+                action["text"] = scrub_pii(str(action["text"]))
             action_key = f"eval-act-{case_id}-t{turn_idx}-{uuid.uuid4().hex[:8]}"
             t_start = time.perf_counter()
             status, payload, headers = client.submit_action(conv_id, action, key=action_key)
+            if validator.active:
+                expected_schema = "Document" if status == 200 else "Receipt"
+                result.errors.extend(validator.validate(expected_schema, payload))
+
+            header_cost: float | None = None
             if "x-llm-cost-rub" in headers:
                 try:
-                    turn_costs.append(float(headers["x-llm-cost-rub"]))
+                    header_cost = float(headers["x-llm-cost-rub"])
                 except ValueError:
-                    pass
+                    header_cost = None
+
             if status == 200:
                 result.latency_ms.append((time.perf_counter() - t_start) * 1000.0)
+                if header_cost is not None:
+                    turn_costs.append(header_cost)
                 continue
 
             action_id = str(payload["actionId"])
+            action_type = str(action.get("type", ""))
             action_events: list[dict] = []
             first_meaningful_ms: float | None = None
+            turn_ready = False
+            last_event_at: float | None = None
             deadline = t_start + timeout
 
-            while time.perf_counter() < deadline:
-                batch, cursor = client.read_all_from(conv_id, after=cursor)
+            while True:
+                batch, cursor = client.read_all_from(conv_id, after=cursor, schema_validator=validator)
+                now = time.perf_counter()
                 if batch:
                     full_history.extend(batch)
+                    last_event_at = now
                     for ev in batch:
                         if ev.get("actionId") == action_id:
                             action_events.append(ev)
                             if first_meaningful_ms is None and _is_meaningful_event(ev):
-                                first_meaningful_ms = (time.perf_counter() - t_start) * 1000.0
-                    if _is_turn_done(action_events, str(action.get("type", ""))):
-                        break
-                time.sleep(poll_interval)
-            else:
-                result.errors.append(f"Turn {turn_idx} timed out after {timeout}s waiting for action {action_id}")
+                                first_meaningful_ms = (now - t_start) * 1000.0
+                    if _is_turn_done(action_events, action_type):
+                        turn_ready = True
+
+                if any(e.get("data", {}).get("type") == "action_failed" for e in action_events):
+                    break
+                if turn_ready and last_event_at is not None and (now - last_event_at) >= settle_seconds:
+                    break
+                if now >= deadline:
+                    if not turn_ready:
+                        result.timed_out = True
+                        result.latency_ms.append((now - t_start) * 1000.0)
+                        result.errors.append(
+                            f"Turn {turn_idx} timed out after {timeout}s waiting for action {action_id}"
+                        )
+                    break
+
+                remaining = max(0.0, deadline - now)
+                if turn_ready and last_event_at is not None:
+                    settle_left = max(0.0, settle_seconds - (now - last_event_at))
+                    sleep_s = min(poll_interval, max(0.005, settle_left), remaining)
+                else:
+                    sleep_s = min(poll_interval, remaining)
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+
+            if result.timed_out:
                 break
 
             if first_meaningful_ms is None:
@@ -722,29 +892,38 @@ def run_case(
             if result.first_meaningful_latency_ms is None:
                 result.first_meaningful_latency_ms = first_meaningful_ms
 
-            for ev in action_events:
-                ev_cost = ev.get("data", {}).get("cost_rub")
-                if isinstance(ev_cost, (int, float)):
-                    turn_costs.append(float(ev_cost))
+            # Deduplicate per-turn cost: prefer structured event cost_rub, else header X-LLM-Cost-Rub.
+            event_costs = [
+                float(ev["data"]["cost_rub"])
+                for ev in action_events
+                if isinstance(ev.get("data", {}).get("cost_rub"), (int, float))
+            ]
+            if event_costs:
+                turn_costs.append(sum(event_costs))
+            elif header_cost is not None:
+                turn_costs.append(header_cost)
 
             turn_errors = validate_case_expectations(action_events, turn.get("assertions", {}), catalog_index)
             result.errors.extend(f"Turn {turn_idx}: {err}" for err in turn_errors)
 
-        replay_events, replay_next_after = client.read_all_from(conv_id, after=0)
+        replay_events, replay_next_after = client.read_all_from(conv_id, after=0, schema_validator=validator)
         result.errors.extend(validate_independent_cursors(full_history, replay_events, replay_next_after))
-        result.errors.extend(validate_contract_events(full_history, conv_id))
+        result.errors.extend(validate_contract_events(full_history, conv_id, schema_validator=validator))
         result.errors.extend(validate_case_expectations(full_history, case.get("assertions", {}), catalog_index))
 
         result.events_count = len(full_history)
+        result.agent_responses = [str(m.get("text", "")) for m in _agent_messages(full_history)]
         handoffs = _handoffs_from_events(full_history)
         result.escalated = bool(handoffs)
-        result.closed_by_agent = not result.escalated
+        result.passed = len(result.errors) == 0
+        # Failed scenarios are never credited as closed by the agent.
+        result.closed_by_agent = result.passed and not result.escalated
         if turn_costs:
             result.cost_rub = round(sum(turn_costs), 6)
-        result.passed = len(result.errors) == 0
     except Exception as exc:
         result.errors.append(f"Runner error: {exc}")
         result.passed = False
+        result.closed_by_agent = False
     return result
 
 
@@ -763,19 +942,36 @@ def percentile(values: list[float], pct: float) -> float | None:
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (rank - lo)
 
 
+def load_category_weights(split_summary_path: Path = DEFAULT_SPLIT_SUMMARY) -> dict[str, float]:
+    """Load real-world category weights from eval/split_summary.json."""
+    if not split_summary_path.is_file():
+        return {}
+    data = json.loads(split_summary_path.read_text(encoding="utf-8"))
+    total = int(data.get("total_records", 0))
+    if total <= 0:
+        return {}
+    return {
+        cat: int(info["total"]) / total
+        for cat, info in data.get("categories", {}).items()
+        if int(info.get("total", 0)) > 0
+    }
+
+
 def summarize_results(
     results: list[CaseResult],
     *,
     suite: str,
     mode: str,
     suite_spend_delta_rub: float | None = None,
+    category_weights: dict[str, float] | None = None,
 ) -> dict:
-    """Aggregate pass/fail, escalation, latency p50/p95, and cost metrics."""
+    """Aggregate pass/fail, escalation, latency p50/p95, and category-weighted cost metrics."""
     total = len(results)
     passed = sum(1 for r in results if r.passed)
     failed = total - passed
     escalated = sum(1 for r in results if r.escalated)
-    closed_by_agent = sum(1 for r in results if r.closed_by_agent)
+    closed_by_agent = sum(1 for r in results if r.passed and not r.escalated)
+    timed_out = sum(1 for r in results if r.timed_out)
 
     all_latencies = [ms for r in results for ms in r.latency_ms]
     p50 = percentile(all_latencies, 50.0)
@@ -785,20 +981,36 @@ def summarize_results(
     explicit_costs = [r.cost_rub for r in results if r.cost_rub is not None]
     avg_cost_rub: float | None = None
     projected_500_rub: float | None = None
+    weighted_avg_cost_rub: float | None = None
+    weighted_projected_500_rub: float | None = None
+
     if explicit_costs and len(explicit_costs) == total:
         avg_cost_rub = round(sum(explicit_costs) / total, 4)
         projected_500_rub = round(avg_cost_rub * 500.0, 2)
+        if category_weights:
+            by_cat: dict[str, list[float]] = {}
+            for r in results:
+                if r.cost_rub is not None and r.category in category_weights:
+                    by_cat.setdefault(r.category, []).append(r.cost_rub)
+            weight_sum = sum(category_weights[cat] for cat in by_cat)
+            if weight_sum > 0:
+                weighted_mean = (
+                    sum((sum(vals) / len(vals)) * category_weights[cat] for cat, vals in by_cat.items()) / weight_sum
+                )
+                weighted_avg_cost_rub = round(weighted_mean, 4)
+                weighted_projected_500_rub = round(weighted_mean * 500.0, 2)
     elif suite_spend_delta_rub is not None and total > 0:
         avg_cost_rub = round(max(0.0, suite_spend_delta_rub) / total, 4)
         projected_500_rub = round(avg_cost_rub * 500.0, 2)
 
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "suite": suite,
         "mode": mode,
         "total_cases": total,
         "passed_cases": passed,
         "failed_cases": failed,
+        "timed_out_cases": timed_out,
         "pass_rate": round(passed / total, 4) if total else 0.0,
         "closed_by_agent_count": closed_by_agent,
         "closed_by_agent_rate": round(closed_by_agent / total, 4) if total else 0.0,
@@ -813,6 +1025,8 @@ def summarize_results(
         "economics": {
             "avg_cost_per_case_rub": avg_cost_rub,
             "projected_500_cases_per_day_rub": projected_500_rub,
+            "weighted_avg_cost_per_case_rub": weighted_avg_cost_rub,
+            "weighted_projected_500_cases_per_day_rub": weighted_projected_500_rub,
         },
         "cases": [
             {
@@ -821,11 +1035,13 @@ def summarize_results(
                 "category": r.category,
                 "passed": r.passed,
                 "escalated": r.escalated,
-                "closed_by_agent": r.closed_by_agent,
+                "closed_by_agent": r.passed and not r.escalated,
+                "timed_out": r.timed_out,
                 "latency_ms": [round(x, 2) for x in r.latency_ms],
                 "cost_rub": r.cost_rub,
                 "events_count": r.events_count,
                 "errors": r.errors,
+                "agent_responses": r.agent_responses,
             }
             for r in results
         ],
@@ -833,11 +1049,12 @@ def summarize_results(
 
 
 def format_markdown_report(summary: dict) -> str:
-    """Render concise Markdown report for terminal/file consumption."""
+    """Render concise Markdown report including actual text of every failed response."""
     lat = summary["latency_ms"]
     econ = summary["economics"]
     avg_cost = econ["avg_cost_per_case_rub"]
     proj_500 = econ["projected_500_cases_per_day_rub"]
+    w_proj = econ.get("weighted_projected_500_cases_per_day_rub")
     lines = [
         f"# Eval Report ({summary['suite']} / {summary['mode']})",
         "",
@@ -847,18 +1064,40 @@ def format_markdown_report(summary: dict) -> str:
         f"| Passed / Failed | {summary['passed_cases']} / {summary['failed_cases']} ({summary['pass_rate']:.1%}) |",
         f"| Closed by agent | {summary['closed_by_agent_count']} ({summary['closed_by_agent_rate']:.1%}) |",
         f"| Escalated | {summary['escalated_count']} ({summary['escalated_rate']:.1%}) |",
+        f"| Timed out | {summary.get('timed_out_cases', 0)} |",
         f"| Latency p50 / p95 (ms) | {lat['p50']} / {lat['p95']} (samples={lat['samples']}) |",
-        f"| Avg cost / 500-day proj (RUB) | {avg_cost} / {proj_500} |",
+        f"| Avg cost / 500-day proj (RUB) | {avg_cost} / {proj_500} (weighted 500-day: {w_proj}) |",
         "",
         "| Case ID | Status | Outcome | Latency (ms) | Errors |",
         "|---|---|---|---|---|",
     ]
+    failed_items: list[dict] = []
     for item in summary["cases"]:
         status_str = "PASS" if item["passed"] else "FAIL"
-        outcome = "escalated" if item["escalated"] else "agent"
+        if item["escalated"]:
+            outcome = "escalated"
+        elif item["passed"]:
+            outcome = "agent"
+        else:
+            outcome = "failed"
         lat_str = ", ".join(str(x) for x in item["latency_ms"]) or "-"
         err_str = "; ".join(item["errors"]) if item["errors"] else "-"
         lines.append(f"| {item['id']} | {status_str} | {outcome} | {lat_str} | {err_str} |")
+        if not item["passed"]:
+            failed_items.append(item)
+
+    if failed_items:
+        lines.extend(["", "## Failed Case Responses", ""])
+        for item in failed_items:
+            lines.append(f"### {item['id']}")
+            lines.append(f"- **Errors:** {'; '.join(item['errors'])}")
+            responses = item.get("agent_responses") or []
+            if responses:
+                for idx, resp_text in enumerate(responses, start=1):
+                    lines.append(f"- **Agent response {idx}:** {resp_text}")
+            else:
+                lines.append("- **Agent response:** <no agent message captured>")
+            lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -1104,6 +1343,11 @@ def _make_mock_t04_server() -> tuple[ThreadingHTTPServer, str]:
     return server, f"http://{host}:{port}"
 
 
+def _require(condition: object, detail: str) -> None:
+    if not condition:
+        raise RuntimeError(f"Self-check failed: {detail}")
+
+
 def run_mock_self_check(golden_open_path: Path) -> int:
     """Verify all validators catch synthetic errors and pass valid T04 mock traces."""
     catalog = load_catalog_index(golden_open_path)
@@ -1123,7 +1367,7 @@ def run_mock_self_check(golden_open_path: Path) -> int:
             },
         }
     ]
-    assert validate_no_hallucinated_prices(bad_price_events, ["4900"], catalog)
+    _require(validate_no_hallucinated_prices(bad_price_events, ["4900"], catalog), "price hallucination not caught")
 
     bad_term_events = [
         {
@@ -1139,7 +1383,7 @@ def run_mock_self_check(golden_open_path: Path) -> int:
             },
         }
     ]
-    assert validate_anti_term_hallucination(bad_term_events, "61557")
+    _require(validate_anti_term_hallucination(bad_term_events, "61557"), "term hallucination not caught")
 
     bad_zero_events = [
         {
@@ -1150,12 +1394,12 @@ def run_mock_self_check(golden_open_path: Path) -> int:
                 "type": "message",
                 "author": "agent",
                 "purpose": "answer",
-                "text": "Adobe InCopy CC стоит 0 руб.",
+                "text": "Adobe InCopy CC стоит 0,00 р.",
                 "sources": [{"url": "https://store.softline.ru/adobe/65272676ba01a12-504/", "label": "Softline"}],
             },
         }
     ]
-    assert validate_anti_zero_price(bad_zero_events, "504")
+    _require(validate_anti_zero_price(bad_zero_events, "504"), "zero price leak not caught")
 
     bad_source_events = [
         {
@@ -1171,7 +1415,7 @@ def run_mock_self_check(golden_open_path: Path) -> int:
             },
         }
     ]
-    assert validate_sources_present(bad_source_events)
+    _require(validate_sources_present(bad_source_events), "missing source not caught")
 
     # 2. Positive end-to-end check over loopback T04 HTTP server
     open_data = json.loads(golden_open_path.read_text(encoding="utf-8"))
@@ -1181,12 +1425,16 @@ def run_mock_self_check(golden_open_path: Path) -> int:
     server, base_url = _make_mock_t04_server()
     try:
         client = T04HttpClient(base_url, timeout=5.0)
-        results = [run_case(client, case, catalog, timeout=5.0, poll_interval=0.02) for case in cases]
+        results = [
+            run_case(client, case, catalog, timeout=5.0, poll_interval=0.02, settle_seconds=0.05) for case in cases
+        ]
     finally:
         server.shutdown()
         server.server_close()
 
-    summary = summarize_results(results, suite="mock-check", mode="mvp")
+    summary = summarize_results(
+        results, suite="mock-check", mode="mvp", category_weights=load_category_weights(DEFAULT_SPLIT_SUMMARY)
+    )
     print(format_markdown_report(summary))
     if summary["failed_cases"] > 0:
         return 1
@@ -1203,9 +1451,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mock-check", action="store_true", help="Run offline validator and mock T04 checks")
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     parser.add_argument("--golden-open", type=Path, default=DEFAULT_GOLDEN_OPEN)
-    parser.add_argument("--holdout-file", type=Path, default=DEFAULT_HOLDOUT_FILE)
+    parser.add_argument("--holdout-file", type=Path, default=None)
+    parser.add_argument("--split-summary", type=Path, default=DEFAULT_SPLIT_SUMMARY)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--poll-interval", type=float, default=0.25)
+    parser.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=0.4,
+        help="Quiet period after a turn produces a meaningful event before closing the turn",
+    )
     return parser
 
 
@@ -1217,11 +1472,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.base_url:
         raise SystemExit("--base-url is required unless --mock-check is specified")
 
+    holdout_path = args.holdout_file if args.holdout_file is not None else default_holdout_file()
     cases = load_cases(
         suite=args.suite,
         mode=args.mode,
         golden_open_path=args.golden_open,
-        holdout_path=args.holdout_file,
+        holdout_path=holdout_path,
     )
     catalog = load_catalog_index(
         args.golden_open,
@@ -1232,12 +1488,26 @@ def main(argv: list[str] | None = None) -> int:
     client = T04HttpClient(args.base_url, timeout=args.timeout)
     spend_before = client.probe_today_spend_rub()
     results = [
-        run_case(client, case, catalog, timeout=args.timeout, poll_interval=args.poll_interval) for case in cases
+        run_case(
+            client,
+            case,
+            catalog,
+            timeout=args.timeout,
+            poll_interval=args.poll_interval,
+            settle_seconds=args.settle_seconds,
+        )
+        for case in cases
     ]
     spend_after = client.probe_today_spend_rub()
     spend_delta = (spend_after - spend_before) if spend_before is not None and spend_after is not None else None
 
-    summary = summarize_results(results, suite=args.suite, mode=args.mode, suite_spend_delta_rub=spend_delta)
+    summary = summarize_results(
+        results,
+        suite=args.suite,
+        mode=args.mode,
+        suite_spend_delta_rub=spend_delta,
+        category_weights=load_category_weights(args.split_summary),
+    )
     json_path, md_path = write_reports(summary, args.out)
     print(format_markdown_report(summary))
     print(f"Reports written: {json_path}, {md_path}")

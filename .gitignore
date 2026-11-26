@@ -23,3 +23,6 @@ __pycache__/
 .pytest_cache/
 .next/
 /dist/
+
+# OS metadata
+.DS_Store

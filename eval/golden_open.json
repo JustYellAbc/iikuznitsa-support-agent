@@ -419,7 +419,7 @@
             "text": "А есть ли российский аналог для защиты почтового шлюза и что с реестром отечественного ПО?"
           },
           "assertions": {
-            "allowed_prices_rub": ["1670.94", "83547", "90047", "6500"],
+            "allowed_prices_rub": ["1670.94", "83547", "90047", "6500", "34727", "41227", "100000"],
             "require_sources_on_answer": true,
             "forbid_fake_registry_number": true
           }
@@ -610,6 +610,85 @@
         "allowed_prices_rub": [],
         "expect_handoff": true,
         "allowed_handoff_reasons": ["tender", "special_terms"],
+        "forbid_document": true
+      }
+    },
+    {
+      "id": "open-tender-repeat",
+      "title": "Тендер после подбора с повторной просьбой -> одно открытое обращение без дубля",
+      "suite": "open",
+      "category": "Госзакупки / процедуры",
+      "modes": ["mvp", "full"],
+      "tags": ["tender", "handoff_dedup", "t03", "pitch"],
+      "turns": [
+        {
+          "action": {
+            "type": "message",
+            "text": "Мы коммерческое юрлицо, покупаем впервые. Нужен MDaemon на 20 пользователей (19576)."
+          },
+          "assertions": {
+            "expected_offer_ids": ["19576"],
+            "allowed_prices_rub": ["77556"],
+            "required_prices_rub": ["77556"],
+            "required_urls": ["https://store.softline.ru/alt-n-technologies-ltd/-19576/"],
+            "require_sources_on_answer": true
+          }
+        },
+        {
+          "action": {
+            "type": "message",
+            "text": "Закупаем по тендеру. Пришлите пакет документов."
+          },
+          "assertions": {
+            "allowed_prices_rub": ["77556"],
+            "expect_handoff": true,
+            "allowed_handoff_reasons": ["tender", "special_terms"],
+            "forbid_document": true
+          }
+        },
+        {
+          "action": {
+            "type": "message",
+            "text": "Повторюсь, пришлите пакет документов для тендера по этой позиции."
+          },
+          "assertions": {
+            "allowed_prices_rub": ["77556"],
+            "forbid_document": true
+          }
+        }
+      ],
+      "assertions": {
+        "expected_offer_ids": ["19576"],
+        "allowed_prices_rub": ["77556"],
+        "expect_handoff": true,
+        "allowed_handoff_reasons": ["tender", "special_terms"],
+        "expect_unique_open_handoff_count": 1,
+        "forbid_document": true
+      }
+    },
+    {
+      "id": "open-individual-buyer",
+      "title": "Покупатель-физлицо запрашивает корпоративный MDaemon -> предупреждение об ограничении Юрлицо",
+      "suite": "open",
+      "category": "Физлицо / самозанятый / срок",
+      "modes": ["mvp", "full"],
+      "tags": ["individual", "restriction", "t03", "pitch"],
+      "turns": [
+        {
+          "action": {
+            "type": "message",
+            "text": "Здравствуйте! Я физлицо, хочу купить MDaemon на 20 пользователей (как 19576) для себя, какая цена?"
+          },
+          "assertions": {
+            "allowed_prices_rub": ["77556"],
+            "expect_legal_entity_caveat": true,
+            "forbid_document": true
+          }
+        }
+      ],
+      "assertions": {
+        "allowed_prices_rub": ["77556"],
+        "expect_legal_entity_caveat": true,
         "forbid_document": true
       }
     }
