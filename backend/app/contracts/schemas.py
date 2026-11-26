@@ -1,25 +1,21 @@
-"""Контракты данных команды — источник правды для OpenAPI.
+"""Внутренние контракты команды: стык с агентом, трейс, FinOps и расширения T05.
 
-ЗАМОРОЖЕНО после Фазы 1. Любое изменение — только по согласованию команды
-и с зелёным `pytest tests/test_contracts.py`.
-
-Деньги (Decimal) в JSON сериализуются строкой с двумя знаками: "77556.00".
+Публичный API покупателя и оператора описан в contracts/t04.py (контракт T04).
+Изменения здесь — только по согласованию команды и с зелёным `pytest tests/test_contracts.py`.
 """
 
-from datetime import date, datetime
-from decimal import Decimal
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.contracts.t04 import HandoffReason, Product, Source
+
 Mode = Literal["autopilot", "pilot"]
 Role = Literal["client", "agent", "operator"]
 Decision = Literal["answer", "draft", "escalate"]
-TicketType = Literal["draft", "escalation"]
-TicketStatus = Literal["open", "in_progress", "resolved"]
 PatchStatus = Literal["proposed", "approved", "rejected"]
-QuoteStatus = Literal["draft", "approved"]
-SseEventType = Literal["step_trace", "message_done", "ticket_created", "operator_reply"]
+DraftStatus = Literal["pending", "sent"]
 
 
 class Strict(BaseModel):
@@ -38,25 +34,21 @@ class ToolResult(Strict):
     error: str | None = None
 
 
-# --- Сессии и сообщения -----------------------------------------------------
-
-
-class SessionCreate(Strict):
-    client_context: dict[str, Any] = {}
+# --- Диалог глазами агента ---------------------------------------------------------
 
 
 class Session(Strict):
+    """Диалог (conversationId в T04) с режимом обработки ответов агента."""
+
     id: str
     client_context: dict[str, Any] = {}
     mode: Mode = "autopilot"
     created_at: datetime
 
 
-class MessageCreate(Strict):
-    text: str = Field(min_length=1, max_length=8000)
-
-
 class Message(Strict):
+    """Реплика из журнала в истории, которую получает агент."""
+
     id: str
     session_id: str
     role: Role
@@ -90,48 +82,66 @@ class AgentTurn(Strict):
     total_latency_ms: int
 
 
+class HandoffRequest(Strict):
+    """Что агент передаёт оператору. products — только контекст покупателя."""
+
+    reason: HandoffReason
+    question: str = Field(min_length=1, max_length=8000)
+    products: list[Product] = []
+
+
 class AgentReply(Strict):
     """Что agent/runner.py возвращает каркасу после одного хода.
 
-    decision="answer"   — text уходит клиенту (в pilot-режиме каркас сам превращает его в черновик);
-    decision="draft"    — text становится draft_answer тикета для менеджера;
-    decision="escalate" — создаётся тикет-эскалация; text (если есть) уходит клиенту как уведомление.
+    Каркас пишет в журнал по порядку: products (если есть) -> message (если text) -> handoff (если есть).
+
+    decision="answer"   — ответ клиенту; в pilot-режиме каркас превращает его в черновик менеджеру;
+    decision="draft"    — ответ сразу уходит менеджеру черновиком;
+    decision="escalate" — обязателен handoff; text (если есть) уходит клиенту до карточки обращения.
     """
 
     turn: AgentTurn
     text: str = ""
-    sources: list[str] = []
-    quote_id: str | None = None
-    ticket_summary: str | None = None
-    collected_params: dict[str, Any] = {}
+    purpose: Literal["answer", "clarification", "notice"] = "answer"
+    sources: list[Source] = []
+    products: list[Product] = []
+    handoff: HandoffRequest | None = None
 
 
-# --- Тикеты и база знаний ---------------------------------------------------
-
-
-class Ticket(Strict):
-    id: str
-    session_id: str
-    type: TicketType
-    status: TicketStatus
-    reason: str
-    summary: str
-    collected_params: dict[str, Any] = {}
-    draft_answer: str | None = None
-    operator_answer: str | None = None
-    suggested_patch_id: str | None = None
-    created_at: datetime
+# --- База знаний и черновики -------------------------------------------------
 
 
 class KBPatch(Strict):
     id: str
-    ticket_id: str | None = None
+    handoff_id: str | None = None
     question: str
     answer: str
     scope: str = "general"
     status: PatchStatus
     approved_by: str | None = None
     created_at: datetime
+
+
+class KBPatchCreate(Strict):
+    question: str = Field(min_length=1, max_length=8000)
+    answer: str = Field(min_length=1, max_length=8000)
+    scope: str = "general"
+    handoff_id: str | None = None
+
+
+class Draft(Strict):
+    """Ответ агента в режиме pilot: события журнала ждут отправки менеджером."""
+
+    id: str
+    conversation_id: str
+    action_id: str
+    events: list[dict[str, Any]]
+    status: DraftStatus
+    created_at: datetime
+
+
+class DraftSend(Strict):
+    text: str | None = Field(default=None, min_length=1, max_length=8000, description="Заменить текст ответа")
 
 
 # --- FinOps -----------------------------------------------------------------
@@ -149,36 +159,7 @@ class LLMCall(Strict):
     latency_ms: int
 
 
-# --- КП ---------------------------------------------------------------------
-
-
-class QuoteItem(Strict):
-    sku: str
-    name: str
-    qty: int
-    term: str | None = None
-    unit_price: Decimal
-    line_total: Decimal
-    vat_amount: Decimal
-
-
-class Quote(Strict):
-    id: str
-    session_id: str
-    version: int
-    customer_name: str
-    items: list[QuoteItem]
-    total: Decimal
-    total_vat: Decimal
-    currency: str = "RUB"
-    payment_terms: str
-    delivery_terms: str
-    valid_until: date
-    status: QuoteStatus = "draft"
-    pdf_url: str
-
-
-# --- HTTP: ответы и запросы API ---------------------------------------------
+# --- HTTP: служебные маршруты T05 -------------------------------------------------
 
 
 class Health(Strict):
@@ -188,47 +169,19 @@ class Health(Strict):
     today_spend_rub: float
 
 
-class SessionState(Strict):
-    session: Session
-    messages: list[Message]
-    turns: list[AgentTurn]
-    open_tickets: list[Ticket]
-    busy: bool = Field(description="Агент сейчас обрабатывает ход; новое сообщение получит 409")
-
-
-class SseEvent(Strict):
-    """Формат SSE: `event: <type>` + `data: <json payload>`.
-
-    step_trace     — payload: StepTrace (идёт в реальном времени, пока агент думает)
-    message_done   — payload: Message (агента или служебное уведомление)
-    ticket_created — payload: Ticket без внутренних полей (summary="", collected_params={}, draft_answer=null)
-    operator_reply — payload: Message (role="operator")
-    """
-
-    type: SseEventType
-    payload: dict[str, Any]
-
-
-class TicketWithContext(Strict):
-    ticket: Ticket
-    messages: list[Message]
-    turns: list[AgentTurn]
-
-
-class OperatorReply(Strict):
-    text: str | None = Field(default=None, max_length=8000)
-    send_draft: bool = Field(default=False, description="Отправить draft_answer тикета как есть")
-    propose_patch: bool = Field(default=False, description="Предложить ответ в БЗ (KBPatch status=proposed)")
+class ManagerLogin(Strict):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class ModeUpdate(Strict):
     mode: Mode
-    session_id: str | None = Field(default=None, description="Пусто — режим по умолчанию для новых сессий")
+    conversation_id: str | None = Field(default=None, description="Пусто — режим по умолчанию для новых диалогов")
 
 
 class ModeState(Strict):
     default_mode: Mode
-    session: Session | None = None
+    conversation: Session | None = None
 
 
 class StepStats(Strict):

@@ -1,7 +1,14 @@
-"""CRUD поверх app.db.database. Вход и выход — модели из contracts/schemas.py."""
+"""CRUD поверх app.db.database.
+
+Функции с параметром conn пишут в переданную транзакцию (async with get_db().tx() as conn),
+без него открывают свою. Так событие журнала и изменение состояния фиксируются атомарно.
+"""
 
 import json
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -9,20 +16,19 @@ import aiosqlite
 
 from app.contracts.schemas import (
     AgentTurn,
+    Draft,
     KBPatch,
     LLMCall,
     Message,
     Mode,
     PatchStatus,
-    Quote,
-    Role,
     Session,
     StepStats,
-    Ticket,
-    TicketStatus,
-    TicketType,
 )
+from app.contracts.t04 import Handoff, HandoffReason
 from app.db.database import get_db
+
+EVENTS_PAGE = 100
 
 
 def now_iso() -> str:
@@ -33,8 +39,27 @@ def to_iso(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat(timespec="microseconds")
 
 
+def event_time() -> str:
+    """Метка `at` журнала в формате контракта: 2026-11-26T09:00:01.000Z."""
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+@asynccontextmanager
+async def _tx(conn: aiosqlite.Connection | None) -> AsyncIterator[aiosqlite.Connection]:
+    if conn is not None:
+        yield conn
+    else:
+        async with get_db().tx() as own:
+            yield own
+
+
+async def _fetchone(conn: aiosqlite.Connection, sql: str, params: tuple = ()) -> aiosqlite.Row | None:
+    async with conn.execute(sql, params) as cur:
+        return await cur.fetchone()
 
 
 # --- Настройки ---------------------------------------------------------------
@@ -52,93 +77,275 @@ async def set_setting(key: str, value: str) -> None:
         )
 
 
-# --- Сессии и сообщения -------------------------------------------------------
+# --- Сессии входа ----------------------------------------------------------------
 
 
-def _session(row: aiosqlite.Row) -> Session:
-    return Session(
-        id=row["id"],
-        client_context=json.loads(row["client_context"]),
-        mode=row["mode"],
-        created_at=row["created_at"],
-    )
+@dataclass(frozen=True)
+class AuthSession:
+    role: str
+    principal: str
 
 
-async def create_session(client_context: dict[str, Any], mode: Mode) -> Session:
-    session = Session(id=new_id("s"), client_context=client_context, mode=mode, created_at=now_iso())
+async def create_auth_session(token_hash: str, role: str, principal: str, expires_at: datetime) -> None:
     async with get_db().tx() as conn:
         await conn.execute(
-            "INSERT INTO sessions(id, client_context, mode, created_at) VALUES (?, ?, ?, ?)",
-            (session.id, json.dumps(client_context, ensure_ascii=False), mode, to_iso(session.created_at)),
+            "INSERT INTO auth_sessions(token_hash, role, principal, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (token_hash, role, principal, now_iso(), to_iso(expires_at)),
+        )
+
+
+async def get_auth_session(token_hash: str) -> AuthSession | None:
+    row = await get_db().fetchone(
+        "SELECT role, principal FROM auth_sessions WHERE token_hash = ? AND expires_at > ?", (token_hash, now_iso())
+    )
+    return AuthSession(row["role"], row["principal"]) if row else None
+
+
+async def delete_auth_session(token_hash: str) -> None:
+    async with get_db().tx() as conn:
+        await conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+
+
+# --- Диалоги ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Conversation:
+    session: Session
+    owner_id: str
+
+
+async def create_conversation(owner_id: str, mode: Mode) -> Session:
+    session = Session(id=new_id("c"), mode=mode, created_at=now_iso())
+    async with get_db().tx() as conn:
+        await conn.execute(
+            "INSERT INTO conversations(id, owner_id, mode, created_at) VALUES (?, ?, ?, ?)",
+            (session.id, owner_id, mode, to_iso(session.created_at)),
         )
     return session
 
 
-async def get_session(session_id: str) -> Session | None:
-    row = await get_db().fetchone("SELECT * FROM sessions WHERE id = ?", (session_id,))
-    return _session(row) if row else None
+async def get_conversation(conversation_id: str) -> Conversation | None:
+    row = await get_db().fetchone("SELECT * FROM conversations WHERE id = ?", (conversation_id,))
+    if row is None:
+        return None
+    return Conversation(Session(id=row["id"], mode=row["mode"], created_at=row["created_at"]), row["owner_id"])
 
 
-async def set_session_mode(session_id: str, mode: Mode) -> None:
+async def set_conversation_mode(conversation_id: str, mode: Mode) -> None:
     async with get_db().tx() as conn:
-        await conn.execute("UPDATE sessions SET mode = ? WHERE id = ?", (mode, session_id))
+        await conn.execute("UPDATE conversations SET mode = ? WHERE id = ?", (mode, conversation_id))
 
 
-def _message(row: aiosqlite.Row) -> Message:
-    return Message(
-        id=row["id"],
-        session_id=row["session_id"],
-        role=row["role"],
-        text=row["text"],
-        sources=json.loads(row["sources"]),
-        quote_id=row["quote_id"],
-        created_at=row["created_at"],
+async def manager_has_access(conversation_id: str) -> bool:
+    """Оператор видит диалог, если по нему есть обращение или черновик."""
+    value = await get_db().fetchval(
+        "SELECT EXISTS(SELECT 1 FROM handoffs WHERE conversation_id = ?) "
+        "OR EXISTS(SELECT 1 FROM drafts WHERE conversation_id = ?)",
+        (conversation_id, conversation_id),
+    )
+    return bool(value)
+
+
+# --- Журнал событий ------------------------------------------------------------------
+
+
+async def append_events(
+    conversation_id: str, action_id: str, datas: list[dict[str, Any]], conn: aiosqlite.Connection | None = None
+) -> list[dict[str, Any]]:
+    """Дописывает события подряд и возвращает их в формате Event контракта."""
+    result = []
+    async with _tx(conn) as c:
+        row = await _fetchone(
+            c, "SELECT coalesce(max(seq), 0) FROM events WHERE conversation_id = ?", (conversation_id,)
+        )
+        seq = row[0]
+        for data in datas:
+            seq += 1
+            event = {"seq": seq, "at": event_time(), "actionId": action_id, "data": data}
+            await c.execute(
+                "INSERT INTO events(conversation_id, seq, at, action_id, data) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, seq, event["at"], action_id, json.dumps(data, ensure_ascii=False)),
+            )
+            result.append(event)
+    return result
+
+
+def _event(row: aiosqlite.Row) -> dict[str, Any]:
+    return {"seq": row["seq"], "at": row["at"], "actionId": row["action_id"], "data": json.loads(row["data"])}
+
+
+async def list_events(conversation_id: str, after: int, limit: int = EVENTS_PAGE) -> tuple[list[dict], bool]:
+    rows = await get_db().fetchall(
+        "SELECT * FROM events WHERE conversation_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+        (conversation_id, after, limit + 1),
+    )
+    return [_event(r) for r in rows[:limit]], len(rows) > limit
+
+
+async def count_agent_inputs(conversation_id: str) -> int:
+    """Реплики покупателя, на которые отвечал агент (без ответов в открытое обращение)."""
+    return await get_db().fetchval(
+        "SELECT count(*) FROM events WHERE conversation_id = ? AND json_extract(data, '$.type') = 'message' "
+        "AND json_extract(data, '$.author') = 'customer' AND json_extract(data, '$.handoffId') IS NULL",
+        (conversation_id,),
     )
 
 
-async def add_message(
-    session_id: str, role: Role, text: str, sources: list[str] | None = None, quote_id: str | None = None
-) -> Message:
-    msg = Message(
-        id=new_id("m"),
-        session_id=session_id,
-        role=role,
-        text=text,
-        sources=sources or [],
-        quote_id=quote_id,
-        created_at=now_iso(),
+async def last_products(conversation_id: str) -> list[dict[str, Any]]:
+    value = await get_db().fetchval(
+        "SELECT data FROM events WHERE conversation_id = ? AND json_extract(data, '$.type') = 'products' "
+        "ORDER BY seq DESC LIMIT 1",
+        (conversation_id,),
     )
-    async with get_db().tx() as conn:
-        await conn.execute(
-            "INSERT INTO messages(id, session_id, role, text, sources, quote_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+    return json.loads(value)["products"] if value else []
+
+
+_ROLE_BY_AUTHOR = {"customer": "client", "agent": "agent", "manager": "operator"}
+
+
+async def history_messages(conversation_id: str) -> list[Message]:
+    """Сообщения журнала в формате истории агента."""
+    rows = await get_db().fetchall(
+        "SELECT * FROM events WHERE conversation_id = ? AND json_extract(data, '$.type') = 'message' ORDER BY seq",
+        (conversation_id,),
+    )
+    result = []
+    for r in rows:
+        data = json.loads(r["data"])
+        result.append(
+            Message(
+                id=f"{conversation_id}:{r['seq']}",
+                session_id=conversation_id,
+                role=_ROLE_BY_AUTHOR[data["author"]],
+                text=data["text"],
+                sources=[s["url"] for s in data["sources"]],
+                created_at=r["at"],
+            )
+        )
+    return result
+
+
+# --- Обращения ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HandoffRow:
+    handoff: Handoff
+    action_id: str
+
+
+def _handoff(row: aiosqlite.Row) -> HandoffRow:
+    return HandoffRow(
+        Handoff(
+            handoffId=row["id"],
+            conversationId=row["conversation_id"],
+            reason=row["reason"],
+            question=row["question"],
+            products=json.loads(row["products"]),
+            status=row["status"],
+        ),
+        row["action_id"],
+    )
+
+
+async def create_handoff(
+    conversation_id: str,
+    action_id: str,
+    reason: HandoffReason,
+    question: str,
+    products: list[dict[str, Any]],
+    conn: aiosqlite.Connection | None = None,
+) -> Handoff:
+    handoff = Handoff(
+        handoffId=new_id("h"),
+        conversationId=conversation_id,
+        reason=reason,
+        question=question,
+        products=products,
+        status="open",
+    )
+    ts = now_iso()
+    async with _tx(conn) as c:
+        await c.execute(
+            "INSERT INTO handoffs(id, conversation_id, action_id, reason, question, products, status, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?)",
             (
-                msg.id,
-                session_id,
-                role,
-                text,
-                json.dumps(msg.sources, ensure_ascii=False),
-                quote_id,
-                to_iso(msg.created_at),
+                handoff.handoffId,
+                conversation_id,
+                action_id,
+                reason,
+                question,
+                json.dumps(products, ensure_ascii=False),
+                ts,
+                ts,
             ),
         )
-    return msg
+    return handoff
 
 
-async def list_messages(session_id: str) -> list[Message]:
-    rows = await get_db().fetchall(
-        "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at, rowid", (session_id,)
+async def get_handoff(handoff_id: str) -> HandoffRow | None:
+    row = await get_db().fetchone("SELECT * FROM handoffs WHERE id = ?", (handoff_id,))
+    return _handoff(row) if row else None
+
+
+async def find_open_handoff(conversation_id: str, reason: HandoffReason) -> HandoffRow | None:
+    row = await get_db().fetchone(
+        "SELECT * FROM handoffs WHERE conversation_id = ? AND reason = ? AND status = 'open' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (conversation_id, reason),
     )
-    return [_message(r) for r in rows]
+    return _handoff(row) if row else None
 
 
-async def count_client_messages(session_id: str) -> int:
-    return await get_db().fetchval(
-        "SELECT count(*) FROM messages WHERE session_id = ? AND role = 'client'", (session_id,)
+async def list_open_handoffs() -> list[Handoff]:
+    rows = await get_db().fetchall("SELECT * FROM handoffs WHERE status = 'open' ORDER BY created_at DESC LIMIT 200")
+    return [_handoff(r).handoff for r in rows]
+
+
+async def resolve_handoff(handoff_id: str, conn: aiosqlite.Connection | None = None) -> None:
+    async with _tx(conn) as c:
+        await c.execute("UPDATE handoffs SET status = 'resolved', updated_at = ? WHERE id = ?", (now_iso(), handoff_id))
+
+
+# --- Idempotency-Key ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoredResult:
+    request_hash: str
+    status: int
+    body: Any
+
+
+async def get_idempotent(principal: str, method: str, path: str, key: str) -> StoredResult | None:
+    row = await get_db().fetchone(
+        "SELECT request_hash, status, body FROM idempotency "
+        "WHERE principal = ? AND method = ? AND path = ? AND key = ?",
+        (principal, method, path, key),
     )
+    return StoredResult(row["request_hash"], row["status"], json.loads(row["body"])) if row else None
 
 
-# --- Ходы агента ---------------------------------------------------------------
+async def save_idempotent(principal: str, method: str, path: str, key: str, result: StoredResult) -> None:
+    async with get_db().tx() as conn:
+        await conn.execute(
+            "INSERT INTO idempotency(principal, method, path, key, request_hash, status, body, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                principal,
+                method,
+                path,
+                key,
+                result.request_hash,
+                result.status,
+                json.dumps(result.body, ensure_ascii=False),
+                now_iso(),
+            ),
+        )
+
+
+# --- Ходы агента ---------------------------------------------------------------------
 
 
 async def save_turn(turn: AgentTurn) -> None:
@@ -175,121 +382,55 @@ async def list_turns(session_id: str) -> list[AgentTurn]:
     ]
 
 
-# --- Тикеты ----------------------------------------------------------------------
+# --- Черновики pilot -------------------------------------------------------------------
 
 
-def _ticket(row: aiosqlite.Row) -> Ticket:
-    return Ticket(
+def _draft(row: aiosqlite.Row) -> Draft:
+    return Draft(
         id=row["id"],
-        session_id=row["session_id"],
-        type=row["type"],
+        conversation_id=row["conversation_id"],
+        action_id=row["action_id"],
+        events=json.loads(row["events"]),
         status=row["status"],
-        reason=row["reason"],
-        summary=row["summary"],
-        collected_params=json.loads(row["collected_params"]),
-        draft_answer=row["draft_answer"],
-        operator_answer=row["operator_answer"],
-        suggested_patch_id=row["suggested_patch_id"],
         created_at=row["created_at"],
     )
 
 
-async def create_ticket(
-    session_id: str,
-    type: TicketType,
-    reason: str,
-    summary: str,
-    collected_params: dict[str, Any] | None = None,
-    draft_answer: str | None = None,
-) -> Ticket:
-    ticket = Ticket(
-        id=new_id("t"),
-        session_id=session_id,
-        type=type,
-        status="open",
-        reason=reason,
-        summary=summary,
-        collected_params=collected_params or {},
-        draft_answer=draft_answer,
+async def create_draft(conversation_id: str, action_id: str, events: list[dict[str, Any]]) -> Draft:
+    draft = Draft(
+        id=new_id("d"),
+        conversation_id=conversation_id,
+        action_id=action_id,
+        events=events,
+        status="pending",
         created_at=now_iso(),
     )
-    ts = to_iso(ticket.created_at)
+    ts = to_iso(draft.created_at)
     async with get_db().tx() as conn:
         await conn.execute(
-            "INSERT INTO tickets(id, session_id, type, status, reason, summary, collected_params, "
-            "draft_answer, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                ticket.id,
-                session_id,
-                type,
-                "open",
-                reason,
-                summary,
-                json.dumps(ticket.collected_params, ensure_ascii=False),
-                draft_answer,
-                ts,
-                ts,
-            ),
+            "INSERT INTO drafts(id, conversation_id, action_id, events, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            (draft.id, conversation_id, action_id, json.dumps(events, ensure_ascii=False), ts, ts),
         )
-    return ticket
+    return draft
 
 
-async def get_ticket(ticket_id: str) -> Ticket | None:
-    row = await get_db().fetchone("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
-    return _ticket(row) if row else None
+async def get_draft(draft_id: str) -> Draft | None:
+    row = await get_db().fetchone("SELECT * FROM drafts WHERE id = ?", (draft_id,))
+    return _draft(row) if row else None
 
 
-async def find_open_ticket(session_id: str, type: TicketType) -> Ticket | None:
-    row = await get_db().fetchone(
-        "SELECT * FROM tickets WHERE session_id = ? AND type = ? AND status != 'resolved' "
-        "ORDER BY created_at DESC LIMIT 1",
-        (session_id, type),
-    )
-    return _ticket(row) if row else None
-
-
-async def list_tickets(
-    status: TicketStatus | None = None, since: datetime | None = None, session_id: str | None = None
-) -> list[Ticket]:
-    where, params = [], []
+async def list_drafts(status: str | None = "pending") -> list[Draft]:
     if status:
-        where.append("status = ?")
-        params.append(status)
-    if since:
-        where.append("updated_at >= ?")
-        params.append(to_iso(since))
-    if session_id:
-        where.append("session_id = ?")
-        params.append(session_id)
-    sql = "SELECT * FROM tickets"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    rows = await get_db().fetchall(sql + " ORDER BY created_at DESC LIMIT 200", tuple(params))
-    return [_ticket(r) for r in rows]
+        rows = await get_db().fetchall("SELECT * FROM drafts WHERE status = ? ORDER BY created_at DESC", (status,))
+    else:
+        rows = await get_db().fetchall("SELECT * FROM drafts ORDER BY created_at DESC")
+    return [_draft(r) for r in rows]
 
 
-_TICKET_FIELDS = {
-    "status",
-    "reason",
-    "summary",
-    "collected_params",
-    "draft_answer",
-    "operator_answer",
-    "suggested_patch_id",
-}
-
-
-async def update_ticket(ticket_id: str, **fields: Any) -> Ticket | None:
-    unknown = set(fields) - _TICKET_FIELDS
-    if unknown:
-        raise ValueError(f"Unknown ticket fields: {unknown}")
-    if "collected_params" in fields:
-        fields["collected_params"] = json.dumps(fields["collected_params"], ensure_ascii=False)
-    fields["updated_at"] = now_iso()
-    assignments = ", ".join(f"{k} = ?" for k in fields)
-    async with get_db().tx() as conn:
-        await conn.execute(f"UPDATE tickets SET {assignments} WHERE id = ?", (*fields.values(), ticket_id))
-    return await get_ticket(ticket_id)
+async def mark_draft_sent(draft_id: str, conn: aiosqlite.Connection | None = None) -> None:
+    async with _tx(conn) as c:
+        await c.execute("UPDATE drafts SET status = 'sent', updated_at = ? WHERE id = ?", (now_iso(), draft_id))
 
 
 # --- Патчи базы знаний -------------------------------------------------------------
@@ -299,10 +440,10 @@ def _patch(row: aiosqlite.Row) -> KBPatch:
     return KBPatch(**{k: row[k] for k in row.keys()})
 
 
-async def create_kb_patch(question: str, answer: str, ticket_id: str | None = None, scope: str = "general") -> KBPatch:
+async def create_kb_patch(question: str, answer: str, handoff_id: str | None = None, scope: str = "general") -> KBPatch:
     patch = KBPatch(
         id=new_id("p"),
-        ticket_id=ticket_id,
+        handoff_id=handoff_id,
         question=question,
         answer=answer,
         scope=scope,
@@ -311,9 +452,9 @@ async def create_kb_patch(question: str, answer: str, ticket_id: str | None = No
     )
     async with get_db().tx() as conn:
         await conn.execute(
-            "INSERT INTO kb_patches(id, ticket_id, question, answer, scope, status, created_at) "
+            "INSERT INTO kb_patches(id, handoff_id, question, answer, scope, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (patch.id, ticket_id, question, answer, scope, "proposed", to_iso(patch.created_at)),
+            (patch.id, handoff_id, question, answer, scope, "proposed", to_iso(patch.created_at)),
         )
     return patch
 
@@ -338,8 +479,7 @@ async def set_kb_patch_status(patch_id: str, status: PatchStatus, approved_by: s
             "UPDATE kb_patches SET status = ?, approved_by = ? WHERE id = ?", (status, approved_by, patch_id)
         )
         if status == "approved":
-            async with conn.execute("SELECT question, answer, scope FROM kb_patches WHERE id = ?", (patch_id,)) as cur:
-                row = await cur.fetchone()
+            row = await _fetchone(conn, "SELECT question, answer, scope FROM kb_patches WHERE id = ?", (patch_id,))
             if row:
                 cur = await conn.execute(
                     "INSERT INTO kb_articles(url, title, section, body, origin, created_at) "
@@ -407,26 +547,6 @@ async def step_stats(since: datetime | None = None) -> list[StepStats]:
 async def recent_llm_calls(limit: int = 20) -> list[LLMCall]:
     rows = await get_db().fetchall("SELECT * FROM llm_calls ORDER BY id DESC LIMIT ?", (limit,))
     return [LLMCall(**{k: r[k] for k in r.keys()}) for r in rows]
-
-
-# --- КП ---------------------------------------------------------------------------------
-
-
-async def save_quote(quote: Quote, pdf_path: str | None = None) -> None:
-    async with get_db().tx() as conn:
-        await conn.execute(
-            "INSERT INTO quotes(id, session_id, version, status, data, pdf_path, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET version = excluded.version, "
-            "status = excluded.status, data = excluded.data, pdf_path = excluded.pdf_path",
-            (quote.id, quote.session_id, quote.version, quote.status, quote.model_dump_json(), pdf_path, now_iso()),
-        )
-
-
-async def get_quote(quote_id: str) -> tuple[Quote, str | None] | None:
-    row = await get_db().fetchone("SELECT data, pdf_path FROM quotes WHERE id = ?", (quote_id,))
-    if row is None:
-        return None
-    return Quote.model_validate_json(row["data"]), row["pdf_path"]
 
 
 # --- Счётчики для /health -----------------------------------------------------------------

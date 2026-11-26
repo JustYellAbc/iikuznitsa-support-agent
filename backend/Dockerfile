@@ -7,8 +7,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
     DATA_DIR=/app/data
 
+# Необязательное зеркало Debian, если deb.debian.org недоступен (например, http://mirror.selectel.ru/debian)
+ARG DEBIAN_MIRROR=""
 # Кириллические шрифты и Pango для WeasyPrint (PDF КП, Фаза 3)
-RUN apt-get update \
+RUN if [ -n "$DEBIAN_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org/debian|$DEBIAN_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         fonts-dejavu-core fonts-liberation libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
     && rm -rf /var/lib/apt/lists/*

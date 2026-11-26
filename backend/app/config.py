@@ -31,6 +31,8 @@ class Settings(BaseSettings):
 
     operator_user: str = "manager"
     operator_password: str = ""
+    manager_session_hours: int = 12
+    customer_session_hours: int = 720
 
     cors_origins: str = "*"
     data_dir: Path = Path("./data")

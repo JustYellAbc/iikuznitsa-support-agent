@@ -4,13 +4,19 @@
 
     async def run_turn(session, history, user_text, emit_step) -> AgentReply
 
-- history   — сообщения диалога ДО текущей реплики (по возрастанию времени);
+- session   — диалог (session.id = conversationId T04);
+- history   — сообщения журнала ДО текущей реплики (по возрастанию времени);
 - user_text — текущая реплика клиента;
-- emit_step — await emit_step(StepTrace) публикует шаг в SSE сразу (панель трейса);
+- emit_step — await emit_step(StepTrace) фиксирует шаг трейса (GET /api/v1/manager/conversations/{id}/trace);
   все шаги также нужно вернуть в reply.turn.steps — каркас сохранит ход в БД.
 
+Ответ (AgentReply) каркас пишет в журнал T04: products -> message -> handoff.
+- sources — [Source(url="https://...", label="Карточка Softline")]: только https-ссылки;
+- products — Product.from_catalog(...) из contracts/t04.py: цены в копейках, priceState по правилам T04;
+- handoff — HandoffRequest(reason=<одна из 8 причин T04>, question=..., products=...) при decision="escalate".
+
 LLM — только через app.core.llm.llm_call(). BudgetExceededError можно не ловить:
-каркас (services/turn_service.py) сам переведёт диалог менеджеру.
+каркас (services/turn_service.py) сам передаст вопрос оператору (reason="technical").
 Режим pilot тоже обрабатывает каркас: decision="answer" превратится в черновик.
 """
 
