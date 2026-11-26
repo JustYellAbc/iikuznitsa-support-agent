@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Обращения · Softline</title>
+  <link rel="stylesheet" href="/manager/manager.css">
+  <script src="/manager/manager.js" defer></script>
+</head>
+<body>
+  <header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span>Softline</div><span class="area">Поддержка клиентов</span></header>
+  <main>
+    <div class="heading"><h1>Рабочее место менеджера</h1><span id="connection" role="status">Подключение…</span></div>
+    <form id="login" class="panel login" hidden>
+      <h2>Вход менеджера</h2>
+      <label>Логин<input name="username" autocomplete="username" required></label>
+      <label>Пароль<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="primary">Войти</button>
+      <p class="feedback" id="login-error" role="alert"></p>
+    </form>
+    <div id="desk" hidden>
+      <aside class="panel">
+        <div class="section-title"><h2>Открытые обращения</h2><span id="count" class="count">0</span></div>
+        <p id="queue-empty" class="muted">Открытых обращений пока нет.</p>
+        <nav id="queue" aria-label="Очередь обращений"></nav>
+      </aside>
+      <section class="panel detail">
+        <p id="no-selection" class="muted">Выберите обращение в очереди.</p>
+        <div id="card" hidden>
+          <div class="section-title"><h2 id="reason"></h2></div>
+          <p id="question"></p>
+          <div id="products"></div>
+          <h3>История диалога</h3>
+          <ol id="history" tabindex="0" aria-label="История диалога"></ol>
+          <form id="compose">
+            <label for="reply">Ответ клиенту</label>
+            <textarea id="reply" required maxlength="8000" rows="3" placeholder="Напишите сообщение…"></textarea>
+            <div class="actions"><button class="primary" value="reply">Отправить</button><button value="close">Ответить и закрыть</button></div>
+          </form>
+        </div>
+        <p class="feedback" id="result" role="status"></p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
