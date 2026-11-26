@@ -156,16 +156,18 @@ CONTROLS = {
 def real_index(tmp_path_factory):
     if not FEED.is_file():
         pytest.skip(f"нет реального фида {FEED}")
-    # Один потоковый проход по фиду: берём дату выгрузки и три эталонных оффера в мини-фид
+    # Один потоковый проход по фиду: дата выгрузки, категории и три эталонных оффера в мини-фид
     root = shop = offers = None
     for event, node in ET.iterparse(FEED, events=("start", "end")):
         if event == "start":
             if root is None:
                 root = ET.Element("yml_catalog", date=node.attrib["date"])
                 shop = ET.SubElement(root, "shop")
-                offers = ET.SubElement(shop, "offers")
             continue
-        if node.tag == "offer":
+        if node.tag == "categories":  # офферы ссылаются на categoryId
+            shop.append(node)
+            offers = ET.SubElement(shop, "offers")
+        elif node.tag == "offer":
             if node.get("id") in CONTROLS:
                 offers.append(node)
                 if len(offers) == len(CONTROLS):
