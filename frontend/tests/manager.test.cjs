@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path("backend").resolve()))
 from fastapi.staticfiles import StaticFiles
 from app.main import app
 app.mount("/manager", StaticFiles(directory="frontend/manager", html=True))
+app.mount("/chat", StaticFiles(directory="frontend/chat", html=True))
 sock = socket.socket()
 sock.bind(("127.0.0.1", 0))
 print(sock.getsockname()[1], flush=True)
@@ -46,20 +47,23 @@ test("Менеджер уточняет и закрывает обращение
   const customer = await browser.newContext({ baseURL });
   const manager = await browser.newContext({ baseURL });
   const page = await manager.newPage();
+  const chat = await customer.newPage();
   const errorLog = [];
   page.on("pageerror", e => errorLog.push(e.message));
-  const post = (url, data) => customer.request.post(url, { data, headers: { "Idempotency-Key": randomUUID() } });
-  const created = await post("/api/v1/conversations");
-  assert.equal(created.status(), 201);
-  const cid = (await created.json()).conversationId;
-  const conversation = "/api/v1/conversations/" + cid;
-  const opened = await post(conversation + "/actions", { type: "request_operator" });
-  assert.equal(opened.status(), 202);
+  chat.on("pageerror", e => errorLog.push(e.message));
+  await chat.goto("/chat/");
+  await chat.getByRole("button", { name: /Чат с поддержкой/ }).click();
+  const message = chat.getByRole("textbox", { name: "Ваше сообщение" });
+  const sendMessage = chat.getByRole("button", { name: "Отправить сообщение" });
+  const chatHistory = chat.getByRole("log", { name: "История диалога" });
+  await message.fill("Закупка тендерная, нужны документы");
+  await sendMessage.click();
+  await chatHistory.getByText("Обращение передано оператору", { exact: true }).waitFor();
   await page.goto("/manager/");
   await page.getByLabel("Логин").fill("manager");
   await page.getByLabel("Пароль").fill(password);
   await page.getByRole("button", { name: "Войти" }).click();
-  await page.getByRole("button", { name: /Запрос оператора/ }).click();
+  await page.getByRole("button", { name: /Тендерная закупка/ }).click();
   await page.locator("#history").getByText(/Передано менеджеру/).waitFor();
   const url = "**/manager/handoffs/*/resolution";
   const keys = [];
@@ -82,19 +86,16 @@ test("Менеджер уточняет и закрывает обращение
   await page.getByText("Ответ отправлен.", { exact: true }).waitFor();
   assert.ok(keys[0]);
   assert.equal(keys[1], keys[0]);
-  const events = async () => (await (await customer.request.get(conversation + "/events?after=0")).json()).events;
-  const replies = (await events()).filter(e => e.data.author === "manager");
-  assert.deepEqual(replies.map(e => e.data.text), ["Сколько пользователей?"]);
-  const clarification = await post(conversation + "/actions", {
-    type: "message", text: "Десять пользователей", handoffId: replies[0].data.handoffId
-  });
-  assert.equal(clarification.status(), 202);
+  const clarification = chatHistory.getByText("Сколько пользователей?", { exact: true });
+  await clarification.waitFor();
+  await message.fill("Десять пользователей");
+  await sendMessage.click();
   await page.locator("#history").getByText("Десять пользователей").waitFor();
   await answer.fill("Подбор для десяти пользователей согласован.");
   await page.getByRole("button", { name: "Ответить и закрыть" }).click();
   await page.getByText("Открытых обращений пока нет.").waitFor();
-  const final = await events();
-  assert.equal(final.at(-2).data.text, "Подбор для десяти пользователей согласован.");
-  assert.equal(final.at(-1).data.handoff.status, "resolved");
+  await chatHistory.getByText("Подбор для десяти пользователей согласован.", { exact: true }).waitFor();
+  await chatHistory.getByText("Обращение закрыто", { exact: true }).waitFor();
+  assert.equal(await clarification.count(), 1);
   assert.deepEqual(errorLog, []);
 });
