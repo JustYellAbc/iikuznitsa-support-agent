@@ -8,7 +8,6 @@ from collections import Counter
 from decimal import Decimal
 from pathlib import Path
 
-
 SNAPSHOT = "27eaec9e77942c61d58b3c04dcaa8991c707dc0fcb64a6442a7408d9908cb148"
 # offer ID -> product group, user capacity, license type, package price in RUR
 MDAEMON = {
@@ -133,8 +132,11 @@ def verify(path):
 
     check(set(offers), ids, "case records")
     check((family_count, standard_count), (510, 0), "MDaemon names and Standard in names/descriptions")
-    check(counts, Counter({("true", "positive"): 44601, ("false", "positive"): 11170,
-                           ("false", "zero"): 80269}), "availability and price distribution")
+    check(
+        counts,
+        Counter({("true", "positive"): 44601, ("false", "positive"): 11170, ("false", "zero"): 80269}),
+        "availability and price distribution",
+    )
     verify_mdaemon(offers)
     verify_price_controls(offers)
     verify_protection(offers)
