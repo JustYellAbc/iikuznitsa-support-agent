@@ -2,7 +2,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import routes_manager, routes_public
@@ -47,7 +47,23 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization"],
     )
-    app.include_router(routes_public.router)
+    accepting_messages: set[str] = set()
+
+    async def reserve_message_turn(request: Request) -> AsyncIterator[None]:
+        # Keep simultaneous submissions out of the gap between the busy check and start_turn().
+        if request.scope["endpoint"] is not routes_public.post_message:
+            yield
+            return
+        session_id = request.path_params["session_id"]
+        if session_id in accepting_messages:
+            raise HTTPException(409, "Агент ещё отвечает на предыдущее сообщение")
+        accepting_messages.add(session_id)
+        try:
+            yield
+        finally:
+            accepting_messages.remove(session_id)
+
+    app.include_router(routes_public.router, dependencies=[Depends(reserve_message_turn)])
     app.include_router(routes_manager.router)
     return app
 
