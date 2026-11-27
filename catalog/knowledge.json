@@ -28,5 +28,55 @@
     "title": "Как войти в личный кабинет",
     "body": "Откройте https://login.softline.com/ или выберите вход на сайте Softline. Используйте электронный адрес, привязанный к аккаунту.",
     "source": "https://docs.softline.com/ru-ru/id/login"
+  },
+  {
+    "title": "Где посмотреть логин Softline ID",
+    "body": "В профиле Softline ID откройте учётные данные. Почта в этом разделе служит логином. Если пароль забыт, запустите восстановление.",
+    "source": "https://docs.softline.com/ru-ru/id/authorization-data"
+  },
+  {
+    "title": "Регистрация аккаунта Softline ID",
+    "body": "Форма регистрации доступна на https://login.softline.ru/registration. Также можно выбрать регистрацию на странице входа Softline.",
+    "source": "https://docs.softline.com/ru-ru/id/registration"
+  },
+  {
+    "title": "Как оформить заказ в магазине",
+    "body": "В личном кабинете (https://lk.softline.ru/) перейдите в интернет-магазин, добавьте выбранные продукты в корзину и оформите заказ.",
+    "source": "https://docs.softline.com/ru-ru/lk/create-order"
+  },
+  {
+    "title": "Где посмотреть счета по заказам",
+    "body": "Откройте личный кабинет (https://lk.softline.ru/) и раздел «Счета и платежи». Вы увидите заказы, к которым у вашего аккаунта есть доступ.",
+    "source": "https://docs.softline.com/ru-ru/lk/invoices"
+  },
+  {
+    "title": "Как оплатить заказ",
+    "body": "Войдите в личный кабинет (https://lk.softline.ru/) с учётной записью, на которую оформлен заказ или которой предоставлен доступ к заказам компании. В кабинете доступны неоплаченные заказы.",
+    "source": "https://docs.softline.com/ru-ru/lk/unpaid-invoices"
+  },
+  {
+    "title": "Где получить ключи и дистрибутивы после покупки",
+    "body": "В личном кабинете (https://lk.softline.ru/) можно получить ключи, ссылки на дистрибутивы и инструкции для приобретённых продуктов.",
+    "source": "https://docs.softline.com/ru-ru/lk/fulfillment"
+  },
+  {
+    "title": "Просмотр статуса заказа",
+    "body": "Откройте личный кабинет (https://lk.softline.ru/). В разделе «Счета и платежи» найдите свой заказ. Статус показан справа в блоке заказа.",
+    "source": "https://docs.softline.com/ru-ru/lk/view-statuses"
+  },
+  {
+    "title": "Скачать закрывающие документы по заказу",
+    "body": "В личном кабинете (https://lk.softline.ru/) откройте «Счета и платежи», найдите заказ и разверните его. Если документы доступны, выберите «Закрывающие документы».",
+    "source": "https://docs.softline.com/ru-ru/lk/closing-documents"
+  },
+  {
+    "title": "Как узнать срок действия лицензии и оформить продление",
+    "body": "Откройте личный кабинет (https://lk.softline.ru/) и перейдите в «Продукты». Дату окончания лицензии смотрите в столбце «Срок истечения».",
+    "source": "https://docs.softline.com/ru-ru/lk/renewal"
+  },
+  {
+    "title": "Как связаться с менеджером по конкретному заказу",
+    "body": "Откройте личный кабинет (https://lk.softline.ru/), найдите заказ в разделе «Счета и платежи». Контакт менеджера указан в блоке «Вопросы по заказу?».",
+    "source": "https://docs.softline.com/ru-ru/lk/order-contact"
   }
 ]

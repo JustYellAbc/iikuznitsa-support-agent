@@ -452,6 +452,28 @@ def checked_answer(answer, evidence, history, text, previous):
         reason = "price_request"
     if answer.field == "availability" and len(products) == 1 and not products[0].available:
         reason = "availability"
+    if not reason and answer.field == "summary":
+        turns = discovery_context(history, text)
+        # Headcount and requested license quantities are distinct from capacity certified for one SKU.
+        quantity = re.search(r"\b(\d{1,6})\s+(?:отдельн\w+\s+)?лицензи[июй]\b", text, re.I)
+        requested = int(quantity[1]) if quantity else seats
+        if requested and requested > 1 and any(not row.get("seatLimit") for row in rows):
+            scope = capacity_question(turns)
+            if scope:
+                return scope, "clarification", [], [], None
+            names = "; ".join(row["name"] for row in rows)
+            per_seat = bool(re.search(r"отдельн\w* лиценз|по (?:одной|1) лиценз", text, re.I))
+            if per_seat and len(rows) == 1 and re.search(r"\b1 рабоч\w+ мест\w*", names, re.I):
+                body = (
+                    product_line(rows[0], "summary") + f" Для отдельных рабочих мест нужно {requested} таких лицензий."
+                )
+                return body, "answer", products, [products[0].source], None
+            body = f"В каталоге есть {names}. Пока не подтверждено, какой вариант покроет {requested} мест. " + (
+                OPERATOR_QUESTION
+                if per_seat
+                else "Подбираем отдельную лицензию на каждое место или одну многопользовательскую?"
+            )
+            return body, "clarification", [], [p.source for p in products], None
     if (
         not reason
         and answer.field in {"summary", "edition"}
