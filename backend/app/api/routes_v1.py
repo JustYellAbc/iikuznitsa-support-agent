@@ -205,6 +205,12 @@ async def download_document(documentId: PathId, principal: Principal = Depends(r
     return await quote_preview(row["conversation_id"], row["quote_id"], row["revision"], principal)
 
 
+@router.get("/conversations/{conversationId}/quotes/history", tags=["КП"])
+async def quote_history(conversationId: PathId, principal: Principal = Depends(require_principal)):
+    await svc.conversation_for(principal, conversationId)
+    return {"revisions": await quotes.revision_history(conversationId)}
+
+
 @router.get("/conversations/{conversationId}/quotes/{quoteId}/{revision}/preview.pdf", tags=["КП"])
 async def quote_preview(
     conversationId: PathId,

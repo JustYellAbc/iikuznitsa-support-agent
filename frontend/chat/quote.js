@@ -4,8 +4,10 @@ const list = document.getElementById("quote-items");
 const status = document.getElementById("quote-status");
 let openingRevision = 0, retry = null, busy = false;
 let openForm, latestRevision = 0;
+let refreshNotes, refreshTimer;
 
 export function resetQuotes() {
+  clearTimeout(refreshTimer);
   retry = null;
   latestRevision = 0;
   dialog.close(); form.reset();
@@ -18,6 +20,23 @@ export function quoteEvent(data, row) {
     label = "Подготовить КП";
   } else if (data.type === "quote") {
     revision = latestRevision = data.quote.revision;
+    const sameQuote = document.querySelectorAll(`[data-quote-status="${CSS.escape(data.quote.quoteId)}"]`);
+    for (const status of sameQuote) {
+      status.textContent = Number(status.dataset.version) < revision ? "Предыдущая версия" : "Ранее в этой версии";
+    }
+    const status = document.createElement("small");
+    status.dataset.quoteStatus = data.quote.quoteId;
+    status.dataset.version = revision;
+    status.textContent = "Последняя версия в чате";
+    row.firstElementChild.after(status);
+    if (revision > 1) {
+      const notes = document.createElement("div");
+      notes.dataset.noteFor = data.quote.quoteId;
+      notes.dataset.version = revision;
+      status.after(notes);
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(refreshNotes, 0);
+    }
     for (const previous of document.querySelectorAll(".quote-open[data-revision]")) {
       if (Number(previous.dataset.revision) < revision) previous.disabled = true;
     }
@@ -42,6 +61,30 @@ export function quoteEvent(data, row) {
 }
 
 export function setupQuotes(conversation, request, newKey) {
+  refreshNotes = async () => {
+    const cid = conversation();
+    const pending = [...document.querySelectorAll("[data-note-for]")].filter(node => !node.childElementCount);
+    if (!pending.length) return;
+    try {
+      const history = await request("/api/v1/conversations/" + encodeURIComponent(cid) + "/quotes/history");
+      if (cid !== conversation()) return;
+      for (const node of pending) {
+        const found = history.revisions.find(entry => entry.quoteId === node.dataset.noteFor && entry.revision === Number(node.dataset.version));
+        if (!found) continue;
+        const summary = document.createElement("p");
+        summary.textContent = "Изменения к версии " + found.previous + ". " + found.changes.join(" ");
+        node.replaceChildren(summary);
+      }
+    } catch {
+      if (cid !== conversation()) return;
+      for (const node of pending.filter(node => !node.childElementCount)) {
+        const retry = document.createElement("button");
+        retry.type = "button"; retry.textContent = "Загрузить изменения";
+        retry.onclick = () => { node.replaceChildren(); refreshNotes(); };
+        node.append(retry);
+      }
+    }
+  };
   let generation = 0;
   openForm = async ({offers, revision, prefillCurrent = false}) => {
     const token = ++generation;
