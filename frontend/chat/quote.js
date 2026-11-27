@@ -23,7 +23,7 @@ export function quoteEvent(data) {
 
 export function setupQuotes(conversation, request, newKey) {
   let generation = 0;
-  openButton.onclick = async () => {
+  const open = async (prefillCurrent = false) => {
     const token = ++generation;
     const cid = conversation();
     if (!cid) return;
@@ -35,18 +35,21 @@ export function setupQuotes(conversation, request, newKey) {
       openingRevision = saved.revision;
       if (saved.customer) for (const k of ["company","inn","kpp"]) form.elements[k].value = saved.customer[k];
       const items = new Map(saved.items.map(item => [item.offerId, item.packages]));
+      const selection = new Map((saved.selection || []).map(item => [item.offerId, item.priceState]));
       const submit = form.querySelector('[type="submit"]');
       const updateSubmit = () => { submit.disabled = !list.querySelector('input[type="checkbox"]:checked'); };
       for (const {offerId: id, name} of saved.choices) {
         const row = document.createElement("div"), label = document.createElement("label");
         const check = document.createElement("input"), qty = document.createElement("input");
         check.type = "checkbox"; check.value = id;
-        check.checked = items.has(id) || (!saved.requiresReselection && saved.choices.length === 1);
+        check.checked = items.has(id) || (!items.size && !saved.requiresReselection &&
+          (saved.choices.length === 1 || (prefillCurrent && selection.has(id))));
         qty.type = "number"; qty.min = "1"; qty.max = "100000"; qty.step = "1";
         qty.setAttribute("aria-label", "Упаковки: " + name);
         qty.value = String(items.get(id) || 1); qty.disabled = !check.checked;
         check.onchange = () => { qty.disabled = !check.checked; updateSubmit(); };
-        label.append(check, " " + name + " · ID " + id); row.append(label, qty); list.append(row);
+        const priceNote = selection.get(id) === "on_request" ? " · Цена по запросу" : "";
+        label.append(check, " " + name + " · ID " + id + priceNote); row.append(label, qty); list.append(row);
       }
       status.textContent = "";
       if (saved.requiresReselection) {
@@ -56,6 +59,7 @@ export function setupQuotes(conversation, request, newKey) {
       updateSubmit();
     } catch (error) { status.textContent = error.message; }
   };
+  openButton.onclick = () => open();
   document.getElementById("quote-cancel").onclick = () => dialog.close();
   form.onsubmit = async e => {
     e.preventDefault();
@@ -74,4 +78,5 @@ export function setupQuotes(conversation, request, newKey) {
       status.textContent = error.code === "stale_revision" ? "КП изменилось. Закройте и снова откройте форму." : error.message;
     } finally { busy=false; button.disabled=false; }
   };
+  return () => open(true);
 }

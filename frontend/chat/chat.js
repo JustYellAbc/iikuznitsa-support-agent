@@ -36,6 +36,7 @@ async function request(path, key, body) {
     throw error;
   }
   if (!res.headers.get("Content-Type")?.includes("application/json")) throw new Error("Стенд пока не предоставил API чата.");
+  if (res.headers.get("X-Chat-Action") === "open-quote-form") data.openQuoteForm = true;
   return data;
 }
 
@@ -213,6 +214,7 @@ async function submit(body) {
     }
     delete state.pending; save();
     if (body.type === "message") message.value = "";
+    if (receipt.openQuoteForm && !panel.hidden) openChatQuote();
     poll();
   } catch (error) {
     if (error.status && error.status < 500 && state.pending) {
@@ -266,4 +268,4 @@ retry.onclick = () => {
   else poll();
 };
 if (state.pending) actionError = "Отправка не подтверждена. Можно повторить.";
-setupQuotes(() => state.id, request, newKey);
+const openChatQuote = setupQuotes(() => state.id, request, newKey);

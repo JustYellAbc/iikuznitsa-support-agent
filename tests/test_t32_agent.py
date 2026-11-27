@@ -163,3 +163,35 @@ def test_tools_retrieve_new_manager_publication_for_different_buyer(api, provide
     [source] = reply["sources"]
     assert source["url"].endswith(f"/api/v1/knowledge/{pid}")
     assert api.call("second", "GET", source["url"]).text == f"{QUESTION}\n\n{ANSWER}"
+
+
+@pytest.mark.usefixtures("index")
+def test_quote_acceptance_uses_verified_selection_without_another_model_call(api, provider):
+    responses, requests = provider
+    responses.extend(
+        [
+            tool("get_offer", offer_id="new20"),
+            tool("respond", kind="product", refs=["r1"], field="price"),
+            tool("get_offer", offer_id="new20"),
+            tool("respond", kind="clarify", question="Оформить запрос на расчёт и КП по выбранным позициям?"),
+        ]
+    )
+    cid = api.new_conversation()
+    say(api, cid, "Цена по артикулу new20?")
+    say(api, cid, "И что дальше?")
+    for prompt in ("Да", "Эй бля подготавливай КП"):
+        receipt = api.say(cid, prompt, key=prompt.encode().hex())
+        assert receipt.status_code == 202 and receipt.headers["X-Chat-Action"] == "open-quote-form"
+        assert set(receipt.json()) == {"conversationId", "actionId"}
+        repeat = api.say(cid, prompt, key=prompt.encode().hex())
+        assert repeat.headers["X-Chat-Action"] == "open-quote-form" and repeat.json() == receipt.json()
+    current = api.call("customer", "GET", f"/api/v1/conversations/{cid}/quotes/current").json()
+    assert [p["offerId"] for p in current["selection"]] == ["new20"]
+    assert current["revision"] == 0 and len(requests) == 4
+
+
+@pytest.mark.parametrize("last", ["Для какого товара подготовить КП?", "Подключить оператора, чтобы оформить КП?"])
+def test_unrelated_yes_does_not_open_quote(last):
+    from app.agent.quote_intent import offers_quote
+
+    assert not offers_quote(last)
