@@ -63,7 +63,7 @@ async def run_turn(session, history, text, emit_step, *, action_type, finding):
                 break
             if step.tool == "needs_search":
                 prior = step.args
-            if step.tool != "product_facts":
+            if step.tool not in {"product_facts", "published_knowledge"}:
                 break
     if not prior and not (initial_need(text) or open_intake(text)):
         return None

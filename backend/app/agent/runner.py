@@ -38,6 +38,7 @@ from app.agent.handoff import (
     handoff_reason,
     route_action,
 )
+from app.agent.knowledge import answer_published
 from app.agent.product_answers import answer_facts, question_target, refresh_products, topics_for
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Session, StepTrace
@@ -104,7 +105,7 @@ async def run_turn(
             if not turn.steps:
                 break
             step = turn.steps[0]
-            if step.tool == "product_facts" and turn.decision == "answer":
+            if step.tool in {"product_facts", "published_knowledge"} and turn.decision == "answer":
                 continue
             if step.tool == "catalog_search":
                 args = step.args
@@ -136,6 +137,18 @@ async def run_turn(
     if pending_question and selected and not route and not topics:
         fact_question = pending_question
         topics = topics_for(fact_question, True)
+    # A store name in a procedural FAQ can look like a named product to the selector.
+    # Keep product facts and escalation ahead of any answer from a published article.
+    if (
+        action_type == "message"
+        and not route
+        and not topics
+        and (not selected or re.search(r"\b(?:где|как)\b", user_text, re.I))
+        and not route_action(history, user_text, products, action_type=action_type, finding=finding)
+    ):
+        published = await answer_published(session.id, user_text, emit_step)
+        if published:
+            return published
     hit = None
     steps = []
     if selected:
