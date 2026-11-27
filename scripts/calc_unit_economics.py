@@ -5,7 +5,12 @@
   - JSON-отчёт eval/run_eval.py (--eval-report) и/или выгрузка /api/v1/manager/telemetry (--telemetry);
   - eval/split_summary.json (--split-summary) с долями 9 категорий из архива чатов;
   - config/pricing.yaml (--pricing) — прайсы моделей, инфраструктура и оператор (без значений по умолчанию);
+    необязательно: models.<id>.note (например, «подписка, 0 ₽ за токены») и секция customer_infrastructure
+    с теми же полями, что infrastructure, — сервер заказчика для локального запуска открытых весов (T36);
   - шаблон организаторов .xlsx (--template + --xlsx-out) — курс ЦБ и формулы не изменяются.
+
+Стоимость токенов всегда пересчитывается по pricing.yaml. Поле cost_rub телеметрии стенда не используется:
+там справочные тарифы для дневного лимита. Вызовы с MOCK_LLM=true (модель mock/...) отклоняются.
 
 Выходные данные:
   - заполненный .xlsx по шаблону организаторов (с сохранением всех формул и курса ЦБ);
@@ -80,6 +85,7 @@ class ModelPrice:
     currency: str
     source_url: str
     date: str
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +110,8 @@ class PricingConfig:
     models: dict[str, ModelPrice]
     infrastructure: InfrastructurePrice
     operator: OperatorPrice
+    # Контур заказчика (локальный запуск, T36): необязательная альтернатива инфраструктуре стенда.
+    customer_infrastructure: InfrastructurePrice | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +133,9 @@ class LLMCallRecord:
     model: str
     tokens_in: int
     tokens_out: int
+    # HTTP-попытки llm_call из трассы (args.attempts); None — источник их не содержит (telemetry).
+    # В сравнение не входит: один и тот же вызов из трассы и из телеметрии должен совпадать.
+    attempts: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -199,6 +210,21 @@ class LoadScenarioEconomics:
     net_savings_daily_rub: Decimal | None
     net_savings_period_rub: Decimal | None
     net_savings_pct: Decimal | None
+    daily_llm_calls: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class CustomerContourEconomics:
+    """Контур заказчика после T36: открытые веса на его сервере, за токены 0 ₽, все расходы — сервер."""
+
+    description: str
+    daily_infra_cost_rub: Decimal
+    period_total_cost_rub: Decimal
+    full_cost_per_request_rub: Decimal
+    net_savings_period_rub: Decimal | None
+    load_daily_total_cost_rub: Decimal
+    load_full_cost_per_request_rub: Decimal
+    load_net_savings_daily_rub: Decimal | None
 
 
 @dataclass(frozen=True)
@@ -241,6 +267,16 @@ class UnitEconomicsResult:
     net_savings_pct: Decimal | None
     load_scenario: LoadScenarioEconomics
     telemetry_warnings: tuple[str, ...] = ()
+    # Детерминированные маршруты (0 вызовов LLM, 0 ₽) и обращения с LLM среди замеренных диалогов.
+    llm_dialogs: int = 0
+    zero_llm_dialogs: int = 0
+    llm_dialog_share: Decimal | None = None  # взвешена так же, как средняя переменная стоимость
+    avg_cost_per_llm_dialog_rub: Decimal | None = None
+    llm_calls_per_request: Decimal | None = None
+    total_llm_calls: int = 0
+    provider_retries: int = 0
+    calls_with_attempts: int = 0
+    customer_contour: CustomerContourEconomics | None = None
 
 
 @dataclass(frozen=True)
@@ -363,16 +399,15 @@ def load_pricing_config(path: Path) -> PricingConfig:
             currency=_parse_currency(cfg.get("currency"), f"{prefix}.currency"),
             source_url=_parse_url(cfg.get("source_url"), f"{prefix}.source_url", require_http=True),
             date=_parse_date(cfg.get("date"), f"{prefix}.date"),
+            note=str(cfg.get("note") or "").strip(),
         )
 
-    raw_infra = raw["infrastructure"]
-    infra = InfrastructurePrice(
-        daily_cost=_parse_decimal(raw_infra.get("daily_cost"), "infrastructure.daily_cost", allow_zero=True),
-        currency=_parse_currency(raw_infra.get("currency"), "infrastructure.currency"),
-        source_url=_parse_url(raw_infra.get("source_url"), "infrastructure.source_url", require_http=True),
-        date=_parse_date(raw_infra.get("date"), "infrastructure.date"),
-        description=str(raw_infra.get("description") or "").strip(),
-    )
+    infra = _parse_infrastructure(raw["infrastructure"], "infrastructure")
+    customer_infra = None
+    if raw.get("customer_infrastructure") is not None:
+        if not isinstance(raw["customer_infrastructure"], dict):
+            raise ConfigError(f"В {path}: секция 'customer_infrastructure' должна быть словарём.")
+        customer_infra = _parse_infrastructure(raw["customer_infrastructure"], "customer_infrastructure")
 
     raw_op = raw["operator"]
     operator = OperatorPrice(
@@ -384,7 +419,17 @@ def load_pricing_config(path: Path) -> PricingConfig:
         date=_parse_date(raw_op.get("date"), "operator.date"),
     )
 
-    return PricingConfig(models=models, infrastructure=infra, operator=operator)
+    return PricingConfig(models=models, infrastructure=infra, operator=operator, customer_infrastructure=customer_infra)
+
+
+def _parse_infrastructure(raw: dict, prefix: str) -> InfrastructurePrice:
+    return InfrastructurePrice(
+        daily_cost=_parse_decimal(raw.get("daily_cost"), f"{prefix}.daily_cost", allow_zero=True),
+        currency=_parse_currency(raw.get("currency"), f"{prefix}.currency"),
+        source_url=_parse_url(raw.get("source_url"), f"{prefix}.source_url", require_http=True),
+        date=_parse_date(raw.get("date"), f"{prefix}.date"),
+        description=str(raw.get("description") or "").strip(),
+    )
 
 
 # --- Загрузка split_summary.json ------------------------------------------------
@@ -456,13 +501,23 @@ def _parse_call_dict(item: dict[str, Any], ctx: str) -> LLMCallRecord:
         raise InputDataError(f"{ctx}: отсутствует непустое строковое поле 'step'.")
     if not isinstance(model, str) or not model.strip():
         raise InputDataError(f"{ctx}: отсутствует непустое строковое поле 'model'.")
+    if model.strip().startswith("mock/"):
+        raise InputDataError(
+            f"{ctx}: вызов {model.strip()!r} записан с MOCK_LLM=true. Токены такого вызова оценены по длине "
+            "текста, это не замер. Снимите выгрузку со стенда с MOCK_LLM=false."
+        )
     tokens_in = item.get("tokens_in")
     tokens_out = item.get("tokens_out")
     if isinstance(tokens_in, bool) or not isinstance(tokens_in, int) or tokens_in < 0:
         raise InputDataError(f"{ctx}: поле 'tokens_in' должно быть целым >= 0 (получено {tokens_in!r}).")
     if isinstance(tokens_out, bool) or not isinstance(tokens_out, int) or tokens_out < 0:
         raise InputDataError(f"{ctx}: поле 'tokens_out' должно быть целым >= 0 (получено {tokens_out!r}).")
-    return LLMCallRecord(step=step.strip(), model=model.strip(), tokens_in=tokens_in, tokens_out=tokens_out)
+    attempts = item.get("attempts")
+    if attempts is not None and (isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1):
+        raise InputDataError(f"{ctx}: поле 'attempts' должно быть целым >= 1 (получено {attempts!r}).")
+    return LLMCallRecord(
+        step=step.strip(), model=model.strip(), tokens_in=tokens_in, tokens_out=tokens_out, attempts=attempts
+    )
 
 
 def _extract_calls_from_turns(turns: list[Any], ctx: str) -> tuple[list[LLMCallRecord], bool]:
@@ -492,7 +547,13 @@ def _extract_calls_from_turns(turns: list[Any], ctx: str) -> tuple[list[LLMCallR
             model_name = args.get("model") or st.get("model")
             calls.append(
                 _parse_call_dict(
-                    {"step": step_name, "model": model_name, "tokens_in": tokens_in, "tokens_out": tokens_out},
+                    {
+                        "step": step_name,
+                        "model": model_name,
+                        "tokens_in": tokens_in,
+                        "tokens_out": tokens_out,
+                        "attempts": args.get("attempts"),
+                    },
                     f"{ctx}.turns[{t_idx}].steps[{s_idx}]",
                 )
             )
@@ -817,6 +878,7 @@ def _compute_load_scenario(
     operator_cost_per_request_rub: Decimal,
     requests_per_day: int,
     period_days: int,
+    llm_calls_per_request: Decimal | None = None,
 ) -> LoadScenarioEconomics:
     """Считает отдельный нагрузочный сценарий (например, 500 обращений/сутки со слайда 2)."""
     req_day_dec = Decimal(requests_per_day)
@@ -900,6 +962,37 @@ def _compute_load_scenario(
         net_savings_daily_rub=net_savings_daily_rub,
         net_savings_period_rub=net_savings_period_rub,
         net_savings_pct=net_savings_pct,
+        daily_llm_calls=req_day_dec * llm_calls_per_request if llm_calls_per_request is not None else None,
+    )
+
+
+def _customer_contour(
+    pricing: PricingConfig,
+    usd_rub_rate: Decimal | None,
+    *,
+    period_days: int,
+    requests_per_period: int,
+    load_requests_per_day: int,
+    operator_cost_per_request_rub: Decimal,
+    labor_share: Decimal | None,
+) -> CustomerContourEconomics | None:
+    """Локальный запуск у заказчика: оплаты за токены нет, расходы — суточная стоимость его сервера."""
+    infra = pricing.customer_infrastructure
+    if infra is None:
+        return None
+    daily = infra.daily_cost * _currency_multiplier(infra.currency, usd_rub_rate, "инфраструктуры заказчика")
+    period_total = daily * Decimal(period_days)
+    _, _, net_period, _ = _pilot_costs(operator_cost_per_request_rub * requests_per_period, period_total, labor_share)
+    _, _, net_daily, _ = _pilot_costs(operator_cost_per_request_rub * load_requests_per_day, daily, labor_share)
+    return CustomerContourEconomics(
+        description=infra.description,
+        daily_infra_cost_rub=daily,
+        period_total_cost_rub=period_total,
+        full_cost_per_request_rub=period_total / Decimal(requests_per_period),
+        net_savings_period_rub=net_period,
+        load_daily_total_cost_rub=daily,
+        load_full_cost_per_request_rub=daily / Decimal(load_requests_per_day),
+        load_net_savings_daily_rub=net_daily,
     )
 
 
@@ -960,6 +1053,15 @@ def compute_unit_economics(
     escalated_dialogs = sum(d.escalated is True for d in dialogs)
     escalation_rate = _weighted_share(dialogs, split_summary, lambda d: d.confirmed_escalation)
     labor_share = _weighted_share(dialogs, split_summary, lambda d: d.needs_operator)
+    customer_contour = _customer_contour(
+        pricing,
+        usd_rub_rate,
+        period_days=period_days,
+        requests_per_period=requests_per_period,
+        load_requests_per_day=load_requests_per_day,
+        operator_cost_per_request_rub=operator_cost_per_request_rub,
+        labor_share=labor_share,
+    )
     dialogs = [d for d in dialogs if d.calls is not None]
     complete_costs = len(dialogs) == total_dialogs
     if not complete_costs:
@@ -1033,6 +1135,7 @@ def compute_unit_economics(
             net_savings_pct=None,
             load_scenario=load_scenario,
             telemetry_warnings=tuple(telemetry_warnings),
+            customer_contour=customer_contour,
         )
 
     # Проверяем наличие всех моделей в pricing.yaml и считаем стоимость каждого диалога.
@@ -1190,6 +1293,11 @@ def compute_unit_economics(
 
     avg_tokens_in_per_request = sum((s.calls_per_request * s.avg_tokens_in for s in step_aggs), ZERO)
     avg_tokens_out_per_request = sum((s.calls_per_request * s.avg_tokens_out for s in step_aggs), ZERO)
+    llm_calls_per_request = sum((s.calls_per_request for s in step_aggs), ZERO)
+    # Та же схема весов, что у средней стоимости: active = доля с LLM × средняя стоимость обращения с LLM.
+    llm_dialog_share = _weighted_share(dialogs, split_summary, lambda d: bool(d.calls))
+    all_calls = [c for d in dialogs for c in d.calls]
+    known_attempts = [c.attempts for c in all_calls if c.attempts is not None]
     base_req_per_day = req_period_dec / period_days_dec
     daily_tokens_in = avg_tokens_in_per_request * base_req_per_day
     daily_tokens_out = avg_tokens_out_per_request * base_req_per_day
@@ -1215,6 +1323,7 @@ def compute_unit_economics(
         operator_cost_per_request_rub=operator_cost_per_request_rub,
         requests_per_day=load_requests_per_day,
         period_days=period_days,
+        llm_calls_per_request=llm_calls_per_request,
     )
 
     return UnitEconomicsResult(
@@ -1256,6 +1365,15 @@ def compute_unit_economics(
         net_savings_pct=net_savings_pct,
         load_scenario=load_scenario,
         telemetry_warnings=tuple(telemetry_warnings),
+        llm_dialogs=sum(1 for d in dialogs if d.calls),
+        zero_llm_dialogs=sum(1 for d in dialogs if not d.calls),
+        llm_dialog_share=llm_dialog_share,
+        avg_cost_per_llm_dialog_rub=active_variable_cost_rub / llm_dialog_share if llm_dialog_share else None,
+        llm_calls_per_request=llm_calls_per_request,
+        total_llm_calls=len(all_calls),
+        provider_retries=sum(a - 1 for a in known_attempts),
+        calls_with_attempts=len(known_attempts),
+        customer_contour=customer_contour,
     )
 
 
@@ -1676,18 +1794,27 @@ def build_comment_lines(result: UnitEconomicsResult, pricing: PricingConfig) -> 
             "доли 9 категорий из архива чатов (не рабочий поток), покрытие 100%."
         )
 
+    if result.llm_dialog_share is not None:
+        line1 += (
+            f" Без LLM (детерминированные маршруты, 0 ₽): {_fmt_dec((1 - result.llm_dialog_share) * HUNDRED, '0.1')}%, "
+            f"с LLM: {_fmt_dec(result.llm_dialog_share * HUNDRED, '0.1')}% "
+            f"({result.zero_llm_dialogs} и {result.llm_dialogs} диалогов)."
+        )
     if result.measured_dialogs < result.total_dialogs:
         line1 += (
             f" Учтены вызовы {result.measured_dialogs}/{result.total_dialogs} диалогов; "
             f"известны исходы {result.known_outcomes}/{result.total_dialogs}."
         )
     used_models = {s.model for s in result.steps} or set(pricing.models.keys())
-    model_refs = "; ".join(
-        f"{m}: {pricing.models[m].source_url} ({pricing.models[m].date})"
-        for m in sorted(used_models)
-        if m in pricing.models
-    )
+    model_refs = "; ".join(_model_ref(pricing.models[m]) for m in sorted(used_models) if m in pricing.models)
     line2 = f"Прайсы LLM: {model_refs}."
+    if result.has_measurements:
+        line2 += (
+            f" LLM-вызовов на обращение {_fmt_dec(result.llm_calls_per_request, '0.01')}, "
+            f"на обращение с LLM {_fmt_dec(_per_llm_dialog(result), '0.01')}, "
+            f"всего в замерах {result.total_llm_calls}; {_retries_text(result)}. "
+            "Токены пересчитаны по pricing.yaml, cost_rub стенда не используется."
+        )
 
     line3 = (
         f"База ({result.requests_per_period} обр./{result.period_days} дн.): "
@@ -1697,7 +1824,33 @@ def build_comment_lines(result: UnitEconomicsResult, pricing: PricingConfig) -> 
         f"оператор {_fmt_dec(result.operator_cost_per_request_rub)} ₽/обр ({pricing.operator.date}); "
         f"нагрузочный сценарий (не база): {result.load_scenario.requests_per_day} обр./сут."
     )
+    customer = result.customer_contour
+    if customer is not None:
+        line3 += (
+            f" Контур заказчика (T36, локальный запуск, токены 0 ₽): "
+            f"{_fmt_dec(customer.daily_infra_cost_rub)} ₽/сут, {_fmt_dec(customer.period_total_cost_rub)} ₽/период."
+        )
     return [line1, line2, line3]
+
+
+def _model_ref(mp: ModelPrice) -> str:
+    note = f", {mp.note}" if mp.note else ""
+    return f"{mp.model}: {mp.input_per_1m}/{mp.output_per_1m} {mp.currency} за 1 млн{note}, {mp.source_url} ({mp.date})"
+
+
+def _per_llm_dialog(result: UnitEconomicsResult) -> Decimal | None:
+    if result.llm_calls_per_request is None or not result.llm_dialog_share:
+        return None
+    return result.llm_calls_per_request / result.llm_dialog_share
+
+
+def _retries_text(result: UnitEconomicsResult) -> str:
+    if not result.calls_with_attempts:
+        return "HTTP-повторы к провайдеру: нет данных трассы"
+    return (
+        f"HTTP-повторов к провайдеру {result.provider_retries} "
+        f"(по трассе для {result.calls_with_attempts} из {result.total_llm_calls} вызовов)"
+    )
 
 
 def fill_xlsx_template(
@@ -1776,6 +1929,82 @@ def fill_xlsx_template(
 
 
 # --- Генерация docs/cost_report.md ----------------------------------------------
+
+
+def _llm_split_lines(result: UnitEconomicsResult) -> list[str]:
+    """Доля детерминированных маршрутов (0 вызовов LLM, 0 ₽), обращения с LLM, вызовы и повторы."""
+    if not result.has_measurements:
+        return []
+    share = result.llm_dialog_share
+    llm_pct = f"{_fmt_dec(share * HUNDRED, '0.01')}%" if share is not None else "н/д"
+    zero_pct = f"{_fmt_dec((1 - share) * HUNDRED, '0.01')}%" if share is not None else "н/д"
+    retries = (
+        f"{result.provider_retries} (по трассе для {result.calls_with_attempts} из {result.total_llm_calls} вызовов)"
+        if result.calls_with_attempts
+        else "н/д: в выгрузке нет трассы с args.attempts"
+    )
+    return [
+        "## Детерминированные маршруты и обращения с LLM",
+        "",
+        "Стоимость обращения включает все LLM-вызовы диалога, в том числе повторные вызовы модели в одном ходе. "
+        "Обращения без вызовов LLM входят в среднюю стоимость со своей долей и нулевой стоимостью. "
+        "Токены пересчитаны по `config/pricing.yaml`. Поле `cost_rub` телеметрии стенда в расчёт не входит: "
+        "там справочные тарифы для дневного лимита.",
+        "",
+        "| Показатель | Значение |",
+        "|---|---|",
+        f"| Замерено обращений без LLM (детерминированные маршруты, 0 ₽) | {result.zero_llm_dialogs} |",
+        f"| Замерено обращений с LLM | {result.llm_dialogs} |",
+        f"| Доля обращений без LLM (взвешенная, как средняя стоимость), % | {zero_pct} |",
+        f"| Доля обращений с LLM (взвешенная), % | {llm_pct} |",
+        "| Средняя переменная стоимость обращения без LLM, ₽ | 0.0000 |",
+        f"| Средняя переменная стоимость обращения с LLM, ₽ | "
+        f"{_fmt_dec(result.avg_cost_per_llm_dialog_rub, '0.0001')} |",
+        f"| LLM-вызовов на 1 обращение | {_fmt_dec(result.llm_calls_per_request, '0.0001')} |",
+        f"| LLM-вызовов на 1 обращение с LLM | {_fmt_dec(_per_llm_dialog(result), '0.0001')} |",
+        f"| Всего LLM-вызовов в замерах | {result.total_llm_calls} |",
+        f"| HTTP-повторов к провайдеру (неуспешные попытки без usage) | {retries} |",
+        "",
+    ]
+
+
+def _customer_contour_lines(result: UnitEconomicsResult) -> list[str]:
+    customer = result.customer_contour
+    header = ["## Контур заказчика (локальный запуск после T36)", ""]
+    if customer is None:
+        return [
+            *header,
+            "_Не задан. После замеров T36 добавьте в `config/pricing.yaml` секцию `customer_infrastructure` "
+            "с суточной стоимостью сервера заказчика._",
+            "",
+        ]
+    load = result.load_scenario
+    desc = f" ({customer.description})" if customer.description else ""
+    return [
+        *header,
+        f"Открытые веса на сервере заказчика{desc}. Оплаты за токены нет. Аренда или амортизация, электроэнергия "
+        "и сопровождение входят в суточную стоимость сервера. Нагрузка в токенах и вызовах та же, что на стенде.",
+        "",
+        "| Показатель | Значение |",
+        "|---|---|",
+        f"| Сервер заказчика, ₽/сут. | {_fmt_dec(customer.daily_infra_cost_rub)} |",
+        f"| Итого за {result.period_days} дн. ({result.requests_per_period} обращений), ₽ | "
+        f"{_fmt_dec(customer.period_total_cost_rub)} |",
+        f"| Полная себестоимость 1 обращения (база), ₽ | {_fmt_dec(customer.full_cost_per_request_rub, '0.0001')} |",
+        f"| Чистая экономия за {result.period_days} дн. с учётом передач менеджеру, ₽ | "
+        f"{_fmt_dec(customer.net_savings_period_rub)} |",
+        f"| Итого в сутки при {load.requests_per_day} обращениях/сутки, ₽ | "
+        f"{_fmt_dec(customer.load_daily_total_cost_rub)} |",
+        f"| Полная себестоимость 1 обращения ({load.requests_per_day} обр./сут.), ₽ | "
+        f"{_fmt_dec(customer.load_full_cost_per_request_rub, '0.0001')} |",
+        f"| Чистая экономия в сутки ({load.requests_per_day} обр./сут.), ₽ | "
+        f"{_fmt_dec(customer.load_net_savings_daily_rub)} |",
+        f"| Нагрузка на сервер: входные / выходные токены в сутки ({load.requests_per_day} обр./сут.) | "
+        f"{_fmt_dec(load.daily_tokens_in)} / {_fmt_dec(load.daily_tokens_out)} |",
+        f"| Нагрузка на сервер: LLM-вызовов в сутки ({load.requests_per_day} обр./сут.) | "
+        f"{_fmt_dec(load.daily_llm_calls)} |",
+        "",
+    ]
 
 
 def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) -> str:
@@ -1891,6 +2120,7 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
             f"+ инфраструктура за {result.period_days} дн.), ₽** | **{p_tot}** |",
             f"| Полная себестоимость 1 обращения за период (с инфраструктурой), ₽ | {full_req} |",
             "",
+            *_llm_split_lines(result),
             f"## Сравнение с ручным маршрутом (оператором) — базовый объём "
             f"({result.requests_per_period} обр. / {result.period_days} дн.)",
             "",
@@ -1919,6 +2149,7 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
             "|---|---|",
             f"| Суммарные входные токены в сутки ({load.requests_per_day} обр./сут.) | {l_tok_in_day} |",
             f"| Суммарные выходные токены в сутки ({load.requests_per_day} обр./сут.) | {l_tok_out_day} |",
+            f"| LLM-вызовов в сутки ({load.requests_per_day} обр./сут.) | {_fmt_dec(load.daily_llm_calls, '0.01')} |",
             f"| Переменные расходы в сутки ({load.requests_per_day} × средняя переменная), ₽ | {l_d_var} |",
             f"| Суточная инфраструктура, ₽ | {d_inf} |",
             f"| **Итого в сутки (агент + инфраструктура), ₽** | **{l_d_tot}** |",
@@ -1937,6 +2168,7 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
             f"| Верхняя граница экономии за {load.period_days} дн. (при полном замещении), ₽ | {l_sav_per} |",
             f"| Верхняя граница относительной экономии (при полном замещении), % | {l_sav_pct_cell} |",
             "",
+            *_customer_contour_lines(result),
             "## Разбивка по шагам агента",
             "",
         ]
@@ -1989,15 +2221,21 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
         ]
     )
     for m in sorted(pricing.models.values(), key=lambda x: x.model):
+        note = f" ({m.note})" if m.note else ""
         lines.append(
-            f"| Модель `{m.model}` | вход {m.input_per_1m} / выход {m.output_per_1m} за 1 млн | "
+            f"| Модель `{m.model}` | вход {m.input_per_1m} / выход {m.output_per_1m} за 1 млн{note} | "
             f"{m.currency} | {m.date} | {m.source_url} |"
         )
-    infra = pricing.infrastructure
-    infra_label = f"Инфраструктура ({infra.description})" if infra.description else "Инфраструктура"
-    lines.append(
-        f"| {infra_label} | {infra.daily_cost} / сут. | {infra.currency} | {infra.date} | {infra.source_url} |"
-    )
+    for title, infra in (
+        ("Инфраструктура", pricing.infrastructure),
+        ("Контур заказчика (T36)", pricing.customer_infrastructure),
+    ):
+        if infra is None:
+            continue
+        infra_label = f"{title} ({infra.description})" if infra.description else title
+        lines.append(
+            f"| {infra_label} | {infra.daily_cost} / сут. | {infra.currency} | {infra.date} | {infra.source_url} |"
+        )
     op = pricing.operator
     lines.append(
         f"| Оператор поддержки | {op.hourly_rate_rub} ₽/ч, {op.minutes_per_request} мин/обр. | "
