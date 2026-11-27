@@ -1,4 +1,4 @@
-import { renderEvent } from "./render.js";
+import { buyerUrl, renderEvent } from "./render.js";
 import { quoteEvent, resetQuotes, setupQuotes } from "./quote.js";
 
 const byId = id => document.getElementById(id);
@@ -25,7 +25,7 @@ async function request(path, key, body) {
   const headers = { Accept: "application/json" };
   if (key) headers["Idempotency-Key"] = key;
   if (body) headers["Content-Type"] = "application/json";
-  const res = await fetch(path, {
+  const res = await fetch(buyerUrl(path), {
     method: key ? "POST" : "GET", credentials: "same-origin", cache: "no-store", headers,
     body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(15000)
   });
@@ -51,7 +51,8 @@ function sync() {
     byId("send").disabled = true;
   }
   retry.hidden = !(actionError || historyError);
-  retry.disabled = posting || Date.now() < waitUntil || denied;
+  retry.textContent = denied ? "Начать новый диалог" : "Повторить";
+  retry.disabled = posting || Date.now() < waitUntil || (denied && polling);
   byId("feedback").textContent = actionError || historyError || (posting ? "Отправляем…" : state.receipt ? "Ожидаем ответ…" : "");
 }
 
@@ -78,7 +79,7 @@ function showError(error, isAction) {
   if (error.status === 401 || error.status === 403 || error.status === 404 && !isAction && state.id) {
     denied = true;
     closeStream();
-    text = error.status === 401 ? "Войдите на стенд и обновите страницу." : "Диалог недоступен. Обновите страницу, чтобы начать заново.";
+    text = "Доступ к этому диалогу закончился. Вы можете начать новый.";
     state = {}; save();
     log.replaceChildren(); openHandoffs.clear(); resetQuotes(); target.replaceChildren(); byId("target-label").hidden = true;
     byId("welcome").hidden = false; message.value = "";
@@ -133,7 +134,7 @@ function closeStream() {
 
 function subscribe() {
   if (stream || streamUnavailable || panel.hidden || denied || !window.EventSource) return;
-  const source = new EventSource(base + "/" + encodeURIComponent(state.id) + "/events/stream?after=" + cursor);
+  const source = new EventSource(buyerUrl(base + "/" + encodeURIComponent(state.id) + "/events/stream?after=" + cursor));
   stream = source;
   function fallBack() {
     if (stream !== source) return;
@@ -205,7 +206,7 @@ async function submit(body) {
     if (body.type === "request_document" && receipt.documentId && receipt.kind === body.kind && receipt.quoteId === body.quoteId &&
         receipt.revision === body.revision && /^\/api\/v1\/documents\/[\w.-]+$/.test(receipt.url)) {
       state.receipt = null;
-      const link = document.createElement("a"); link.href = receipt.url; link.download = ""; link.click();
+      const link = document.createElement("a"); link.href = buyerUrl(receipt.url); link.download = ""; link.click();
     } else {
       if (!receipt.actionId || receipt.conversationId !== state.id) throw new Error("Не удалось подтвердить отправку.");
       state.receipt = completedActions.has(receipt.actionId) ? null : receipt.actionId;
@@ -256,6 +257,10 @@ message.onkeydown = event => {
 };
 operator.onclick = () => submit({ type: "request_operator" });
 retry.onclick = () => {
+  if (denied) {
+    denied = false; cursor = 0; operatorOffered = false; streamUnavailable = false;
+    completedActions.clear(); actionError = ""; historyError = "";
+  }
   if (!state.id) connect();
   else if (state.pending) submit(state.pending.body);
   else poll();

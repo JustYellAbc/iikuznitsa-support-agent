@@ -67,6 +67,25 @@ test("Виджет Т09 на примерах контракта", async t => {
     assert.equal(await page.getByText(first.data.text, { exact: true }).count(), 1);
     assert.deepEqual(cursors.slice(0, 2), [0, first.seq]);
   });
+  await t.test("Просроченный диалог можно заменить в виджете одним нажатием", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    await page.addInitScript(() => sessionStorage.setItem("softline.t09.conversation.v1",
+      JSON.stringify({ id: "old", pending: { body: {type: "message", text: "старый запрос"}, uncertain: true } })));
+    await page.route("**/conversations/old/events?*", route =>
+      route.fulfill({ status: 404, json: {code: "not_found", message: "Диалог недоступен"} }));
+    const actions = [];
+    page.on("request", req => { if (new URL(req.url()).pathname.endsWith("/actions")) actions.push(req.postDataJSON()); });
+    await page.goto(url);
+    await page.locator("#launch").click();
+    const created = page.waitForResponse(res => new URL(res.url()).pathname === api && res.status() === 201);
+    await page.getByRole("button", {name: "Начать новый диалог"}).click();
+    assert.equal(new URL((await created).url()).searchParams.get("view"), "buyer");
+    await page.locator("#message").fill("Позовите оператора.");
+    await page.locator("#send").click();
+    await page.getByText("Подскажите, с каким вопросом нужна помощь?", {exact: true}).waitFor();
+    assert.deepEqual(actions, [{type: "message", text: "Позовите оператора."}]);
+  });
   for (const [name, turns] of [
     ["Повтор после ответа", [
       ["Позовите оператора.", "Подскажите, с каким вопросом нужна помощь?"],

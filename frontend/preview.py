@@ -141,18 +141,19 @@ class Preview(BaseHTTPRequestHandler):
         if not key:
             return self.respond(400, {"code": "invalid_input", "message": "Требуется ключ повтора."})
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"null")
-        cache_key = (self.path, key)
+        path = urlsplit(self.path).path
+        cache_key = (path, key)
         if cache_key in self.requests_by_key:
             original, status, result = self.requests_by_key[cache_key]
             if original != body:
                 return self.respond(409, {"code": "key_conflict", "message": "Команда с таким ключом уже принята."})
             return self.respond(status, result)
-        if self.path == API:
+        if path == API:
             cid = uuid4().hex
             self.conversations[cid] = {"scripts": SCRIPTS, "position": 0, "events": []}
             status, result = 201, {"conversationId": cid}
         else:
-            match = re.fullmatch(API + r"/([a-f0-9]+)/actions", self.path)
+            match = re.fullmatch(API + r"/([a-f0-9]+)/actions", path)
             if not match or match[1] not in self.conversations:
                 return self.send_error(404)
             cid = match[1]
