@@ -39,6 +39,30 @@ def test_capabilities_of_named_product_still_use_catalog(stand_api, provider, in
     assert len(requests) == 2 and any(e["type"] == "products" for e in reply)
 
 
+def test_order_tracking_reads_the_verified_guide_before_asking_for_a_product(stand_api, provider, index):  # noqa: F811
+    body = "Откройте личный кабинет ( https://lk.softline.ru/ ). Найдите заказ в списке."
+    with closing(sqlite3.connect(get_settings().catalog_index_path)) as db:
+        db.execute(
+            "INSERT INTO knowledge(title,body,source) VALUES(?,?,?)",
+            ("Просмотр статуса заказа", body, "https://docs.softline.com/ru-ru/lk/view-statuses"),
+        )
+        db.commit()
+    events = say(stand_api, stand_api.new_conversation(), "Где в личном кабинете посмотреть статус моего заказа?")
+    assert events[-1]["sources"][0]["url"] == "https://lk.softline.ru/" and "Найдите заказ" in events[-1]["text"]
+    assert not provider[1]
+
+
+def test_team_size_and_named_product_are_kept_before_another_model_call(stand_api, provider):  # noqa: F811
+    answers, requests = provider
+    answers.append(tool("respond", kind="clarify", question="Какое решение нужно для вашей закупки?"))
+    cid = stand_api.new_conversation()
+    say(stand_api, cid, "Нужен полный комплект на 1000 человек")
+    reply = say(stand_api, cid, "1С Бухгалтерия")
+    assert len(requests) == 1 and "1000" in reply[-1]["text"] and reply[-1]["purpose"] == "clarification"
+    reply = say(stand_api, cid, "Это всего по компании")
+    assert len(requests) == 1 and "Сколько сотрудников" in reply[-1]["text"]
+
+
 @pytest.mark.parametrize(
     ("source", "excerpt", "account_link"),
     [
