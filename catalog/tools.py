@@ -6,14 +6,14 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from catalog.index import search
+from catalog.index import search, source_version
 
 from app.agent.knowledge import ARTICLE_PATH, question_key
 from app.config import get_settings
 from app.contracts.schemas import ToolResult
 from app.db.database import get_db
 from app.services.catalog_snapshot import open_index
-from app.services.price_policy import assess, snapshot_from_row
+from app.services.price_policy import UNDEFINED_TERMS, assess, snapshot_from_row
 
 
 def _results(items: list[dict]) -> ToolResult:
@@ -42,14 +42,24 @@ def _offer(row, version: str, *, detail: bool) -> dict:
     params = row["params"]
     if isinstance(params, str):
         params = json.loads(params)
-    item["seatLimit"] = params.get("К-во пользователей до") or None
-    item["licenseType"] = params.get("Тип лицензии") or None
+    unknown = UNDEFINED_TERMS | {"n/a"}
+
+    def values(key):
+        return [v.strip() for v in params.get(key, []) if v.strip().casefold() not in unknown] or None
+
+    details = row["details"]
+    if isinstance(details, str):
+        details = json.loads(details)
+    item["salesNotes"] = details.get("sales_notes") or None
+    item["seatLimit"] = values("К-во пользователей до")
+    item["licenseType"] = values("Тип лицензии")
     if detail:
         item.update(
-            edition=row["edition"],
-            platform=params.get("Платформа") or None,
-            delivery=params.get("Способ доставки") or None,
-            buyer=params.get("Пользователь") or None,
+            edition=" / ".join(values("Версия") or []) or None,
+            platform=values("Платформа"),
+            delivery=values("Способ доставки"),
+            buyer=values("Пользователь"),
+            organizationType=values("Тип организации"),
         )
     return item
 
@@ -71,14 +81,13 @@ def get_offer(index: Path, offer_id: str) -> ToolResult:
     """Exact offer ID, including non-numeric IDs. Never substitute a different pack."""
     try:
         with open_index(index) as db:
-            row = db.execute(
-                "SELECT o.*, m.snapshot FROM offers o CROSS JOIN metadata m WHERE o.id=?", (offer_id,)
-            ).fetchone()
+            version = source_version(db)
+            row = db.execute("SELECT * FROM offers WHERE id=?", (offer_id,)).fetchone()
     except sqlite3.Error:
         return ToolResult(ok=False, error="catalog_unavailable")
     if row is None or not _public_link(row["source"]):
         return _results([])
-    return _results([_offer(row, row["snapshot"], detail=True)])
+    return _results([_offer(row, version, detail=True)])
 
 
 def search_store_knowledge(index: Path, query: str, *, limit: int = 3) -> ToolResult:
@@ -102,7 +111,7 @@ async def search_published_knowledge(query: str) -> ToolResult:
     if len(query) > 500:
         return ToolResult(ok=False, error="invalid_arguments")
     key = question_key(query)
-    if len(key.split()) < 2:
+    if not key:
         return _results([])
     async with get_db().committed_read() as db:
         rows = await db.execute_fetchall(

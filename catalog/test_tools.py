@@ -1,4 +1,6 @@
 import os
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -24,17 +26,27 @@ def test_exact_and_search(index):  # noqa: F811
     assert not get_offer(index.parent / "missing.db", "new20").ok
 
 
-def test_only_published_answers(api):  # noqa: F811
+@pytest.mark.parametrize("question", [QUESTION, "Доставка?"])
+def test_only_published_answers(api, question):  # noqa: F811
     _, hid = source_case(api)
-    pid = propose(api, hid)
+    pid = propose(api, hid, question=question)
     lookup = api.client.portal.call
-    assert lookup(search_published_knowledge, QUESTION).data == []
+    assert lookup(search_published_knowledge, question).data == []
     assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
-    hit = lookup(search_published_knowledge, QUESTION)
+    hit = lookup(search_published_knowledge, question)
+    assert lookup(search_published_knowledge, " ? ").data == []
     assert hit.data[0]["body"] == ANSWER and hit.data[0]["version"] == pid
     assert hit.source_ref.endswith("/knowledge/" + pid)
     assert api.call("manager", "POST", f"{PATCHES}/{pid}/withdraw").status_code == 204
-    assert lookup(search_published_knowledge, QUESTION).data == []
+    assert lookup(search_published_knowledge, question).data == []
+
+
+def test_missing_metadata_is_an_error_even_for_unknown_offer(index):  # noqa: F811
+    with closing(sqlite3.connect(index)) as db, db:
+        db.execute("DELETE FROM metadata")
+    for query in ("new20", "no-match"):
+        assert get_offer(index, query).error == "catalog_unavailable"
+        assert search_catalog(index, query).error == "catalog_unavailable"
 
 
 @pytest.mark.skipif(not os.getenv("T31_CATALOG_INDEX"), reason="requires the private Softline store index")
@@ -50,3 +62,16 @@ def test_store_snapshot():
     pdf = search_catalog(path, "Нужен редактор PDF", by_need=True, limit=2)
     assert len(pdf.data) == 2 and all("pdf editor" in item["name"].lower() for item in pdf.data)
     assert search_store_knowledge(path, "оплата заказа").data
+    protection = search_catalog(path, "Антивирус для почтового сервера", by_need=True).data
+    assert protection and all("security" in item["name"].casefold() for item in protection)
+    for seats, sku in [(50, "62873"), (100, "62874")]:
+        hits = search_catalog(path, f"Почтовый сервер на {seats} пользователей", by_need=True).data
+        assert sku in {item["offerId"] for item in hits}
+        assert all(int(item["seatLimit"][0]) >= seats for item in hits)
+    assert not search_catalog(path, "Почтовый сервер на 50 ГБ", by_need=True).data
+    for sku, band, price in [("436672", "от 1 до 9", 520000), ("436675", "от 100 до 499", 440000)]:
+        item = get_offer(path, sku).data[0]
+        assert band in item["salesNotes"] and item["unitPriceKopecks"] == price
+    academic = get_offer(path, "505").data[0]
+    assert academic["buyer"] is None and academic["organizationType"] == ["Академическая"]
+    assert get_offer(path, "405958").data[0]["licenseType"] is None

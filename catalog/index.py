@@ -155,6 +155,13 @@ def catalog_lookup(query, expression):
     return f'name:"mdaemon" AND ({expression})'
 
 
+def source_version(db):
+    row = db.execute("SELECT snapshot FROM metadata").fetchone()
+    if not row or not (row[0] or "").strip():
+        raise sqlite3.DatabaseError("Missing catalog snapshot version")
+    return row[0]
+
+
 def search(index, query, scope="catalog", limit=5, *, license_type=None, include_snapshot=False, by_need=False):
     # Quote FTS tokens and bind MATCH to keep raw user input out of query syntax.
     named_family = scope == "catalog" and MDAEMON.search(query)
@@ -169,9 +176,14 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None, include
         elif re.search(r"резервн\w* коп|б[эе]кап|\bbackup\b", query, re.I):
             expression = "category:резервн* AND category:копирован*"
         elif re.search(r"почтов\w+ сервер|почтов\w+ ящик", query, re.I):
-            expression = 'name:"Messaging Server" OR name:"Mail Server"'
+            if re.search(r"антивирус|антиспам|защит\w*|фильтр\w*", query, re.I):
+                expression = '(name:security AND name:почтов*) OR name:"Security Gateway for Email Servers"'
+            else:
+                expression = 'name:"Messaging Server" OR name:"Mail Server"'
     with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
+        if include_snapshot:
+            snapshot = source_version(db)
         if scope == "knowledge":
             rows = db.execute(
                 "SELECT title,body,source FROM knowledge WHERE knowledge MATCH ? "
@@ -184,8 +196,15 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None, include
             ordering = []
             if named_family:
                 ordering.append("CASE WHEN o.name LIKE '%MDaemon Messaging Server%' THEN 0 ELSE 1 END")
-            seats = SEATS.findall(query) if named_family else []
-            capacity = """CAST(json_extract(o.params, '$."К-во пользователей до"[0]') AS INTEGER)"""
+            seats = SEATS.findall(query) if named_family or by_need else []
+            seat_value = """trim(json_extract(o.params, '$."К-во пользователей до"[0]'))"""
+            capacity = (
+                f"CASE WHEN {seat_value} <> '' AND {seat_value} NOT GLOB '*[^0-9]*' "
+                f"THEN CAST({seat_value} AS INTEGER) END"
+            )
+            if by_need and re.search(r"\d\s*(?:[гт]б|[gt]b|гигабайт\w*|терабайт\w*)\b", query, re.I):
+                # The catalog has seat capacity, but no indexed storage-capacity constraint.
+                return []
             if len(seats) == 1:
                 # The feed stores the upper capacity of each pack as a decimal string.
                 size = seats[0].lstrip("0")
@@ -193,7 +212,7 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None, include
                     return []
                 filters.append(f"{capacity} >= ?")
                 bindings.append(int(size))
-            if named_family:
+            if named_family or seats:
                 ordering.append(f"{capacity} ASC NULLS LAST")
             if license_type:
                 filters.append("""EXISTS (SELECT 1 FROM json_each(o.params, '$."Тип лицензии"')
@@ -210,8 +229,7 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None, include
                 [*bindings, limit],
             )
         result = [dict(r) for r in rows]
-        if include_snapshot and result:
-            snapshot = db.execute("SELECT snapshot FROM metadata").fetchone()[0]
+        if include_snapshot:
             for item in result:
                 item["snapshot"] = snapshot
         for item in result:
