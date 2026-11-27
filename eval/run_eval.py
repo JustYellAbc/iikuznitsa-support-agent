@@ -1459,16 +1459,19 @@ class ManagerCostClient:
                 model = args.get("model") or st.get("model")
                 if not isinstance(model, str) or not model.strip():
                     continue
-                calls.append(
-                    {
-                        "step": tool.removeprefix("llm:").strip() or "llm",
-                        "model": model.strip(),
-                        "tokens_in": tokens_in,
-                        "tokens_out": tokens_out,
-                        "cost_rub": float(st.get("cost_rub", 0.0)),
-                        "latency_ms": int(st.get("latency_ms", 0)),
-                    }
-                )
+                record = {
+                    "step": tool.removeprefix("llm:").strip() or "llm",
+                    "model": model.strip(),
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "cost_rub": float(st.get("cost_rub", 0.0)),
+                    "latency_ms": int(st.get("latency_ms", 0)),
+                }
+                # HTTP retries to the provider (llm_call attempts); only the trace records them.
+                attempts = args.get("attempts")
+                if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 1:
+                    record["attempts"] = attempts
+                calls.append(record)
         if has_steps_field:
             return calls
         if all(float(t.get("total_cost_rub", 0.0)) == 0.0 for t in turns_payload):

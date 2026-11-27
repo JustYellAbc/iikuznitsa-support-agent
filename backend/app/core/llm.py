@@ -56,12 +56,14 @@ class LLMResponse:
     tokens_out: int
     cost_rub: float
     latency_ms: int
+    # HTTP-попытки к провайдеру: 2 — был повтор после 429/5xx/сетевой ошибки. Usage есть только у успешной.
+    attempts: int = 1
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_step_trace(self, result_summary: str | None = None) -> StepTrace:
         return StepTrace(
             tool=f"llm:{self.step}",
-            args={"model": self.model},
+            args={"model": self.model, "attempts": self.attempts},
             result_summary=result_summary or _summary(self),
             tokens_in=self.tokens_in,
             tokens_out=self.tokens_out,
@@ -164,7 +166,10 @@ class _AttemptTiming:
             self.marks[f"{phase}.{state}"] = self.elapsed()
 
 
-async def _post_chat(payload: dict[str, Any], session_id: str | None = None, *, step: str = "") -> dict[str, Any]:
+async def _post_chat(
+    payload: dict[str, Any], session_id: str | None = None, *, step: str = ""
+) -> tuple[dict[str, Any], int]:
+    """Ответ провайдера и число HTTP-попыток, которое на него ушло."""
     s = get_settings()
     url = s.llm_base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {s.llm_api_key}"} if s.llm_api_key else {}
@@ -193,7 +198,7 @@ async def _post_chat(payload: dict[str, Any], session_id: str | None = None, *, 
                 break
         else:
             if resp.status_code == 200:
-                return resp.json()
+                return resp.json(), attempt + 1
             last_error = LLMError(f"LLM HTTP {resp.status_code}")
             if resp.status_code not in _RETRY_STATUSES or attempt > 0:
                 break
@@ -262,7 +267,9 @@ async def llm_call(
         payload["max_tokens"] = max_tokens
 
     started = time.perf_counter()
-    data = _mock_completion(messages, model) if s.mock_llm else await _post_chat(payload, session_id, step=step)
+    data, attempts = (
+        (_mock_completion(messages, model), 1) if s.mock_llm else await _post_chat(payload, session_id, step=step)
+    )
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     try:
@@ -299,5 +306,6 @@ async def llm_call(
         tokens_out=tokens_out,
         cost_rub=cost_rub,
         latency_ms=latency_ms,
+        attempts=attempts,
         raw=data,
     )
