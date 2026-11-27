@@ -1,11 +1,17 @@
-# Local credentials and pricing overrides
+# Local credentials, private docs and pricing overrides
 .env
 .env.*
 !.env.example
 !.env.*.example
 config/pricing.yaml
+docs/data_audit.md
+holdout_eval.json
+dev_ids.json
+manifest.json
 *.pem
 *.key
+id_rsa*
+id_ed25519*
 /secrets/
 
 # Local copies of partner data and runtime files

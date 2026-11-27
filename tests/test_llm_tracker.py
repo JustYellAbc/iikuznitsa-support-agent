@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -148,6 +150,82 @@ async def test_client_error_is_not_logged(db):
     with pytest.raises(LLMError):
         await llm_call([{"role": "user", "content": "x"}], step="agent_loop")
     assert await repository.recent_llm_calls() == []
+
+
+async def test_cancelled_provider_wait_reports_phase_without_replaying_or_logging_content(db, caplog):
+    waiting = asyncio.Event()
+
+    async def hang(request):
+        trace = request.extensions["trace"]
+        await trace("http11.send_request_body.complete", {"body": "private-prompt"})
+        await trace("http11.receive_response_headers.started", {"headers": "private-headers"})
+        waiting.set()
+        await asyncio.Future()
+
+    provider(hang)
+    caplog.set_level(logging.INFO, logger=llm.__name__)
+    task = asyncio.create_task(
+        llm_call([{"role": "user", "content": "private-prompt"}], step="support_tools", session_id="c_test")
+    )
+    await asyncio.wait_for(waiting.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    logs = [record.getMessage() for record in caplog.records if record.name == llm.__name__]
+    assert len(logs) == 1
+    assert all(
+        token in logs[0]
+        for token in (
+            "session=c_test",
+            "step=support_tools",
+            "attempt=1",
+            "outcome=cancelled",
+            "phase=receive_response_headers",
+            "send_request_body.complete",
+        )
+    )
+    assert not any(token in logs[0] for token in ("private-prompt", "private-headers", "sk-test"))
+    assert await repository.recent_llm_calls() == []
+
+
+async def test_no_second_inference_after_read_timeout(db, caplog):
+    calls = []
+
+    def fail(request):
+        calls.append(request)
+        raise httpx.ReadTimeout("read timed out")
+
+    provider(fail)
+    caplog.set_level(logging.INFO, logger=llm.__name__)
+    with pytest.raises(LLMError):
+        await llm_call([], step="support_tools")
+    assert len(calls) == 1
+    assert "outcome=ReadTimeout" in caplog.text
+
+
+async def test_go_reconnects_before_request_submission_and_counts_one_completion(db, monkeypatch, caplog):
+    settings = get_settings()
+    settings.llm_base_url = "https://opencode.ai/inference/go/openai/v1/"
+    assert llm._get_client().timeout.connect == min(2.5, settings.llm_timeout_s)
+    await llm.close_http_client()
+    attempts = 0
+
+    def sometimes_reachable(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.ConnectTimeout("unreachable")
+        return ok_response()
+
+    provider(sometimes_reachable)
+    caplog.set_level(logging.INFO, logger=llm.__name__)
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda _: _noop())
+    await llm_call([], step="support_tools")
+    assert attempts == 3
+    assert len(await repository.recent_llm_calls()) == 1
+    records = [rec.getMessage() for rec in caplog.records if rec.name == llm.__name__]
+    assert len({rec.split(" call=")[1].split()[0] for rec in records}) == 1
+    assert "attempt=3 outcome=http_200" in records[-1]
 
 
 async def test_mock_mode_logs_without_network(db):

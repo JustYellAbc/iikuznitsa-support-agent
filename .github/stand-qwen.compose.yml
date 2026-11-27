@@ -1,0 +1,15 @@
+# Override used only by the hackathon stand's manual deployment.
+services:
+  backend:
+    environment:
+      AGENT_ENGINE: tools
+      MOCK_LLM: "false"
+      MODEL_SMART: qwen3.8-flash
+      MODEL_FAST: qwen3.8-flash
+      LLM_BASE_URL: https://opencode.ai/inference/go/openai/v1
+      LLM_API_KEY: ${DEMO_OPENCODE_GO_KEY:?Missing demo credential}
+      # Reference token rates for telemetry and the daily cap. Subscription billing is accounted for separately.
+      MODEL_SMART_PRICE_IN_USD: "0.15"
+      MODEL_SMART_PRICE_OUT_USD: "0.47"
+      MODEL_FAST_PRICE_IN_USD: "0.15"
+      MODEL_FAST_PRICE_OUT_USD: "0.47"

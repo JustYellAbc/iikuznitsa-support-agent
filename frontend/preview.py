@@ -102,6 +102,8 @@ FILES = {
     "chat.js": "text/javascript",
     "render.js": "text/javascript",
     "quote.js": "text/javascript",
+    "softline.png": "image/png",
+    "softline-white.png": "image/png",
 }
 
 
@@ -130,7 +132,8 @@ class Preview(BaseHTTPRequestHandler):
         if url.path.startswith("/chat/") and name in FILES:
             raw = (FRONTEND / "chat" / name).read_bytes()
             self.send_response(200)
-            self.send_header("Content-Type", FILES[name] + "; charset=utf-8")
+            mime = FILES[name]
+            self.send_header("Content-Type", mime + "; charset=utf-8" if mime.startswith("text/") else mime)
             self.end_headers()
             self.wfile.write(raw)
             return
@@ -141,18 +144,19 @@ class Preview(BaseHTTPRequestHandler):
         if not key:
             return self.respond(400, {"code": "invalid_input", "message": "Требуется ключ повтора."})
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"null")
-        cache_key = (self.path, key)
+        path = urlsplit(self.path).path
+        cache_key = (path, key)
         if cache_key in self.requests_by_key:
             original, status, result = self.requests_by_key[cache_key]
             if original != body:
                 return self.respond(409, {"code": "key_conflict", "message": "Команда с таким ключом уже принята."})
             return self.respond(status, result)
-        if self.path == API:
+        if path == API:
             cid = uuid4().hex
             self.conversations[cid] = {"scripts": SCRIPTS, "position": 0, "events": []}
             status, result = 201, {"conversationId": cid}
         else:
-            match = re.fullmatch(API + r"/([a-f0-9]+)/actions", self.path)
+            match = re.fullmatch(API + r"/([a-f0-9]+)/actions", path)
             if not match or match[1] not in self.conversations:
                 return self.send_error(404)
             cid = match[1]

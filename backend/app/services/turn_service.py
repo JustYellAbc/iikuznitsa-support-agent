@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from app.agent import runner
+from app.agent.handoff import SERVICE_FAILURE, open_question, opening_chatter
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Mode, Session, StepTrace
 from app.contracts.t04 import HandoffData, MessageData, ProductsData
@@ -19,7 +20,6 @@ from app.services import quotes
 
 log = logging.getLogger(__name__)
 
-HANDOFF_TEXT = "Передал ваш вопрос оператору — он ответит здесь же, в этом чате."
 PILOT_TEXT = "Готовлю ответ, оператор проверит его и пришлёт сюда."
 
 _busy: set[str] = set()
@@ -85,7 +85,7 @@ def _fallback(session: Session, steps: list[StepTrace], started: float, reason: 
     # question видят обе роли: только вопрос покупателя, без внутренних причин
     return AgentReply(
         turn=turn,
-        text=HANDOFF_TEXT,
+        text=SERVICE_FAILURE,
         purpose="notice",
         handoff=HandoffRequest(reason="technical", question=question[:8000]),
     )
@@ -145,9 +145,17 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
     request = reply.handoff or HandoffRequest(
         reason="insufficient_evidence", question=(reply.text or "Нужна помощь оператора.")[:8000]
     )
+    if opening_chatter(request.question.strip().casefold()):
+        subject = open_question(await repository.history_messages(cid), request.question, True)
+        if opening_chatter(subject.strip().casefold()):
+            subject = "Покупатель подтвердил запрос помощи."
+        request = request.model_copy(update={"question": subject})
     datas = _reply_events(reply)
     async with get_db().tx() as conn:
         existing = await repository.find_open_handoff(cid, request.reason)
+        written = await append_reply(conn, cid, action_id, datas) if datas else []
+        if existing is None and len(request.products) == 1:
+            existing = await repository.find_open_quote_handoff(cid, request.reason, request.products[0].offerId)
         if existing is None:
             handoff = await repository.create_handoff(
                 cid,
@@ -157,8 +165,9 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
                 [p.model_dump(mode="json") for p in request.products],
                 conn=conn,
             )
-            datas.append(HandoffData(handoff=handoff).model_dump(mode="json"))
-        written = await append_reply(conn, cid, action_id, datas) if datas else []
+            written.extend(
+                await append_reply(conn, cid, action_id, [HandoffData(handoff=handoff).model_dump(mode="json")])
+            )
     events.publish(cid, written)
 
 

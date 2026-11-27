@@ -53,3 +53,5 @@ details summary { cursor: pointer; margin: 16px 0 8px; }
   #queue { max-height: 195px; }
   .panel { padding: 16px; }
 }
+#purchase-lines button { display: block; width: 100%; text-align: left; margin-bottom: 4px; }
+#purchase-lines button[aria-pressed="true"] { border-color: #356a88; background: #edf4f8; }

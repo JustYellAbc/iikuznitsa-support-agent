@@ -4,6 +4,11 @@ name: Deploy stand
 
 on:
   workflow_dispatch:
+    inputs:
+      demo_qwen:
+        description: "Использовать Qwen через OpenCode Go на конкурсном стенде после подключения T32"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -66,22 +71,53 @@ jobs:
           fi
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Deploy origin/main
+      - name: Prepare tested main revision
+        id: revision
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           # Без git clean: .env и ./data не отслеживаются git и должны пережить деплой
           ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
-            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'EOF'
+            "$DEPLOY_USER@$DEPLOY_HOST" "bash -s -- $GITHUB_SHA" >> "$GITHUB_OUTPUT" <<'EOF'
           set -euo pipefail
           cd /opt/stand
-          git fetch origin main
-          git checkout main
-          git reset --hard origin/main
-          echo "Deploying $(git log --oneline -1)"
-          docker compose up -d --build --remove-orphans
+          git fetch origin main >&2
+          if [ "$(git rev-parse origin/main)" != "$1" ]; then
+            echo "main changed during checks; start a deployment for its new revision" >&2
+            exit 1
+          fi
+          git checkout main >&2
+          git reset --hard "$1" >&2
+          if test -f backend/app/agent/tool_agent.py; then echo 'tools=true'; else echo 'tools=false'; fi
           EOF
+
+      - name: Start stand with existing configuration
+        if: ${{ !inputs.demo_qwen || steps.revision.outputs.tools != 'true' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/stand && docker compose up -d --build --remove-orphans'
+
+      - name: Start demo Qwen backend
+        if: ${{ inputs.demo_qwen && steps.revision.outputs.tools == 'true' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEMO_OPENCODE_GO_KEY: ${{ secrets.DEMO_OPENCODE_GO_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KNOWN_HOSTS" || { echo "::error::Set DEPLOY_KNOWN_HOSTS for the demo host"; exit 1; }
+          test -n "$DEMO_OPENCODE_GO_KEY" || { echo "::error::Set DEMO_OPENCODE_GO_KEY"; exit 1; }
+          printf '%s\n' "$DEMO_OPENCODE_GO_KEY" | ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'set -eu
+              cd /opt/stand
+              IFS= read -r DEMO_OPENCODE_GO_KEY
+              export DEMO_OPENCODE_GO_KEY
+              exec docker compose -f docker-compose.yml -f .github/stand-qwen.compose.yml up -d --build --remove-orphans'
 
       - name: Health check
         env:

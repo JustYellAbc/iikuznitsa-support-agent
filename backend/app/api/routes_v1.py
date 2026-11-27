@@ -15,9 +15,10 @@ from app.contracts.t04 import (
     EventPage,
     HandoffList,
     ManagerDecision,
+    MessageAction,
     Receipt,
 )
-from app.core import auth, events
+from app.core import auth, events, prefilter
 from app.core.auth import Principal, require_manager, require_principal
 from app.core.errors import ApiError, not_found
 from app.db import repository
@@ -42,6 +43,9 @@ ERRORS = {
 
 def _json(result: tuple[int, dict]) -> JSONResponse:
     status, payload = result
+    if payload.get("_open_quote_form"):
+        body = {k: v for k, v in payload.items() if k != "_open_quote_form"}
+        return JSONResponse(body, status_code=status, headers={"X-Chat-Action": "open-quote-form"})
     return JSONResponse(payload, status_code=status)
 
 
@@ -66,7 +70,8 @@ async def create_conversation(request: Request, key: IdempotencyKey) -> JSONResp
     )
     response = _json(result)
     if token is not None:
-        auth.set_session_cookie(request, response, token, "customer")
+        name = auth.BUYER_COOKIE if auth.buyer_view(request) else auth.COOKIE
+        auth.set_session_cookie(request, response, token, "customer", name=name)
     return response
 
 
@@ -88,6 +93,9 @@ async def submit_action(
     """Реплика, вызов оператора, подтверждение расчёта или запрос документа. Результат — в журнале."""
     if principal.role != "customer":
         raise ApiError(403, "forbidden", "Команда доступна покупателю.")
+    if isinstance(action, MessageAction):
+        # До Idempotency-Key, журнала и очереди хода: отказ ничего не занимает и не пишет.
+        prefilter.check_message_length(action.text)
     body = action.model_dump(mode="json")
     return _json(
         await svc.idempotent(
@@ -201,6 +209,12 @@ async def download_document(documentId: PathId, principal: Principal = Depends(r
     return await quote_preview(row["conversation_id"], row["quote_id"], row["revision"], principal)
 
 
+@router.get("/conversations/{conversationId}/quotes/history", tags=["КП"])
+async def quote_history(conversationId: PathId, principal: Principal = Depends(require_principal)):
+    await svc.conversation_for(principal, conversationId)
+    return {"revisions": await quotes.revision_history(conversationId)}
+
+
 @router.get("/conversations/{conversationId}/quotes/{quoteId}/{revision}/preview.pdf", tags=["КП"])
 async def quote_preview(
     conversationId: PathId,
@@ -260,6 +274,7 @@ async def quote_inputs(conversationId: PathId, principal: Principal = Depends(re
         if principal.role == "customer" and row and not row["reselect"]:
             await quotes.require_published(row)
         choices = await quotes.selectable_products(conversationId)
+        selected = await repository.last_products(conversationId)
     snapshot = quotes.read(row) if row else None
     reselect = bool(row and row["reselect"])
     return JSONResponse(
@@ -267,6 +282,7 @@ async def quote_inputs(conversationId: PathId, principal: Principal = Depends(re
             "revision": snapshot.quote.revision if snapshot else 0,
             "requiresReselection": reselect,
             "choices": [{"offerId": offer_id, "name": name} for offer_id, name in choices.items()],
+            "selection": [{"offerId": p["offerId"], "priceState": p["priceState"]} for p in selected],
             "customer": snapshot.customer.model_dump() if snapshot else None,
             "items": [{"offerId": d.product.offerId, "packages": d.packages} for d in snapshot.details]
             if snapshot and not reselect
@@ -286,6 +302,7 @@ async def manager_login(request: Request, body: ManagerLogin) -> JSONResponse:
         raise ApiError(401, "unauthenticated", "Неверный логин или пароль.")
     principal, token = await auth.create_session("manager", f"manager:{body.username}")
     response = JSONResponse({"role": principal.role})
+    await auth.preserve_legacy_buyer(request, response)
     auth.set_session_cookie(request, response, token, "manager")
     return response
 

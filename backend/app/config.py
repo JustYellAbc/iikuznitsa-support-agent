@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import AnyUrl, UrlConstraints
+from pydantic import AnyUrl, Field, UrlConstraints
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     mock_llm: bool = True
+    agent_engine: Literal["rules", "tools"] = "rules"
+    agent_max_model_calls: int = Field(default=30, gt=0)
+    agent_max_tool_calls: int = Field(default=30, gt=0)
+    agent_turn_timeout_s: float = Field(default=30.0, gt=0, allow_inf_nan=False)
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_proxy_url: str = ""
@@ -28,7 +32,6 @@ class Settings(BaseSettings):
     rate_limit_ip_per_min: int = 60
     rate_limit_session_msg_per_min: int = 10
     max_turns_per_session: int = 30
-    max_message_chars: int = 4000
 
     operator_user: str = "manager"
     operator_password: str = ""

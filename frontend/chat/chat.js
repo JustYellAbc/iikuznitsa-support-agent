@@ -1,16 +1,21 @@
-import { renderEvent } from "./render.js";
+import { buyerUrl, renderEvent } from "./render.js";
 import { quoteEvent, resetQuotes, setupQuotes } from "./quote.js";
 
 const byId = id => document.getElementById(id);
 const panel = byId("chat"), launch = byId("launch"), message = byId("message");
-const log = byId("log"), retry = byId("retry"), operator = byId("operator"), target = byId("target");
+const log = byId("log"), retry = byId("retry"), operator = byId("operator");
+const recipient = byId("recipient"), recipientSummary = byId("recipient-summary");
 const storageKey = "softline.t09.conversation.v1";
 const base = "/api/v1/conversations";
 const newKey = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+// T33: the server counts Unicode code points of the sent text, not UTF-16 units; CRLF is one line break.
+const maxChars = 500;
+const charCount = text => Array.from(text.replace(/\r\n/g, "\n")).length;
 let state;
 try { state = JSON.parse(sessionStorage.getItem(storageKey)) || {}; } catch { state = {}; }
 function save() { sessionStorage.setItem(storageKey, JSON.stringify(state)); }
 const openHandoffs = new Map();
+let recipientId = "";
 const completedActions = new Set();
 // T12's OFFER_HELP is delivered as a clarification in the current T04 wire format.
 const operatorQuestion = "Подключить оператора, чтобы он уточнил ваш вопрос?";
@@ -25,7 +30,7 @@ async function request(path, key, body) {
   const headers = { Accept: "application/json" };
   if (key) headers["Idempotency-Key"] = key;
   if (body) headers["Content-Type"] = "application/json";
-  const res = await fetch(path, {
+  const res = await fetch(buyerUrl(path), {
     method: key ? "POST" : "GET", credentials: "same-origin", cache: "no-store", headers,
     body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(15000)
   });
@@ -36,12 +41,18 @@ async function request(path, key, body) {
     throw error;
   }
   if (!res.headers.get("Content-Type")?.includes("application/json")) throw new Error("Стенд пока не предоставил API чата.");
+  if (res.headers.get("X-Chat-Action") === "open-quote-form") data.openQuoteForm = true;
   return data;
 }
 
 function sync() {
   const locked = posting || denied || !state.id || Date.now() < waitUntil;
-  byId("send").disabled = locked || !message.value.trim();
+  const length = charCount(message.value.trim());
+  const tooLong = length > maxChars;
+  byId("counter").textContent = length + " / " + maxChars;
+  byId("counter").classList.toggle("over", tooLong);
+  message.setAttribute("aria-invalid", String(tooLong));
+  byId("send").disabled = locked || !message.value.trim() || tooLong;
   operator.hidden = denied || !operatorOffered || openHandoffs.size > 0;
   operator.disabled = locked || operator.hidden || Boolean(state.receipt);
   // After an ambiguous network error only replay the exact original command.
@@ -51,25 +62,49 @@ function sync() {
     byId("send").disabled = true;
   }
   retry.hidden = !(actionError || historyError);
-  retry.disabled = posting || Date.now() < waitUntil || denied;
-  byId("feedback").textContent = actionError || historyError || (posting ? "Отправляем…" : state.receipt ? "Ожидаем ответ…" : "");
+  retry.textContent = denied ? "Начать новый диалог" : "Повторить";
+  retry.disabled = posting || Date.now() < waitUntil || (denied && polling);
+  const shorten = tooLong ? "Сообщение длиннее " + maxChars + " символов (сейчас " + length + "). Сократите его, чтобы отправить." : "";
+  byId("feedback").textContent = shorten || actionError || historyError || (posting ? "Отправляем…" : state.receipt ? "Ожидаем ответ…" : "");
 }
 
+function updateRecipientSummary() {
+  const current = openHandoffs.get(recipientId);
+  recipientSummary.textContent = current ? "Сообщение оператору" : "Сообщение ассистенту";
+  if (current && openHandoffs.size > 1) recipientSummary.textContent += " · " + current.question;
+}
+
+function renderRecipients() {
+  recipient.hidden = !openHandoffs.size;
+  updateRecipientSummary();
+  const fields = byId("recipients");
+  fields.querySelectorAll("label").forEach(label => label.remove());
+  const options = [...openHandoffs].map(([id, item]) =>
+    [id, openHandoffs.size > 1 ? "Оператор · " + item.question : "Оператор"]);
+  options.push(["", "Ассистент"]);
+  for (const [id, title] of options) {
+    const label = document.createElement("label"), radio = document.createElement("input");
+    radio.type = "radio"; radio.name = "recipient"; radio.value = id; radio.checked = recipientId === id;
+    label.append(radio, title); fields.append(label);
+  }
+}
+
+byId("recipients").onchange = event => {
+  recipientId = event.target.value;
+  state.recipientChoice = { seq: cursor, id: recipientId }; save();
+  recipient.open = false;
+  updateRecipientSummary(); message.focus();
+};
+
 function updateHandoffs(handoff) {
-  const selected = target.value;
   const hadRecipient = openHandoffs.size > 0;
   if (handoff.status === "open") openHandoffs.set(handoff.handoffId, handoff);
   else openHandoffs.delete(handoff.handoffId);
-  target.replaceChildren();
-  for (const [id, item] of openHandoffs) target.add(new Option("Менеджеру — " + item.question, id));
-  target.add(new Option("Агенту поддержки", ""));
-  if (openHandoffs.has(selected) || (hadRecipient && !selected)) target.value = selected;
-  byId("target-label").hidden = openHandoffs.size === 0;
-  if ([...openHandoffs.values()].some(item => item.quoteLine)) {
-    byId("quote-open").textContent = "Изменить количество в КП";
-  } else if (handoff.quoteLine) {
-    byId("quote-open").textContent = "Изменить КП";
+  if (!hadRecipient || (recipientId && !openHandoffs.has(recipientId))) {
+    recipientId = openHandoffs.keys().next().value || "";
   }
+  if (!openHandoffs.size) recipient.open = false;
+  renderRecipients();
 }
 
 function showError(error, isAction) {
@@ -78,9 +113,9 @@ function showError(error, isAction) {
   if (error.status === 401 || error.status === 403 || error.status === 404 && !isAction && state.id) {
     denied = true;
     closeStream();
-    text = error.status === 401 ? "Войдите на стенд и обновите страницу." : "Диалог недоступен. Обновите страницу, чтобы начать заново.";
+    text = "Доступ к этому диалогу закончился. Вы можете начать новый.";
     state = {}; save();
-    log.replaceChildren(); openHandoffs.clear(); resetQuotes(); target.replaceChildren(); byId("target-label").hidden = true;
+    log.replaceChildren(); openHandoffs.clear(); resetQuotes(); recipientId = ""; recipient.open = false; renderRecipients();
     byId("welcome").hidden = false; message.value = "";
   }
   if (error.retryAfter > 0) {
@@ -105,11 +140,21 @@ function display(event) {
         updateHandoffs({...item,status:"resolved"});
     }
   }
-  log.append(renderEvent(event, state.id, submit));
-  quoteEvent(event.data);
+  const cardLinks = new Set();
+  if (event.data.type === "message" && event.data.author === "agent" && event.data.sources.length) {
+    const cards = log.querySelectorAll(`[data-products-for="${CSS.escape(event.actionId)}"] .result a[href]`);
+    for (const link of cards) cardLinks.add(link.href);
+  }
+  const row = renderEvent(event, state.id, submit, cardLinks);
+  log.append(row);
+  quoteEvent(event.data, row);
   byId("welcome").hidden = true;
   cursor = event.seq;
   if (event.data.type === "handoff") updateHandoffs(event.data.handoff);
+  if (state.recipientChoice?.seq === cursor && (!state.recipientChoice.id || openHandoffs.has(state.recipientChoice.id))) {
+    recipientId = state.recipientChoice.id;
+    renderRecipients();
+  }
   const { type, author, purpose, handoffId } = event.data;
   if (type === "message") {
     operatorOffered = author === "agent" && purpose === "clarification" &&
@@ -133,7 +178,7 @@ function closeStream() {
 
 function subscribe() {
   if (stream || streamUnavailable || panel.hidden || denied || !window.EventSource) return;
-  const source = new EventSource(base + "/" + encodeURIComponent(state.id) + "/events/stream?after=" + cursor);
+  const source = new EventSource(buyerUrl(base + "/" + encodeURIComponent(state.id) + "/events/stream?after=" + cursor));
   stream = source;
   function fallBack() {
     if (stream !== source) return;
@@ -205,13 +250,14 @@ async function submit(body) {
     if (body.type === "request_document" && receipt.documentId && receipt.kind === body.kind && receipt.quoteId === body.quoteId &&
         receipt.revision === body.revision && /^\/api\/v1\/documents\/[\w.-]+$/.test(receipt.url)) {
       state.receipt = null;
-      const link = document.createElement("a"); link.href = receipt.url; link.download = ""; link.click();
+      const link = document.createElement("a"); link.href = buyerUrl(receipt.url); link.download = ""; link.click();
     } else {
       if (!receipt.actionId || receipt.conversationId !== state.id) throw new Error("Не удалось подтвердить отправку.");
       state.receipt = completedActions.has(receipt.actionId) ? null : receipt.actionId;
     }
     delete state.pending; save();
     if (body.type === "message") message.value = "";
+    if (receipt.openQuoteForm && !panel.hidden) openChatQuote();
     poll();
   } catch (error) {
     if (error.status && error.status < 500 && state.pending) {
@@ -225,9 +271,10 @@ async function submit(body) {
 
 function sendText() {
   const text = message.value.trim();
-  if (!text || byId("send").disabled) return;
+  // An over-long draft stays in the field untouched; the hint asks to shorten it.
+  if (!text || charCount(text) > maxChars || byId("send").disabled) { sync(); return; }
   const body = { type: "message", text };
-  if (target.value) body.handoffId = target.value;
+  if (recipientId) body.handoffId = recipientId;
   submit(body);
 }
 
@@ -242,7 +289,11 @@ function close() {
   clearTimeout(timer); launch.focus();
 }
 byId("close").onclick = close;
-panel.onkeydown = event => { if (event.key === "Escape") close(); };
+panel.onkeydown = event => {
+  if (event.key !== "Escape") return;
+  if (recipient.open) { recipient.open = false; recipientSummary.focus(); }
+  else close();
+};
 byId("compose").onsubmit = event => { event.preventDefault(); sendText(); };
 message.oninput = () => {
   if (state.pending?.body.type === "message" && !state.pending.uncertain && message.value.trim() !== state.pending.body.text) {
@@ -256,9 +307,13 @@ message.onkeydown = event => {
 };
 operator.onclick = () => submit({ type: "request_operator" });
 retry.onclick = () => {
+  if (denied) {
+    denied = false; cursor = 0; operatorOffered = false; streamUnavailable = false;
+    completedActions.clear(); actionError = ""; historyError = "";
+  }
   if (!state.id) connect();
   else if (state.pending) submit(state.pending.body);
   else poll();
 };
 if (state.pending) actionError = "Отправка не подтверждена. Можно повторить.";
-setupQuotes(() => state.id, request, newKey);
+const openChatQuote = setupQuotes(() => state.id, request, newKey);

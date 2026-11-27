@@ -39,12 +39,203 @@ test("Виджет Т09 на примерах контракта", async t => {
     const cards = page.locator("#log .result");
     await cards.nth(2).waitFor();
     const card = id => cards.filter({ has: page.locator('a[href*="-' + id + '/"]') });
-    assert.match((await card("61557").innerText()).replace(/\s/g, " "), /4 900 ₽ за единицу по карточке/);
+    assert.match((await card("61557").innerText()).replace(/\s/g, " "), /Цена позиции: 4 900 ₽/);
     assert.match(await card("61557").innerText(), /Срок лицензии неизвестен/);
     assert.match(await card("48093").innerText(), /Наличие требует подтверждения/);
     assert.match(await card("504").innerText(), /Цена по запросу/);
     assert.doesNotMatch(await card("504").innerText(), /₽/);
+    await page.locator("#log .handoff").waitFor();
+    for (const link of await cards.locator("a").all()) {
+      const href = await link.getAttribute("href");
+      assert.equal(await page.locator(`#log a[href="${href}"]`).count(), 1);
+    }
+    assert.equal(await page.locator("#log .entry:has(.result) .quote-open").count(), 1);
+    assert.equal(await page.locator("footer .quote-open").count(), 0);
+    await page.route("**/quotes/current?*", route => route.fulfill({ json: {
+      revision: 0, items: [], choices: [{ offerId: "61557", name: "BookOffice" }]
+    } }));
+    await page.getByRole("button", { name: "Подготовить КП" }).click();
+    assert.equal(await page.getByLabel("BookOffice · ID 61557").isChecked(), true);
+    await page.getByRole("button", { name: "Закрыть", exact: true }).click();
+    for (const logo of await page.locator(".brand img, .wordmark").all()) {
+      assert.ok(await logo.evaluate(img => img.complete && img.naturalWidth > 0));
+    }
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  });
+  await t.test("Статья остаётся рядом с подборкой, а новый ответ сохраняет свой источник", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    const steps = cases.find(item => item.id === "c-price").steps;
+    const batch = structuredClone(steps.find(step => step.operationId === "readEvents").response.events);
+    const reply = batch.find(e => e.data.author === "agent");
+    const article = {url: "https://support.softline.ru/kb/demo", label: "Как оформить заказ"};
+    reply.data.sources.push(article);
+    batch.push({...reply, seq: batch.at(-1).seq + 1, actionId: "later-turn",
+      data: {...reply.data, text: "Отдельный ответ", sources: [reply.data.sources[0]]}});
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({json:{events:batch.filter(e => e.seq > after),nextAfter:batch.at(-1).seq,hasMore:false}});
+    });
+    await page.route("**/events/stream?*", route => route.abort());
+    await page.goto(url);
+    await page.locator("#launch").click();
+    await page.getByText("Отдельный ответ", {exact:true}).waitFor();
+    assert.equal(await page.locator(`#log a[href="${article.url}"]`).count(), 1);
+    assert.equal(await page.locator(`#log a[href="${reply.data.sources[0].url}"]`).count(), 2);
+  });
+  await t.test("Единица цены сохраняется от карточки до КП, количество лицензий не становится количеством заказа", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    await page.addInitScript(() => { window.EventSource = undefined; });
+    const cases = [
+      ["380385", "Microsoft Windows 11 Pro FQC-10572, электронный ключ", 3044800, "Цена электронного ключа: 30 448 ₽"],
+      ["460481", "ООО ПКФ «Информ-Сервис» ПК ИС Заготовка 36и6 (лицензия), ПК ИС Заготовка 36и6 (комплект на 3 пользователя)", 10459000, "Цена комплекта: 104 590 ₽"],
+      ["61557", "SunRav Software BookOffice (лицензии), Лицензия на 1 ПК", 490000, "Цена позиции: 4 900 ₽"],
+      ["204194", "ООО «МАКСИМА» МАКСИМА (базовый комплект лицензий),", 6000000, "Цена комплекта: 60 000 ₽"],
+      ["538468", "ООО «АВИ» Uvatron Lite (электронная лицензия на 1 устройство), Тип поставки: Электронный ключ", 2999000, "Цена электронного ключа: 29 990 ₽"],
+      ["accessory", "Оборудование (для электронного ключа)", 10000, "Цена позиции: 100 ₽"],
+    ];
+    const products = cases.map(([offerId, name, unitPriceKopecks]) => ({ offerId, name, unitPriceKopecks,
+      priceState: "listed", source: {url: "https://example.org/" + offerId, label: "Карточка"} }));
+    const lines = products.map(product => ({...product, packages: 2}));
+    const data = [{type: "products", products}, {type: "quote", quote: {quoteId: "q", revision: 1, lines, terms: {}}}];
+    const events = data.map((data, i) => ({seq: i + 1, at: "2026-11-27T12:00:00Z", data}));
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({json: {events: events.slice(after), nextAfter: events.length, hasMore: false}});
+    });
+    await page.route("**/quotes/current?*", route => route.fulfill({json: {revision: 1, choices: products, items: lines}}));
+    await page.goto(url);
+    await page.locator("#launch").click();
+    const edit = page.getByRole("button", {name: "Изменить КП"});
+    await edit.waitFor();
+    for (const [id, name, , price] of cases) {
+      const card = page.locator(".result").filter({hasText: "Артикул " + id});
+      await card.getByText(price, {exact: true}).waitFor();
+      await page.getByText(name + " · " + price + " · Количество: 2", {exact: true}).waitFor();
+    }
+    await edit.click();
+    const qty = page.getByRole("spinbutton", {name: "Количество: " + cases[1][1]});
+    assert.equal(await qty.inputValue(), "2");
+    await qty.fill("4");
+    await page.getByLabel("Организация").fill("ООО Проверка");
+    await page.getByLabel("ИНН").fill("7700000001");
+    await page.getByLabel("КПП").fill("770001001");
+    const submitUrl = "**/quotes?*";
+    await page.route(submitUrl, route => route.fulfill({status: 202, json: {actionId: "a-test"}}));
+    const sent = page.waitForRequest(submitUrl);
+    await page.getByRole("button", {name: "Подтвердить выбор и получить КП"}).click();
+    const expectedItems = products.map(({offerId}) => ({offerId, packages: offerId === "460481" ? 4 : 2}));
+    assert.deepEqual((await sent).postDataJSON().items, expectedItems);
+  });
+  await t.test("Подборки открывают собственные позиции, изменить можно только актуальный расчёт", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    await page.addInitScript(() => { window.EventSource = undefined; });
+    const product = id => ({ offerId: id, name: "Товар " + id, source: { url: "https://example.org/" + id, label: id },
+      priceState: "listed", unitPriceKopecks: 100 });
+    const quote = revision => ({ type: "quote", quote: { quoteId: "q", revision, lines: [], terms: {} } });
+    const data = [{ type: "products", products: [product("A")] }, { type: "products", products: [product("B")] },
+      quote(1), quote(2)];
+    const journal = data.map((data, index) => ({ seq: index + 1, at: "2026-11-27T12:00:00Z", data }));
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({ json: { events: journal.slice(after), nextAfter: journal.length, hasMore: false } });
+    });
+    const saved = { revision: 2, items: [{ offerId: "B", packages: 3 }], choices: ["A", "B"].map(product) };
+    await page.route("**/quotes/history?*", route => route.fulfill({json:{revisions:[
+      {quoteId:"q",revision:2,previous:1,changes:["Позиция B · количество 1 → 3 уп."]}
+    ]}}));
+    await page.route("**/quotes/current?*", route => route.fulfill({ json: saved }));
+    await page.goto(url);
+    await page.locator("#launch").click();
+    const prepare = page.getByRole("button", { name: "Подготовить КП" });
+    const edit = page.getByRole("button", { name: "Изменить КП" });
+    const close = page.getByRole("button", { name: "Закрыть", exact: true });
+    await edit.nth(1).waitFor();
+    await page.getByText("Изменения к версии 1. Позиция B · количество 1 → 3 уп.").waitFor();
+    assert.equal(await page.getByText("Предыдущая версия", {exact:true}).count(), 1);
+    assert.equal(await page.getByText("Последняя версия в чате", {exact:true}).count(), 1);
+    for (const [index, id] of ["A", "B"].entries()) {
+      await prepare.nth(index).click();
+      await page.getByRole("checkbox", { name: "Товар " + id + " · ID " + id }).waitFor();
+      assert.equal(await page.getByRole("checkbox").count(), 1);
+      await close.click();
+    }
+    assert.equal(await edit.first().isDisabled(), true);
+    await edit.nth(1).click();
+    await page.getByLabel("Количество: Товар B").waitFor();
+    assert.equal(await page.getByLabel("Количество: Товар B").inputValue(), "3");
+    await close.click();
+    saved.revision = 3;
+    await edit.nth(1).click();
+    await page.getByText("КП изменилось. Откройте последнюю версию расчёта в чате.").waitFor();
+    assert.equal(await page.locator('#quote-form [type="submit"]').isDisabled(), true);
+  });
+  await t.test("Адресат сохраняется после перезагрузки и сбрасывается после закрытия обращений", async t => {
+    const page = await browser.newPage({ viewport: { width: 320, height: 690 } });
+    t.after(() => page.close());
+    await page.addInitScript(() => { window.EventSource = undefined; });
+    const journal = [];
+    function handoff(id, question, status) {
+      const seq = journal.length + 1;
+      journal.push({ seq, at: "2026-11-27T12:00:00Z", actionId: "action-" + seq,
+        data: { type: "handoff", handoff: { handoffId: id, question, status } } });
+    }
+    handoff("first", "Срок лицензии", "open");
+    handoff("second", "Условия поставки", "open");
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({ json: { events: journal.slice(after), nextAfter: journal.length, hasMore: false } });
+    });
+    await page.goto(url);
+    const open = () => page.locator("#launch").click();
+    await open();
+    const summary = page.locator("#recipient-summary");
+    await summary.click();
+    await page.getByLabel("Оператор · Условия поставки").check();
+    assert.match(await summary.textContent(), /Условия поставки/);
+    await page.reload();
+    await open();
+    await page.getByText("Сообщение оператору · Условия поставки", { exact: true }).waitFor();
+    await summary.click();
+    await page.getByRole("radio", { name: "Ассистент", exact: true }).click();
+    assert.equal(await summary.textContent(), "Сообщение ассистенту");
+    const sent = page.waitForRequest(req => new URL(req.url()).pathname.endsWith("/actions"));
+    await page.locator("#message").fill("Теперь вопрос ассистенту");
+    await page.locator("#send").click();
+    assert.deepEqual((await sent).postDataJSON(), { type: "message", text: "Теперь вопрос ассистенту" });
+    handoff("first", "Срок лицензии", "resolved");
+    handoff("second", "Условия поставки", "resolved");
+    await page.reload();
+    await open();
+    await page.getByText("Обращение закрыто", { exact: true }).last().waitFor();
+    assert.equal(await page.locator("#recipient").isVisible(), false);
+  });
+  await t.test("Подтверждение из чата открывает форму с обеими выбранными позициями", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    const selection = [{offerId: "office", priceState: "on_request"}, {offerId: "av", priceState: "on_request"}];
+    await page.route("**/quotes/current?*", route => route.fulfill({json: {
+      revision: 0, requiresReselection: false, customer: null, items: [], selection,
+      choices: [...selection, {offerId: "old"}].map(p => ({offerId: p.offerId, name: p.offerId}))
+    }}));
+    await page.route("**/actions?*", route => {
+      const cid = new URL(route.request().url()).pathname.split("/")[4];
+      return route.fulfill({status: 202, headers: {"X-Chat-Action": "open-quote-form"},
+        json: {conversationId: cid, actionId: "accepted-quote"}});
+    });
+    await page.goto(url);
+    await page.locator("#launch").click();
+    await page.locator("#message").fill("Да");
+    await page.locator("#send").click();
+    const form = page.locator("#quote-dialog[open]");
+    await form.getByText("av · ID av · Цена по запросу").waitFor();
+    assert.deepEqual(await form.locator("input[type=checkbox]:checked").evaluateAll(nodes => nodes.map(n => n.value)),
+      ["office", "av"]);
+    await page.reload();
+    await page.locator("#launch").click();
+    assert.equal(await page.locator("#quote-dialog").isVisible(), false);
   });
   await t.test("После обрыва потока виджет дочитывает историю с последнего события", async t => {
     const page = await browser.newPage();
@@ -66,6 +257,25 @@ test("Виджет Т09 на примерах контракта", async t => {
     await page.getByText(second.data.text, { exact: true }).waitFor();
     assert.equal(await page.getByText(first.data.text, { exact: true }).count(), 1);
     assert.deepEqual(cursors.slice(0, 2), [0, first.seq]);
+  });
+  await t.test("Просроченный диалог можно заменить в виджете одним нажатием", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    await page.addInitScript(() => sessionStorage.setItem("softline.t09.conversation.v1",
+      JSON.stringify({ id: "old", pending: { body: {type: "message", text: "старый запрос"}, uncertain: true } })));
+    await page.route("**/conversations/old/events?*", route =>
+      route.fulfill({ status: 404, json: {code: "not_found", message: "Диалог недоступен"} }));
+    const actions = [];
+    page.on("request", req => { if (new URL(req.url()).pathname.endsWith("/actions")) actions.push(req.postDataJSON()); });
+    await page.goto(url);
+    await page.locator("#launch").click();
+    const created = page.waitForResponse(res => new URL(res.url()).pathname === api && res.status() === 201);
+    await page.getByRole("button", {name: "Начать новый диалог"}).click();
+    assert.equal(new URL((await created).url()).searchParams.get("view"), "buyer");
+    await page.locator("#message").fill("Позовите оператора.");
+    await page.locator("#send").click();
+    await page.getByText("Подскажите, с каким вопросом нужна помощь?", {exact: true}).waitFor();
+    assert.deepEqual(actions, [{type: "message", text: "Позовите оператора."}]);
   });
   for (const [name, turns] of [
     ["Повтор после ответа", [

@@ -14,6 +14,7 @@ const authors = { customer: "Клиент", agent: "ИИ-агент", manager: "
 const currency = new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB" });
 const clock = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" });
 const drafts = new Map();
+const savingPrices = new Set();
 let items = [], selected = null, cursor = 0, generation = 0;
 let authenticated = false, timer, refreshNumber = 0, historyNumber = 0, retryAt = 0;
 
@@ -96,17 +97,59 @@ function showComposer() {
   $("result").textContent = state.notice;
 }
 
+function purchaseKey(item) {
+  return item?.quoteLine ? JSON.stringify([item.conversationId, item.quoteLine.quoteId]) : null;
+}
+
+function caseSubject(item) {
+  if (!/^(?:да|ок|ага|хорошо|давайте|конечно)[\s.!,]*$/iu.test(item.question.trim())) return item.question;
+  return item.products.map(product => product.name).join(", ") || "Покупатель подтвердил обращение к менеджеру";
+}
+
+function showPurchaseLines(item) {
+  const panel = $("purchase-lines");
+  const key = purchaseKey(item);
+  panel.replaceChildren();
+  panel.hidden = !key || item.status === "resolved";
+  const saving = savingPrices.has(key);
+  $("line-price").disabled = saving;
+  $("approve-price").querySelector("button").disabled = saving;
+  if (panel.hidden) return;
+  panel.append(element("h3", "Позиции на согласовании"));
+  for (const line of items.filter(entry => purchaseKey(entry) === key)) {
+    const name = line.products[0]?.name || line.quoteLine.offerId;
+    const button = element("button", name + " · " + line.quoteLine.offerId + " · " + reasons[line.reason]);
+    button.type = "button";
+    button.disabled = saving;
+    button.setAttribute("aria-pressed", String(line.handoffId === item.handoffId));
+    button.onclick = () => openCard(line);
+    panel.append(button);
+  }
+}
+
 function showQueue() {
   const nav = $("queue");
   const focused = nav.contains(document.activeElement) ? document.activeElement.dataset.id : null;
   nav.replaceChildren();
-  $("count").textContent = items.length;
-  $("queue-empty").hidden = items.length > 0;
+  const groups = new Map();
   for (const item of items) {
+    const key = purchaseKey(item) || item.handoffId;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  $("count").textContent = groups.size;
+  $("queue-empty").hidden = items.length > 0;
+  for (const group of groups.values()) {
+    const item = group.find(line => line.handoffId === selected?.handoffId) || group[0];
     const button = document.createElement("button");
     button.dataset.id = item.handoffId;
     button.setAttribute("aria-current", String(selected?.handoffId === item.handoffId));
-    button.append(element("strong", reasons[item.reason]), element("span", item.question));
+    if (item.quoteLine) {
+      button.append(element("strong", "Согласование КП · версия " + item.quoteLine.revision),
+        element("span", group.map(line => line.products[0]?.name || line.quoteLine.offerId).join(", ")));
+    } else {
+      button.append(element("strong", reasons[item.reason]), element("span", caseSubject(item)));
+    }
     button.onclick = () => openCard(item);
     nav.append(button);
     if (focused === item.handoffId) button.focus({ preventScroll: true });
@@ -130,9 +173,10 @@ function openCard(item) {
   $("article-form").reset();
   $("articles").replaceChildren();
   $("kb-result").textContent = "";
+  showPurchaseLines(item);
   if (item) {
     $("reason").textContent = reasons[item.reason];
-    $("question").textContent = item.question;
+    $("question").textContent = caseSubject(item);
     $("products").replaceChildren();
     if (item.products.length) $("products").append(element("h3", "Выбранные позиции"), productList(item.products));
     if (resolved) loadArticles(item.handoffId); else showComposer();
@@ -197,6 +241,14 @@ async function refresh() {
     items = incoming;
     if (selected && selected.status !== "resolved" && !items.some(item => item.handoffId === selected.handoffId)) {
       const id = selected.handoffId;
+      const key = purchaseKey(selected);
+      const nextLine = key && items.find(item => purchaseKey(item) === key);
+      if (nextLine) {
+        openCard(nextLine);
+        drafts.delete(id);
+        $("result").textContent = "Решение сохранено. Открыта следующая строка КП.";
+        return;
+      }
       const closed = await loadArchive();
       if (attempt !== refreshNumber) return;
       if (selected?.handoffId === id) openCard(closed.find(item => item.handoffId === id) || null);
@@ -205,7 +257,7 @@ async function refresh() {
     } else {
       const current = selected && items.find(item => item.handoffId === selected.handoffId);
       if (current && JSON.stringify(current.quoteLine) !== JSON.stringify(selected.quoteLine)) openCard(current);
-      if (changed) showQueue();
+      if (changed) { showQueue(); showPurchaseLines(selected); }
       await readHistory();
     }
     await refreshQuoteDrafts();
@@ -296,11 +348,17 @@ $("approve-price").onsubmit = async e => {
   if (!Number.isSafeInteger(unitPriceKopecks) || unitPriceKopecks < 1) {
     $("price-status").textContent = "Укажите положительную цену в рублях."; return;
   }
-  button.disabled = true;
+  const key = purchaseKey(item);
+  savingPrices.add(key);
+  showPurchaseLines(item);
+  $("price-status").textContent = "Сохраняю цену и обновляю версию КП…";
   try {
     await request("/manager/handoffs/" + encodeURIComponent(item.handoffId) + "/resolution",
       {type:"approve_line_price", ...item.quoteLine, unitPriceKopecks}, newKey());
     await refresh();
   } catch (error) { if (selected?.handoffId === item.handoffId) $("price-status").textContent = error.message; }
-  finally { button.disabled = false; }
+  finally {
+    savingPrices.delete(key);
+    showPurchaseLines(selected);
+  }
 };

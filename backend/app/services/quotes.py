@@ -5,7 +5,7 @@ import json
 import re
 from datetime import date
 
-from app.agent.handoff import handoff_reason
+from app.agent.handoff import AFFIRMATIVE, handoff_reason
 from app.agent.quote_calculation import (
     Conditions,
     Customer,
@@ -16,6 +16,7 @@ from app.agent.quote_calculation import (
     calculate,
     catalog_lines,
 )
+from app.agent.quote_intent import REQUEST, offers_quote
 from app.agent.quote_pdf import render
 from app.config import get_settings
 from app.contracts.t04 import (
@@ -78,6 +79,64 @@ async def published(cid, qid, revision):
         "json_extract(data,'$.quote.quoteId')=? AND json_extract(data,'$.quote.revision')=? LIMIT 1",
         (cid, qid, revision),
     )
+
+
+def revision_changes(before, after):
+    changes = []
+    for field, label in (("company", "название организации"), ("inn", "ИНН"), ("kpp", "КПП")):
+        if getattr(before.customer, field) != getattr(after.customer, field):
+            changes.append(f"Изменены реквизиты — {label}.")
+    old = {line.offerId: line for line in before.quote.lines}
+    new = {line.offerId: line for line in after.quote.lines}
+    for sku, line in new.items():
+        if sku not in old:
+            changes.append(f"Добавлена позиция {sku} · {line.packages} уп.")
+            continue
+        if line.packages != old[sku].packages:
+            changes.append(f"Позиция {sku} · количество {old[sku].packages} → {line.packages} уп.")
+        if line.unitPriceKopecks != old[sku].unitPriceKopecks:
+            changes.append(f"Изменилась цена за упаковку позиции {sku}.")
+    for sku in old:
+        if sku not in new:
+            changes.append(f"Удалена позиция {sku}.")
+    for field, label in (
+        ("payment", "оплата"),
+        ("delivery", "поставка"),
+        ("taxNote", "налоги"),
+        ("validUntil", "срок действия КП"),
+    ):
+        if getattr(before.quote.terms, field) != getattr(after.quote.terms, field):
+            changes.append(f"Изменены условия — {label}.")
+    if not changes:
+        changes.append("Состав, количество, цены, реквизиты и условия совпадают.")
+    return changes
+
+
+async def revision_history(cid):
+    db = get_db()
+    async with db.committed_read():
+        rows = await db.fetchall(
+            """SELECT quote_id, revision, snapshot FROM quote_revisions q WHERE conversation_id=?
+               AND EXISTS (SELECT 1 FROM events e WHERE e.conversation_id=q.conversation_id
+               AND json_extract(e.data,'$.quote.quoteId')=q.quote_id
+               AND json_extract(e.data,'$.quote.revision')=q.revision) ORDER BY quote_id,revision""",
+            (cid,),
+        )
+    notes = []
+    previous = None
+    for row in rows:
+        current = Snapshot.model_validate_json(row["snapshot"])
+        if previous and previous.quote.quoteId == current.quote.quoteId:
+            notes.append(
+                {
+                    "quoteId": row["quote_id"],
+                    "revision": row["revision"],
+                    "previous": previous.quote.revision,
+                    "changes": revision_changes(previous, current),
+                }
+            )
+        previous = current
+    return notes
 
 
 async def require_published(row):
@@ -164,6 +223,18 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None, select
         h = (await repo.get_handoff(record["id"])).handoff
         if h.status == "open" and (h.quoteLine.offerId, h.reason) in active:
             carry[(h.quoteLine.offerId, h.reason)] = h
+    unlinked = await get_db().fetchall(
+        "SELECT h.id FROM handoffs h LEFT JOIN quote_handoffs l ON h.id=l.handoff_id "
+        "WHERE h.conversation_id=? AND h.status='open' AND l.handoff_id IS NULL "
+        "ORDER BY h.created_at DESC",
+        (cid,),
+    )
+    for record in unlinked:
+        h = (await repo.get_handoff(record["id"])).handoff
+        if len(h.products) == 1:
+            key = (h.products[0].offerId, h.reason)
+            if key in active and key not in carry:
+                carry[key] = h
     quote_event = QuoteData(quote=q)
     buyer_events = [quote_event]
     if selection:
@@ -186,9 +257,9 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None, select
         if not d.reason:
             continue
         request = (
-            "Согласовать конечную цену за упаковку в рублях"
-            if d.reason == "price_request"
-            else "Проверить доступность и условия поставки"
+            "Согласовать цену за упаковку и подтвердить доступность поставки"
+            if not d.product.available
+            else "Согласовать конечную цену за упаковку в рублях"
         )
         question = f"{request}. КП, версия {q.revision}: {d.product.name}, ID {d.product.offerId}, {d.packages} уп."
         h = carry.get((d.product.offerId, d.reason))
@@ -258,14 +329,17 @@ async def invalidate_changed_selection(conn, cid):
             await invalidate_revision(conn, cid, row["revision"])
 
 
-async def clarification(conn, cid, text, reply):
+async def clarification(conn, cid, text, reply, *, open_form=False):
     action_id = repo.new_id("a")
     messages = [
         MessageData(author="customer", purpose="input", text=text, sources=[]),
         MessageData(author="agent", purpose="clarification", text=reply, sources=[]),
     ]
     written = await repo.append_events(cid, action_id, [m.model_dump(mode="json") for m in messages], conn=conn)
-    result = await repo.record_quote_response(conn, 202, {"conversationId": cid, "actionId": action_id})
+    receipt = {"conversationId": cid, "actionId": action_id}
+    if open_form:
+        receipt["_open_quote_form"] = True
+    result = await repo.record_quote_response(conn, 202, receipt)
     return result, written
 
 
@@ -285,6 +359,24 @@ async def clarify_quantity(cid, current, text):
 
 async def from_message(cid: str, text: str):
     """Unambiguous single-SKU purchase or pack count. Mixed intents stay in the normal agent flow."""
+    clean = text.strip().casefold()
+    requested = bool(REQUEST.fullmatch(clean))
+    if not requested and AFFIRMATIVE.fullmatch(clean):
+        history = await repo.history_messages(cid)
+        requested = bool(history and history[-1].role == "agent" and offers_quote(history[-1].text))
+    if requested:
+        async with get_db().tx() as conn:
+            selected = await repo.last_products(cid)
+            reply = (
+                "Проверьте позиции и количество упаковок в форме «Подготовить КП», затем укажите реквизиты организации."
+                if selected
+                else "Для какого товара подготовить КП? Напишите название или артикул."
+            )
+            if any(p["priceState"] == "on_request" for p in selected):
+                reply += " По позициям с ценой по запросу менеджер уточнит стоимость."
+            result, written = await clarification(conn, cid, text, reply, open_form=bool(selected))
+        events.publish(cid, written)
+        return result
     seats = re.fullmatch(
         rf"(?:(?:{CHANGE_QUOTE})\s+|теперь\s+|вместо \d+ (?:нужно |на )?)?(?:нужно |нужны |на )?([1-9]\d{{0,4}})\s+"
         r"(?:мест[ао]?|пользовател(?:я|ей|ь))(?:\s+для\s+(?:обоих|всех)\s+(?:продуктов|позиций))?"
@@ -549,12 +641,14 @@ async def approve_price(handoff, decision: ApproveLinePriceDecision):
             raise ApiError(409, "stale_revision", STALE)
         if ref.revision != decision.revision:
             raise ApiError(409, "stale_revision", STALE)
-        line = next(d for d in snapshot.details if d.product.offerId == ref.offerId)
-        if line.reason != "price_request":
-            raise ApiError(409, "terms_pending", "Подтверждение цены не подтверждает доступность.")
+        line = next((d for d in snapshot.details if d.product.offerId == ref.offerId), None)
+        if line is None:
+            raise not_found("Строка расчёта не найдена.")
+        if line.reason not in ("price_request", "availability"):
+            raise ApiError(409, "terms_pending", "Строка не требует согласования цены или доступности.")
         line.unit = decision.unitPriceKopecks
         line.decision = handoff.handoffId
-        line.reason = None if line.product.available else "availability"
+        line.reason = None
         updated = calculate(snapshot.customer, snapshot.details, ref.quoteId, ref.revision + 1)
         action_id = repo.new_id("a")
         written = await save_revision(conn, cid, action_id, updated, resolved=handoff)

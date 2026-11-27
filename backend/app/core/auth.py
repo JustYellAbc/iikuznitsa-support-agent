@@ -17,6 +17,7 @@ from app.core.errors import forbidden_manager, unauthenticated
 from app.db import repository
 
 COOKIE = "support_session"
+BUYER_COOKIE = "support_buyer_session"
 COOKIE_PATH = "/api/v1"
 
 RoleName = Literal["customer", "manager"]
@@ -32,12 +33,23 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-async def current_principal(request: Request) -> Principal | None:
-    token = request.cookies.get(COOKIE)
+async def _principal(token: str | None) -> Principal | None:
     if not token:
         return None
     found = await repository.get_auth_session(_hash(token))
     return Principal(found.role, found.principal) if found else None
+
+
+def buyer_view(request: Request) -> bool:
+    return request.query_params.get("view") == "buyer"
+
+
+async def current_principal(request: Request) -> Principal | None:
+    if not buyer_view(request):
+        return await _principal(request.cookies.get(COOKIE))
+    # Старый покупатель может продолжить свой диалог. Права менеджера в виджет не переходят.
+    principal = await _principal(request.cookies.get(BUYER_COOKIE) or request.cookies.get(COOKIE))
+    return principal if principal and principal.role == "customer" else None
 
 
 async def require_principal(request: Request) -> Principal:
@@ -61,9 +73,9 @@ async def create_session(role: RoleName, principal_id: str) -> tuple[Principal, 
     return Principal(role, principal_id), token
 
 
-def set_session_cookie(request: Request, response: Response, token: str, role: RoleName) -> None:
+def set_session_cookie(request: Request, response: Response, token: str, role: RoleName, *, name: str = COOKIE) -> None:
     response.set_cookie(
-        COOKIE,
+        name,
         token,
         max_age=int(_ttl(role).total_seconds()),
         path=COOKIE_PATH,
@@ -73,16 +85,32 @@ def set_session_cookie(request: Request, response: Response, token: str, role: R
     )
 
 
+async def preserve_legacy_buyer(request: Request, response: Response) -> None:
+    """При входе менеджера сохраняем прежнюю покупательскую сессию этого браузера."""
+    if request.cookies.get(BUYER_COOKIE):
+        return
+    token = request.cookies.get(COOKIE)
+    if token:
+        previous = await _principal(token)
+        if previous and previous.role == "customer":
+            set_session_cookie(request, response, token, "customer", name=BUYER_COOKIE)
+
+
 def _ttl(role: RoleName) -> timedelta:
     s = get_settings()
     return timedelta(hours=s.manager_session_hours if role == "manager" else s.customer_session_hours)
 
 
 async def drop_session(request: Request, response: Response) -> None:
-    token = request.cookies.get(COOKIE)
+    name = COOKIE
+    if buyer_view(request):
+        name = BUYER_COOKIE
+        if name not in request.cookies and await current_principal(request):
+            name = COOKIE  # ранее выданная сессия покупателя
+    token = request.cookies.get(name)
     if token:
         await repository.delete_auth_session(_hash(token))
-    response.delete_cookie(COOKIE, path=COOKIE_PATH)
+    response.delete_cookie(name, path=COOKIE_PATH)
 
 
 def check_manager_credentials(username: str, password: str) -> bool:

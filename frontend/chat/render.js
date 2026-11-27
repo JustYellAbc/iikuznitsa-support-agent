@@ -2,6 +2,12 @@ const names = { customer: "Вы", agent: "Ассистент", manager: "Опе�
 const rubles = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
 const money = kopecks => rubles.format(kopecks / 100) + " ₽";
 
+export function buyerUrl(path) {
+  const url = new URL(path, location.origin);
+  url.searchParams.set("view", "buyer");
+  return url.pathname + url.search;
+}
+
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text != null) node.textContent = text;
@@ -9,12 +15,14 @@ function element(tag, text, className) {
   return node;
 }
 
-function sourceLink(source) {
-  const link = element("a", source.label + " ↗");
+function sourceLink(source, label = source.label) {
+  const link = element("a", label + " ↗");
   try {
     const url = new URL(source.url);
     if (url.protocol === "https:") {
-      link.href = url.href;
+      // Local preview may serve this same API over HTTP. Published articles belong to this stand.
+      link.href = url.host === window.location.host && url.pathname.startsWith("/api/v1/knowledge/")
+        ? url.pathname : url.href;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
     }
@@ -22,25 +30,41 @@ function sourceLink(source) {
   return link;
 }
 
+// T04 exposes the catalogue name but no separate sale unit.
+function priceLabel(name) {
+  const parts = name.toLowerCase().split(/[,;()]/).map(part => part.trim());
+  const kit = /^(?:базовый\s+)?комплект\s+(?:лицензий(?:\s|$)|(?:из\s+|на\s+)?\d+\s+(?:лицензи|пользовател))/;
+  const key = /^(?:тип поставки:\s*)?электронный ключ(?:\s+на\s+\d+\s+рабоч(?:ее место|их мест[а]?))?$/;
+  if (parts.some(part => kit.test(part))) return "Цена комплекта";
+  if (parts.some(part => key.test(part))) return "Цена электронного ключа";
+  return "Цена позиции";
+}
+
 function productCard(product) {
   const card = element("div", null, "result");
-  const price = product.priceState === "on_request" ? "Цена по запросу" : money(product.unitPriceKopecks) + " за единицу по карточке";
-  card.append(element("strong", product.name), element("div", price));
+  const price = product.priceState === "on_request" ? "Цена по запросу" : priceLabel(product.name) + ": " + money(product.unitPriceKopecks);
+  card.append(element("strong", product.name), element("small", "Артикул " + product.offerId), element("div", price));
   if (product.priceState === "availability_check") card.append(element("small", "Наличие требует подтверждения"));
-  card.append(element("small", product.licenseTerm ? "Срок: " + product.licenseTerm : "Срок лицензии неизвестен"), sourceLink(product.source));
+  const link = sourceLink(product.source, "Открыть в магазине");
+  link.setAttribute("aria-label", "Открыть в магазине · " + product.name);
+  card.append(element("small", product.licenseTerm ? "Срок: " + product.licenseTerm : "Срок лицензии неизвестен"), link);
   return card;
 }
 
-export function renderEvent({ data, at }, conversationId, submit) {
+export function renderEvent({ data, at, actionId }, conversationId, submit, cardLinks = new Set()) {
   const row = element("div", null, "entry");
   const time = new Date(at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
   switch (data.type) {
     case "message":
       row.classList.add(data.author);
       row.append(element("div", names[data.author] + " · " + time, "meta"), element("div", data.text, "bubble"));
-      for (const source of data.sources) row.append(sourceLink(source));
+      for (const source of data.sources) {
+        const link = sourceLink(source);
+        if (!cardLinks.has(link.href)) row.append(link);
+      }
       break;
     case "products":
+      row.dataset.productsFor = actionId;
       for (const product of data.products) row.append(productCard(product));
       break;
     case "handoff":
@@ -54,17 +78,19 @@ export function renderEvent({ data, at }, conversationId, submit) {
       row.append(element("strong", "Расчёт · версия " + data.quote.revision),
         element("p", data.quote.totalKopecks == null ? "Условия на согласовании" : "Итого " + money(data.quote.totalKopecks)));
       for (const line of data.quote.lines) {
-        row.append(element("p", line.name + " · " + line.packages + " уп. × " +
-          (line.unitPriceKopecks == null ? "цена на согласовании" : money(line.unitPriceKopecks))));
+        const price = line.unitPriceKopecks == null ? "Цена на согласовании" : priceLabel(line.name) + ": " + money(line.unitPriceKopecks);
+        row.append(element("p", line.name + " · " + price + " · Количество: " + line.packages));
       }
       for (const [field, label] of [["payment","Оплата"],["delivery","Поставка"],["taxNote","Налоги"],["validUntil","Действует до"]]) {
         row.append(element("div", label + ": " + (data.quote.terms[field] || "требует согласования")));
       }
       if (data.quote.state === "needs_review") {
+        const pendingPrices = data.quote.lines.filter(line => line.unitPriceKopecks == null).length;
+        if (pendingPrices) row.append(element("p", "Ожидают подтверждения цены: " + pendingPrices + " из " + data.quote.lines.length));
         row.append(element("small", "Сумма известных строк: " + money(data.quote.knownSubtotalKopecks)));
         const link = element("a", "Скачать черновик КП");
-        link.href = "/api/v1/conversations/" + encodeURIComponent(conversationId) + "/quotes/" +
-          encodeURIComponent(data.quote.quoteId) + "/" + encodeURIComponent(data.quote.revision) + "/preview.pdf";
+        link.href = buyerUrl("/api/v1/conversations/" + encodeURIComponent(conversationId) + "/quotes/" +
+          encodeURIComponent(data.quote.quoteId) + "/" + encodeURIComponent(data.quote.revision) + "/preview.pdf");
         row.append(link);
       } else if (submit) {
         const get = element("button", "Получить PDF КП");
@@ -87,7 +113,7 @@ export function renderEvent({ data, at }, conversationId, submit) {
       break;
     case "document": {
       const link = element("a", data.document.kind === "quote_pdf" ? "Скачать КП" : "Скачать демо-счёт");
-      if (/^\/api\/v1\/documents\/[\w.-]+$/.test(data.document.url)) link.href = data.document.url;
+      if (/^\/api\/v1\/documents\/[\w.-]+$/.test(data.document.url)) link.href = buyerUrl(data.document.url);
       row.append(link);
       break;
     }
