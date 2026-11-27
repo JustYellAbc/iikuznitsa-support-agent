@@ -44,8 +44,8 @@ test("Виджет Т09 на примерах контракта", async t => {
     assert.match(await card("48093").innerText(), /Наличие требует подтверждения/);
     assert.match(await card("504").innerText(), /Цена по запросу/);
     assert.doesNotMatch(await card("504").innerText(), /₽/);
-    assert.equal(await page.locator("#log .entry:has(.result) #quote-open").count(), 1);
-    assert.equal(await page.locator("footer #quote-open").count(), 0);
+    assert.equal(await page.locator("#log .entry:has(.result) .quote-open").count(), 1);
+    assert.equal(await page.locator("footer .quote-open").count(), 0);
     await page.route("**/quotes/current?*", route => route.fulfill({ json: {
       revision: 0, items: [], choices: [{ offerId: "61557", name: "BookOffice" }]
     } }));
@@ -56,6 +56,44 @@ test("Виджет Т09 на примерах контракта", async t => {
       assert.ok(await logo.evaluate(img => img.complete && img.naturalWidth > 0));
     }
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  });
+  await t.test("Подборки открывают собственные позиции, изменить можно только актуальный расчёт", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    await page.addInitScript(() => { window.EventSource = undefined; });
+    const product = id => ({ offerId: id, name: "Товар " + id, source: { url: "https://example.org/" + id, label: id },
+      priceState: "listed", unitPriceKopecks: 100 });
+    const quote = revision => ({ type: "quote", quote: { quoteId: "q", revision, lines: [], terms: {} } });
+    const data = [{ type: "products", products: [product("A")] }, { type: "products", products: [product("B")] },
+      quote(1), quote(2)];
+    const journal = data.map((data, index) => ({ seq: index + 1, at: "2026-11-27T12:00:00Z", data }));
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({ json: { events: journal.slice(after), nextAfter: journal.length, hasMore: false } });
+    });
+    const saved = { revision: 2, items: [{ offerId: "B", packages: 3 }], choices: ["A", "B"].map(product) };
+    await page.route("**/quotes/current?*", route => route.fulfill({ json: saved }));
+    await page.goto(url);
+    await page.locator("#launch").click();
+    const prepare = page.getByRole("button", { name: "Подготовить КП" });
+    const edit = page.getByRole("button", { name: "Изменить КП" });
+    const close = page.getByRole("button", { name: "Закрыть", exact: true });
+    await edit.nth(1).waitFor();
+    for (const [index, id] of ["A", "B"].entries()) {
+      await prepare.nth(index).click();
+      await page.getByRole("checkbox", { name: "Товар " + id + " · ID " + id }).waitFor();
+      assert.equal(await page.getByRole("checkbox").count(), 1);
+      await close.click();
+    }
+    assert.equal(await edit.first().isDisabled(), true);
+    await edit.nth(1).click();
+    await page.getByLabel("Упаковки: Товар B").waitFor();
+    assert.equal(await page.getByLabel("Упаковки: Товар B").inputValue(), "3");
+    await close.click();
+    saved.revision = 3;
+    await edit.nth(1).click();
+    await page.getByText("КП изменилось. Откройте последнюю версию расчёта в чате.").waitFor();
+    assert.equal(await page.locator('#quote-form [type="submit"]').isDisabled(), true);
   });
   await t.test("Адресат сохраняется после перезагрузки и сбрасывается после закрытия обращений", async t => {
     const page = await browser.newPage({ viewport: { width: 320, height: 690 } });
