@@ -9,7 +9,7 @@ const storageKey = "softline.t09.conversation.v1";
 const base = "/api/v1/conversations";
 const newKey = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
 // T33: the server counts Unicode code points of the sent text, not UTF-16 units; CRLF is one line break.
-const maxChars = 500;
+const maxChars = 1500;
 const charCount = text => Array.from(text.replace(/\r\n/g, "\n")).length;
 let state;
 try { state = JSON.parse(sessionStorage.getItem(storageKey)) || {}; } catch { state = {}; }

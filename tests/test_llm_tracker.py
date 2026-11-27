@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -47,6 +48,33 @@ async def test_cost_formula_uses_usd_prices_and_cbr_rate():
     assert compute_cost_rub("smart", 1_000_000, 0) == pytest.approx(2 * 82.1664)
     assert compute_cost_rub("smart", 0, 1_000_000) == pytest.approx(8 * 82.1664)
     assert compute_cost_rub("fast", 1000, 500) == pytest.approx((1000 * 0.4 + 500 * 1.6) / 1e6 * s.usd_rub_rate)
+
+
+@pytest.mark.parametrize(
+    ("base", "model", "profile", "disable"),
+    [
+        ("https://opencode.ai/inference/go/openai/v1", "qwen3.8-flash", "smart", True),
+        ("https://opencode.ai/inference/go/openai/v1/", "qwen3.8-flash", "fast", True),
+        ("https://opencode.ai/inference/go/openai/v1", "another-model", "smart", False),
+        ("https://example.org/v1", "qwen3.8-flash", "smart", False),
+    ],
+)
+async def test_demo_qwen_reasoning_setting_in_http_body(db, monkeypatch, base, model, profile, disable):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_base_url", base)
+    monkeypatch.setattr(settings, f"model_{profile}", model)
+
+    def handler(request):
+        payload = json.loads(request.content)
+        assert payload["model"] == model
+        if disable:
+            assert payload["enable_thinking"] is False
+        else:
+            assert "enable_thinking" not in payload
+        return ok_response()
+
+    provider(handler)
+    await llm_call([{"role": "user", "content": "test"}], step="support_tools", session_id="demo", profile=profile)
 
 
 async def test_llm_call_logs_tokens_cost_and_latency(db):
