@@ -5,6 +5,7 @@ import json
 import re
 from datetime import date
 
+from app.agent.handoff import handoff_reason
 from app.agent.quote_calculation import (
     Conditions,
     Customer,
@@ -325,6 +326,11 @@ async def from_message(cid: str, text: str):
             and re.search(r"\b(?:упаков\w*|пач\w*|количеств\w*|мест[ао]?|пользовател\w*|штук\w*|шт)\b", text, re.I)
             and (current := await latest(cid))
         ):
+            if handoff_reason(text.casefold()):
+                # Keep the entire request for T12, including the reason and new quantity.
+                async with get_db().tx() as conn:
+                    await invalidate_revision(conn, cid, current["revision"])
+                return None
             return await clarify_quantity(cid, current, text)
         return None
     products = await repo.last_products(cid)

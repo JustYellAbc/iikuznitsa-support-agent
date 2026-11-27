@@ -212,6 +212,24 @@ def test_rejected_pack_tier_retires_accepted_revision(api, tmp_path):
     assert bill(api, cid, next_quote).json()["code"] == "confirmation_required"
 
 
+@pytest.mark.parametrize(
+    "extra,reason", [("Позовите оператора.", "customer_request"), ("Нужны тендерные документы.", "tender")]
+)
+def test_mixed_quantity_change_reaches_operator(api, tmp_path, extra, reason):
+    cid = setup_quote(api, tmp_path, ["t1"], rules=True)
+    assert request(api, cid, [("t1", 1)]).status_code == 202
+    quote = last_quote(api, cid)
+    assert command(api, cid, quote, "confirm_quote").status_code == 202
+    text = "Теперь 3 упаковки. " + extra
+    assert api.say(cid, text).status_code == 202
+    api.idle()
+    api.login()
+    [case] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+    assert case["reason"] == reason and case["question"] == text
+    assert bill(api, cid, quote).json()["code"] in ("stale_revision", "terms_pending")
+    assert not issued(api, cid)
+
+
 def test_rolled_back_invoice_is_never_visible_to_polling(api, tmp_path, monkeypatch):
     cid = setup_quote(api, tmp_path, ["t1"], rules=True)
     assert request(api, cid, [("t1", 1)]).status_code == 202
