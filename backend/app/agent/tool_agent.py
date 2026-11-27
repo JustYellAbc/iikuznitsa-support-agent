@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 from catalog import tools as t31
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.agent.catalog_selection import Selection
+from app.agent.catalog_selection import CANDIDATE_QUESTION, Selection, confirmed_candidate
 from app.agent.handoff import (
     ASK_DETAIL,
     ASK_PRODUCT,
@@ -24,6 +24,7 @@ from app.agent.handoff import (
     offers_operator,
     route_action,
 )
+from app.agent.product_answers import topics_for
 from app.agent.quote_intent import offers_quote
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, StepTrace
@@ -59,7 +60,15 @@ class Answer(Arguments):
     kind: Literal["product", "knowledge", "clarify", "handoff"]
     refs: list[str] = Field(default_factory=list, max_length=3)
     field: Literal["price", "term", "availability", "delivery", "edition", "platform", "licenseType", "summary"] = (
-        "summary"
+        Field(
+            default="summary",
+            description="Для подбора или выбора варианта — summary. Иное поле только для вопроса о нём.",
+        )
+    )
+    title_edition: str = Field(
+        default="",
+        max_length=80,
+        description="Для edition: дословное обозначение редакции в названии одного проверенного товара.",
     )
     required_seats: Annotated[int, Field(ge=1, le=1000000)] | None = None
     excerpt: str = Field(default="", max_length=550)
@@ -107,6 +116,14 @@ def instructions():
 Для процедур, восстановления доступа и проблем после покупки вызови search_knowledge.
 При прямом совпадении используй опубликованный ответ. Проверяй, что статья отвечает именно на вопрос.
 Для нового вопроса о факте товара получи свежую карточку. Не подменяй её смежным товаром.
+Ответ на твой вопрос о выборе — продолжение покупки. Сохрани количество и тип покупателя.
+Если ответ подходит нескольким предложенным вариантам, спроси только об оставшемся различии (clarify).
+Не выбирай версию за покупателя. Если выбор однозначен, верни product с field=summary.
+Пустое свойство не отменяет найденный товар. Не выводи из названия совместимость, права или число устройств.
+Когда спрашивают об отсутствующем свойстве карточки, верни product, нужное field и ref: сервер объяснит пробел.
+Если покупатель подтвердил названную в предыдущем ответе позицию, проверь её через каталог и покажи карточку.
+Для вопроса именно о редакции можешь процитировать её из названия (title_edition), если она явно относится к товару.
+При расхождении укажи обозначение из названия: сервер покажет оба значения и предложит проверку.
 Заверши через respond или JSON той же схемы. Для product верни refs подтверждённых товаров и field.
 Для запроса с числом мест укажи required_seats числом, даже если покупатель написал его прописью.
 При передаче менеджеру по конкретному проверенному товару включи его ref в respond.
@@ -180,7 +197,7 @@ def product_line(row, field_name, *, compact=False):
             parts.append("Цена по запросу.")
         else:
             rub = f"{Decimal(kopecks) / 100:,.2f}".replace(",", " ").removesuffix(".00").replace(".", ",")
-            parts.append(f"Цена за упаковку — {rub} ₽.")
+            parts.append(f"Цена по карточке — {rub} ₽.")
         if row.get("salesNotes"):
             parts.append(row["salesNotes"])
     if row.get("priceCaveat"):
@@ -209,6 +226,70 @@ def selection_summary(rows, seats):
     for note, ids in notes.items():
         parts.append(note if len(ids) == len(rows) else f"Артикул {', '.join(ids)} — {note}")
     return " ".join(parts)
+
+
+# Each catalog row is independent: a missing property of one SKU cannot suppress the other facts.
+DETAIL_FIELDS = {
+    "term": ("licenseTerm", "Срок лицензии не указан"),
+    "delivery": ("delivery", "Способ поставки не указан"),
+    "platform": ("platform", "Поддерживаемые платформы не указаны"),
+    "edition": ("edition", "Редакция отдельно не указана"),
+    "licenseType": ("licenseType", "Тип лицензии не указан"),
+}
+
+
+def needs_choice_confirmation(history, text, row):
+    """A recommendation following an unresolved either/or question is still a candidate."""
+    if not history or history[-1].role != "agent" or topics_for(text, True):
+        return False
+    question = history[-1].text.strip()
+    if not question.endswith("?") or question.endswith(CANDIDATE_QUESTION):
+        return False
+    options = re.split(r"\bили\b", re.split(r":\s+", question)[-1], flags=re.I)
+    if len(options) < 2:
+        return False
+
+    def words(value):
+        return set(re.findall(r"\w+", value.casefold()))
+
+    buyer = words(text)
+    if re.search(r"(?<!\w)" + re.escape(row["offerId"]) + r"(?!\w)", text, re.I):
+        return False
+    labels = [words(option) for option in options]
+    # Only a distinguishing word actually present in both the buyer's reply and the offer can select it.
+    distinctive = [{w for w in label if sum(w in other for other in labels) == 1} for label in labels]
+    picked = [buyer & option for option in distinctive if buyer & option]
+    return len(picked) != 1 or picked[0].isdisjoint(words(row["name"]))
+
+
+def requested_detail(text):
+    topics = topics_for(text, True)
+    if re.search(r"\bплатформ\w*", text, re.I):
+        topics.add("platform")
+    if len(topics) == 1:
+        topic = next(iter(topics))
+        return "licenseType" if topic == "license" else topic if topic in DETAIL_FIELDS else None
+    return None
+
+
+def detail_reply(row, field_name, title_edition, *, compact):
+    key, missing = DETAIL_FIELDS[field_name]
+    value = row.get(key)
+    if title_edition:
+        if not re.search(r"(?<!\w)" + re.escape(title_edition) + r"(?!\w)", row["name"]):
+            raise ValueError("title_edition должна быть дословной частью названия, иначе оставь её пустой.")
+        if value and not re.search(r"(?<!\w)" + re.escape(title_edition) + r"(?!\w)", value, re.I):
+            return (
+                f"В названии артикула {row['offerId']} указано «{title_edition}», в поле версии — «{value}». "
+                "Соответствие этих обозначений нужно уточнить.",
+                True,
+            )
+        return f"В названии артикула {row['offerId']} указано «{title_edition}».", False
+    if value:
+        return product_line(row, field_name, compact=compact), False
+    # The official name is still evidence, even when the separate edition field is absent.
+    summary = product_line(row, "summary", compact=compact and field_name != "edition")
+    return f"{summary} {missing} в карточке.", True
 
 
 def checked_answer(answer, evidence, history, text, previous):
@@ -268,36 +349,52 @@ def checked_answer(answer, evidence, history, text, previous):
                 [],
                 HandoffRequest(reason=reason, question=text, products=current),
             )
-        prior = history[-1].text if history and history[-1].role == "agent" else ""
-        question = ASK_DETAIL if current else ASK_PRODUCT
-        if prior in {ASK_DETAIL, ASK_PRODUCT} or offers_operator(prior):
-            question = OFFER_HELP
-        return question, "clarification", products, [p.source for p in products], None
+        detail = requested_detail(text) if products and answer.reason == "insufficient_evidence" else None
+        if detail:
+            answer = answer.model_copy(update={"field": detail})
+        else:
+            prior = history[-1].text if history and history[-1].role == "agent" else ""
+            question = ASK_DETAIL if current else ASK_PRODUCT
+            if prior in {ASK_DETAIL, ASK_PRODUCT} or offers_operator(prior):
+                question = (
+                    "Товар найден. Уточнить ваш вопрос по нему пока не удалось.\n\n" + OPERATOR_QUESTION
+                    if current
+                    else OFFER_HELP
+                )
+            return question, "clarification", products, [p.source for p in products], None
     if not products:
         raise ValueError("Сначала проверь товар в каталоге.")
-    details = {
-        "term": "licenseTerm",
-        "delivery": "delivery",
-        "platform": "platform",
-        "edition": "edition",
-        "licenseType": "licenseType",
-    }
-    if answer.field in details and any(not row.get(details[answer.field]) for row in rows):
-        return OFFER_HELP, "clarification", products, [p.source for p in products], None
+    if answer.title_edition and (answer.field != "edition" or len(rows) != 1):
+        raise ValueError("Цитату редакции можно дать только для одной позиции и field=edition.")
     policy = route_action(history, text, products)
     reason = policy.reason if policy and not policy.clarification else None
     if answer.field == "price" and len(products) == 1 and products[0].priceState == "on_request":
         reason = "price_request"
     if answer.field == "availability" and len(products) == 1 and not products[0].available:
         reason = "availability"
-    if len(rows) > 1 and answer.field == "summary":
+    if (
+        not reason
+        and answer.field in {"summary", "edition"}
+        and len(rows) == 1
+        and needs_choice_confirmation(history, text, rows[0])
+    ):
+        candidate = product_line(rows[0], "summary")
+        return f"{candidate} {CANDIDATE_QUESTION}", "clarification", [], [products[0].source], None
+    partial = False
+    if answer.field in DETAIL_FIELDS:
+        details = [detail_reply(row, answer.field, answer.title_edition, compact=len(rows) > 1) for row in rows]
+        body = "\n".join(line for line, _ in details)
+        partial = any(unresolved for _, unresolved in details)
+    elif len(rows) > 1 and answer.field == "summary":
         body = selection_summary(rows, seats)
     else:
         body = "\n".join(product_line(row, answer.field, compact=len(rows) > 1) for row in rows)
     handoff = HandoffRequest(reason=reason, question=text, products=products) if reason else None
+    if partial and not handoff:
+        body += "\n\n" + OPERATOR_QUESTION
     return (
         body + (" " + handoff_notice(reason) if handoff else ""),
-        "notice" if handoff else "answer",
+        "notice" if handoff else "clarification" if partial else "answer",
         products,
         [p.source for p in products],
         handoff,
@@ -372,6 +469,22 @@ async def run_tool_turn(session, history, text, previous, emit):
         return await read(name, args.model_dump(), t31.search_catalog, index, **args.model_dump(), limit=3)
 
     async def loop():
+        confirmed = confirmed_candidate(history, text)
+        if confirmed:
+            offer_id, source = confirmed
+            evidence.replaced = True
+            data = await read("get_offer", {"offer_id": offer_id}, t31.get_offer, index, offer_id)
+            if data["results"] and data["results"][0]["source"] == source:
+                return checked_answer(
+                    Answer(kind="product", refs=[data["results"][0]["ref"]]), evidence, history, text, previous
+                )
+            return (
+                "Предыдущую карточку подтвердить не удалось. Подобрать актуальный вариант?",
+                "clarification",
+                [],
+                [],
+                None,
+            )
         calls = 0
         for _ in range(settings.agent_max_model_calls):
             if len(serialize([messages, TOOLS]).encode()) > MAX_CONTEXT_BYTES:
