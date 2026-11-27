@@ -57,12 +57,19 @@ function sync() {
 
 function updateHandoffs(handoff) {
   const selected = target.value;
+  const hadRecipient = openHandoffs.size > 0;
   if (handoff.status === "open") openHandoffs.set(handoff.handoffId, handoff);
   else openHandoffs.delete(handoff.handoffId);
   target.replaceChildren();
-  for (const [id, item] of openHandoffs) target.add(new Option(item.question, id));
-  if (openHandoffs.has(selected)) target.value = selected;
-  byId("target-label").hidden = openHandoffs.size < 2;
+  for (const [id, item] of openHandoffs) target.add(new Option("Менеджеру — " + item.question, id));
+  target.add(new Option("Агенту поддержки", ""));
+  if (openHandoffs.has(selected) || (hadRecipient && !selected)) target.value = selected;
+  byId("target-label").hidden = openHandoffs.size === 0;
+  if ([...openHandoffs.values()].some(item => item.quoteLine)) {
+    byId("quote-open").textContent = "Изменить количество в КП";
+  } else if (handoff.quoteLine) {
+    byId("quote-open").textContent = "Изменить КП";
+  }
 }
 
 function showError(error, isAction) {

@@ -98,6 +98,35 @@ def test_seats_change_all_licenses_and_preserve_pack_quantities(api, tmp_path):
     assert command(api, cid, revised, "confirm_quote").json()["code"] == "stale_revision"
 
 
+def test_form_requires_fresh_catalog_selection_after_unmatched_seat_count(api, tmp_path):
+    cid = setup_quote(api, tmp_path, ["t1"], rules=True)
+    assert request(api, cid, [("t1", 1)]).status_code == 202
+    revised = last_quote(api, cid)
+    assert api.say(cid, "Теперь нужно 37 мест").status_code == 202
+    api.idle()
+    current_url = f"/api/v1/conversations/{cid}/quotes/current"
+    form = api.call("customer", "GET", current_url).json()
+    assert form["requiresReselection"] and form["items"] == form["choices"] == []
+    assert request(api, cid, [("t1", 1)], revised["revision"]).status_code == 422
+    doc = {
+        "type": "request_document",
+        "kind": "quote_pdf",
+        "quoteId": revised["quoteId"],
+        "revision": revised["revision"],
+    }
+    assert api.call("customer", "POST", f"/api/v1/conversations/{cid}/actions", json=doc).status_code == 409
+    assert last_quote(api, cid) == revised
+    assert api.say(cid, "Артикул t2").status_code == 202
+    api.idle()
+    form = api.call("customer", "GET", current_url).json()
+    assert form["requiresReselection"] and form["items"] == []
+    assert [item["offerId"] for item in form["choices"]] == ["t2"]
+    assert request(api, cid, [("t2", 1)], revised["revision"]).status_code == 202
+    form = api.call("customer", "GET", current_url).json()
+    assert not form["requiresReselection"] and form["items"] == [{"offerId": "t2", "packages": 1}]
+    assert [item["offerId"] for item in form["choices"]] == ["t2"]
+
+
 def test_open_special_terms_block_form_confirmation_and_issue(api, tmp_path):
     cid = setup_quote(api, tmp_path, ["t1"], rules=True)
     assert request(api, cid, [("t1", 1)]).status_code == 202

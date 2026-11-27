@@ -3,22 +3,20 @@ const dialog = document.getElementById("quote-dialog");
 const list = document.getElementById("quote-items");
 const openButton = document.getElementById("quote-open");
 const status = document.getElementById("quote-status");
-const choices = new Map();
 let openingRevision = 0, retry = null, busy = false;
 
 export function resetQuotes() {
-  choices.clear(); retry = null;
+  retry = null;
+  openButton.textContent = "Подготовить КП";
   openButton.hidden = true; dialog.close(); form.reset();
 }
 
 export function quoteEvent(data) {
   if (data.type === "products") {
-    for (const p of data.products) choices.set(p.offerId, p.name);
     openButton.hidden = false;
   }
   if (data.type === "quote") {
     openButton.textContent = "Изменить КП";
-    for (const line of data.quote.lines) choices.set(line.offerId, line.name);
     openButton.hidden = false;
   }
 }
@@ -37,18 +35,25 @@ export function setupQuotes(conversation, request, newKey) {
       openingRevision = saved.revision;
       if (saved.customer) for (const k of ["company","inn","kpp"]) form.elements[k].value = saved.customer[k];
       const items = new Map(saved.items.map(item => [item.offerId, item.packages]));
-      for (const [id, name] of choices) {
+      const submit = form.querySelector('[type="submit"]');
+      const updateSubmit = () => { submit.disabled = !list.querySelector('input[type="checkbox"]:checked'); };
+      for (const {offerId: id, name} of saved.choices) {
         const row = document.createElement("div"), label = document.createElement("label");
         const check = document.createElement("input"), qty = document.createElement("input");
         check.type = "checkbox"; check.value = id;
-        check.checked = items.has(id) || choices.size === 1;
+        check.checked = items.has(id) || (!saved.requiresReselection && saved.choices.length === 1);
         qty.type = "number"; qty.min = "1"; qty.max = "100000"; qty.step = "1";
         qty.setAttribute("aria-label", "Упаковки: " + name);
         qty.value = String(items.get(id) || 1); qty.disabled = !check.checked;
-        check.onchange = () => { qty.disabled = !check.checked; };
+        check.onchange = () => { qty.disabled = !check.checked; updateSubmit(); };
         label.append(check, " " + name + " · ID " + id); row.append(label, qty); list.append(row);
       }
-      status.textContent = ""; form.querySelector('[type="submit"]').disabled = false;
+      status.textContent = "";
+      if (saved.requiresReselection) {
+        status.textContent = saved.choices.length ? "Выберите позиции для новых условий."
+          : "Закройте форму и подберите товар в чате для новых условий.";
+      }
+      updateSubmit();
     } catch (error) { status.textContent = error.message; }
   };
   document.getElementById("quote-cancel").onclick = () => dialog.close();

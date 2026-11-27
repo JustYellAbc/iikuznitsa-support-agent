@@ -239,13 +239,17 @@ async def quote_inputs(conversationId: PathId, principal: Principal = Depends(re
         row = await quotes.latest(conversationId)
         if principal.role == "customer" and row and not row["reselect"]:
             await quotes.require_published(row)
+        choices = await quotes.selectable_products(conversationId)
     snapshot = quotes.read(row) if row else None
+    reselect = bool(row and row["reselect"])
     return JSONResponse(
         {
             "revision": snapshot.quote.revision if snapshot else 0,
+            "requiresReselection": reselect,
+            "choices": [{"offerId": offer_id, "name": name} for offer_id, name in choices.items()],
             "customer": snapshot.customer.model_dump() if snapshot else None,
             "items": [{"offerId": d.product.offerId, "packages": d.packages} for d in snapshot.details]
-            if snapshot
+            if snapshot and not reselect
             else [],
         },
         headers={"Cache-Control": "private, no-store"},

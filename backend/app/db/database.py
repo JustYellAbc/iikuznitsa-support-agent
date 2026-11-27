@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS quote_revisions (
     issued_action TEXT, reselect INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, revision), UNIQUE (quote_id, revision)
 );
+CREATE TABLE IF NOT EXISTS quote_selection_resets (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+    after_seq INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS quote_handoffs (
     handoff_id TEXT PRIMARY KEY REFERENCES handoffs(id),
     quote_id TEXT NOT NULL, revision INTEGER NOT NULL, offer_id TEXT NOT NULL,
@@ -222,6 +226,17 @@ class Database:
         await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(SCHEMA)
+        # Restore the selection boundary for conversations invalidated before it was stored explicitly.
+        await self._conn.execute(
+            """INSERT OR IGNORE INTO quote_selection_resets(conversation_id,after_seq)
+               SELECT e.conversation_id,MAX(e.seq) FROM events e
+               WHERE e.conversation_id IN (SELECT conversation_id FROM quote_revisions WHERE reselect=1
+                                           EXCEPT SELECT conversation_id FROM quote_selection_resets)
+                 AND json_extract(e.data,'$.author')='agent' AND json_extract(e.data,'$.purpose')='clarification'
+                 AND json_extract(e.data,'$.text') LIKE ?
+               GROUP BY e.conversation_id""",
+            ("На % мест нужно заново подобрать варианты. Уточните товар, затем подтвердите новые позиции в форме КП.",),
+        )
 
     async def close(self) -> None:
         if self._conn is not None:

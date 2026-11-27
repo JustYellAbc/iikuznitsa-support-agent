@@ -213,6 +213,34 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None, select
     return await repo.append_events(cid, action_id, [d.model_dump(mode="json") for d in data], conn=conn)
 
 
+async def reset_selection(conn, cid, revision):
+    await conn.execute("UPDATE quote_revisions SET reselect=1 WHERE conversation_id=? AND revision=?", (cid, revision))
+    await conn.execute(
+        "INSERT INTO quote_selection_resets(conversation_id,after_seq) "
+        "SELECT ?,COALESCE(MAX(seq),0) FROM events WHERE conversation_id=? "
+        "ON CONFLICT(conversation_id) DO UPDATE SET after_seq=excluded.after_seq",
+        (cid, cid),
+    )
+    await conn.execute(
+        "DELETE FROM drafts WHERE conversation_id=? AND status='pending' AND action_id="
+        "(SELECT action_id FROM quote_revisions WHERE conversation_id=? AND revision=?)",
+        (cid, cid, revision),
+    )
+
+
+async def selectable_products(cid):
+    rows = await get_db().fetchall(
+        """SELECT json_extract(p.value,'$.offerId') AS id, json_extract(p.value,'$.name') AS name
+           FROM events e, json_each(e.data, CASE json_extract(e.data,'$.type')
+               WHEN 'products' THEN '$.products' WHEN 'quote' THEN '$.quote.lines' END) p
+           WHERE e.conversation_id=? AND json_extract(e.data,'$.type') IN ('products','quote')
+             AND e.seq > COALESCE((SELECT after_seq FROM quote_selection_resets WHERE conversation_id=?),0)
+           ORDER BY e.seq,p.key""",
+        (cid, cid),
+    )
+    return {row["id"]: row["name"] for row in rows}
+
+
 async def from_message(cid: str, text: str):
     """Unambiguous single-SKU purchase or pack count. Mixed intents stay in the normal agent flow."""
     seats = re.fullmatch(
@@ -247,11 +275,8 @@ async def from_message(cid: str, text: str):
         if re.match(CHANGE_QUOTE + r"\b", text.strip(), re.I):
             # Unparsed explicit change goes through normal product discovery, but old terms are no longer actionable.
             async with get_db().tx() as conn:
-                await conn.execute(
-                    "UPDATE quote_revisions SET reselect=1 WHERE conversation_id=? AND revision="
-                    "(SELECT max(revision) FROM quote_revisions WHERE conversation_id=?)",
-                    (cid, cid),
-                )
+                if current := await latest(cid):
+                    await reset_selection(conn, cid, current["revision"])
         return None
     products = await repo.last_products(cid)
     if len(products) != 1:
@@ -299,23 +324,16 @@ async def prepare_revision(conn, cid, request, customer_message, seats):
     revision = current["revision"] if current else 0
     if request.baseRevision != revision:
         raise ApiError(409, "stale_revision", STALE)
-    # The buyer explicitly selects from products shown in their own chat; older cards allow multi-item offers.
-    rows = await get_db().fetchall(
-        "SELECT DISTINCT json_extract(p.value,'$.offerId') AS id FROM events e,"
-        " json_each(e.data,'$.products') p WHERE e.conversation_id=? AND json_extract(e.data,'$.type')='products'",
-        (cid,),
-    )
-    if set(ids) - {r["id"] for r in rows}:
-        raise invalid_input("Сначала подберите эти позиции в текущем чате.")
+    # Seat changes resolve the old lines against the catalogue. Other inputs must come from the current selection.
+    if seats is None and set(ids).difference(await selectable_products(cid)):
+        raise invalid_input("Сначала подберите эти позиции в чате под текущие условия.")
     s = get_settings()
     try:
         details = await asyncio.to_thread(
             catalog_lines, s.catalog_index_path, request.items, s.data_dir / "config" / "quote_terms.json", seats
         )
     except NoSeatVariant:
-        await conn.execute(
-            "UPDATE quote_revisions SET reselect=1 WHERE conversation_id=? AND revision=?", (cid, revision)
-        )
+        await reset_selection(conn, cid, revision)
         action_id = repo.new_id("a")
         written = await repo.append_events(
             cid,
