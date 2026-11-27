@@ -50,6 +50,7 @@ function sync() {
   const length = charCount(message.value.trim());
   const tooLong = length > maxChars;
   byId("counter").textContent = length + " / " + maxChars;
+  byId("counter").hidden = length === 0;
   byId("counter").classList.toggle("over", tooLong);
   message.setAttribute("aria-invalid", String(tooLong));
   byId("send").disabled = locked || !message.value.trim() || tooLong;
