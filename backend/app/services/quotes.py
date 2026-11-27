@@ -16,7 +16,7 @@ from app.agent.quote_calculation import (
     calculate,
     catalog_lines,
 )
-from app.agent.quote_intent import REQUEST, offers_quote
+from app.agent.quote_intent import REQUEST, basket_resize, offers_quote
 from app.agent.quote_pdf import render
 from app.config import get_settings
 from app.contracts.t04 import (
@@ -395,14 +395,32 @@ async def from_message(cid: str, text: str):
         text.strip(),
         re.I,
     )
-    if seats and (current := await latest(cid)):
+    resize = basket_resize(text) if not seats and not handoff_reason(clean) else None
+    if (seats or resize) and (current := await latest(cid)):
+        if resize and resize[1]:
+            async with get_db().tx() as conn:
+                if (await latest(cid))["revision"] != current["revision"]:
+                    raise ApiError(409, "stale_revision", STALE)
+                await require_published(current)
+                result, written = await clarification(
+                    conn,
+                    cid,
+                    text,
+                    f"Пересчитать все строки версии {current['revision']} на {resize[0]} пользователей "
+                    f"с прежними условиями? Для подтверждения напишите «На {resize[0]} пользователей». "
+                    "Для изменения отдельных строк откройте форму КП.",
+                )
+            events.publish(cid, written)
+            return result
         old = read(current)
         req = ProposalRequest(
-            customer=Customer(company=seats[2], inn=seats[3], kpp=seats[4].upper()) if seats[2] else old.customer,
+            customer=Customer(company=seats[2], inn=seats[3], kpp=seats[4].upper())
+            if seats and seats[2]
+            else old.customer,
             items=[Item(offerId=d.product.offerId, packages=d.packages) for d in old.details],
             baseRevision=old.quote.revision,
         )
-        return await prepare(cid, req, customer_message=text, seats=int(seats[1]))
+        return await prepare(cid, req, customer_message=text, seats=int(seats[1]) if seats else resize[0])
     quantity = re.fullmatch(
         r"(?:теперь\s+|(?:измените|поменяйте)\s+(?:количество\s+)?на\s+)?"
         r"(?:по\s+)?([1-9]\d{0,5})\s+упаков(?:ка|ки|ок|ку)"

@@ -59,7 +59,15 @@ def test_quote_receipt_rolls_back_together_with_revision(api, tmp_path, monkeypa
     assert [e["data"]["quote"]["revision"] for e in api.events(cid) if e["data"]["type"] == "quote"] == [1]
 
 
-def test_seats_change_all_licenses_and_preserve_pack_quantities(api, tmp_path):
+@pytest.mark.parametrize(
+    "resize,confirm",
+    [
+        ("Теперь нужно 40 мест для обоих продуктов.", False),
+        ("Обновите все строки на 40 мест.", False),
+        ("Уточнили объём: пересчитайте прежний комплект на 40 пользователей (включая модуль).", True),
+    ],
+)
+def test_seats_change_all_licenses_and_preserve_pack_quantities(api, tmp_path, resize, confirm):
     pairs = [
         ("sv20", 20, "Server", 100),
         ("sv40", 40, "Server", 150),
@@ -83,7 +91,12 @@ def test_seats_change_all_licenses_and_preserve_pack_quantities(api, tmp_path):
         api.say(cid, f"Артикул {sku}")
         api.idle()
     assert request(api, cid, [("sv20", 1), ("cn20", 2)]).status_code == 202
-    api.say(cid, "Теперь нужно 40 мест для обоих продуктов.")
+    api.say(cid, resize)
+    if confirm:
+        api.idle()
+        assert last_quote(api, cid)["revision"] == 1
+        assert "На 40 пользователей" in api.events(cid)[-1]["data"]["text"]
+        api.say(cid, "На 40 пользователей")
     api.idle()
     q = last_quote(api, cid)
     assert (q["revision"], q["knownSubtotalKopecks"]) == (2, 30000)

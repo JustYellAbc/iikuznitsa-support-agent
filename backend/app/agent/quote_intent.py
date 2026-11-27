@@ -24,3 +24,24 @@ def offers_quote(text: str) -> bool:
         )
         and not re.search(r"\b(?:или|оператор\w*|менеджер\w*|отмен\w*|не)\b", question)
     )
+
+
+def basket_resize(text):
+    """An explicit instruction about the whole basket can be executed as a unit.
+    Free-form qualifications require confirming the scope before changing a revision.
+    """
+    command = re.search(
+        r"\b(?:пересчит(?:ай(?:те)?|ать)|измен(?:и(?:те)?|ить)|обнов(?:и(?:те)?|ить))\s+"
+        r"(?:(?:этот|тот|весь|прежний|исходный)\s+(?:же\s+)?(?:состав|комплект|заказ)|"
+        r"(?:все|обе)\s+(?:позиции|строки)|вс[её]\s+кп)\s+на\s+"
+        r"([1-9]\d{0,4})\s+(?:пользовател(?:я|ей|ь)|мест(?:а|о)?|seats?)\b",
+        text,
+        re.I,
+    )
+    if not command:
+        return None
+    prefix = text[: command.start()].strip(" .,:;!").casefold()
+    suffix = text[command.end() :].strip(" .!")
+    if text.rstrip().endswith("?") or re.search(r"\bне\s*$", prefix):
+        return None
+    return int(command[1]), bool(prefix or suffix)

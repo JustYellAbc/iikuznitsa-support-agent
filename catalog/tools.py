@@ -55,6 +55,7 @@ def _offer(row, version: str, *, detail: bool) -> dict:
     item["licenseType"] = values("Тип лицензии")
     if detail:
         item.update(
+            groupId=row["group_id"] if "group_id" in row.keys() else None,
             edition=" / ".join(values("Версия") or []) or None,
             platform=values("Платформа"),
             delivery=values("Способ доставки"),

@@ -336,3 +336,12 @@ def test_unrelated_yes_does_not_open_quote(last):
     from app.agent.quote_intent import offers_quote
 
     assert not offers_quote(last)
+
+
+@pytest.mark.usefixtures("index")
+def test_missing_capacity_only_retries_if_the_evidence_changes(api, provider):
+    responses, requests = provider
+    responses.extend([tool("select_licenses", variants=[{"name": "PaperDesk Pro", "seats": 40}])] * 2)
+    events = say(api, api.new_conversation(), "Хочу лицензию PaperDesk Pro.")
+    assert len(requests) == 2 and "сколько пользователей" in events[-1]["text"]
+    assert all(event["type"] not in {"handoff", "products"} for event in events)
