@@ -93,6 +93,28 @@ class Knowledge(Arguments):
     query: Query
 
 
+class Recall(Arguments):
+    author: Literal["customer", "assistant"]
+    which: Literal["first", "last", "matching"]
+    words: str = Field(default="", max_length=120)
+    quote_to_customer: bool = False
+
+
+def recall_message(history, args):
+    role = "client" if args.author == "customer" else "agent"
+    entries = [(i, m) for i, m in enumerate(history, 1) if m.role == role]
+    if args.which == "matching":
+        words = set(re.findall(r"\w+", args.words.casefold()))
+        if not words:
+            raise ValueError("Укажи ключевые слова прежней реплики или выбери first/last.")
+        ranked = [(len(words.intersection(re.findall(r"\w+", m.text.casefold()))), i, m) for i, m in entries]
+        entries = [(i, m) for score, i, m in sorted(ranked, key=lambda item: item[:2], reverse=True) if score]
+    if not entries:
+        raise ValueError("В истории этого диалога такой реплики не найдено.")
+    i, m = entries[-1] if args.which == "last" else entries[0]
+    return {"message": i, "author": args.author, "text": scrub_pii(m.text)}
+
+
 class Compare(Arguments):
     first: Annotated[str, Field(min_length=2, max_length=100)]
     second: Annotated[str, Field(min_length=2, max_length=100)]
@@ -139,7 +161,8 @@ FUNCTIONS = {
     ),
     "search_catalog": (
         Search,
-        "Поиск по названию или назначению. В query сохрани число мест, тип покупателя и покупки.",
+        "Поиск по названию или назначению. Результат уже содержит данные точной карточки. "
+        "Ответь через respond по refs, если они подтверждают нужный факт. В query сохрани условия покупателя.",
     ),
     "get_offer": (Lookup, "Точная карточка Softline по offerId из диалога или поиска."),
     "search_knowledge": (Knowledge, "Поиск сразу в двух базах: публикации менеджера и инструкции магазина."),
@@ -149,6 +172,16 @@ TOOLS = [
     {"type": "function", "function": {"name": name, "description": description, "parameters": cls.model_json_schema()}}
     for name, (cls, description) in FUNCTIONS.items()
 ]
+RECALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "recall_message",
+        "description": "Прочитать реплику из всей истории этого чата. first/last по автору, matching по словам. "
+        "Для просьбы напомнить, кто что писал, верни цитату через quote_to_customer=true. Для продолжения подбора "
+        "прочти условия покупателя с false и проверь товар по каталогу. Позднее исправление заменяет прежнее условие.",
+        "parameters": Recall.model_json_schema(),
+    },
+}
 
 
 @lru_cache(maxsize=1)
@@ -203,6 +236,23 @@ def serialize(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def catalog_feedback(data, displayed):
+    """Keep full rows for validation; transmit each unchanged catalog record once per model turn."""
+    hits = []
+    for row in data.get("results", []):
+        if "offerId" not in row:
+            return data
+        ref = row["ref"]
+        if displayed.get(ref) == row:
+            hits.append({"ref": ref, "offerId": row["offerId"], "name": row["name"], "already_shown": True})
+        else:
+            hits.append({key: value for key, value in row.items() if value is not None})
+            displayed[ref] = row
+    if hits and all(hit.get("already_shown") for hit in hits):
+        return {"results": hits, "status": "Те же карточки уже проверены. Используй их refs или уточни различие."}
+    return {**data, "results": hits} if hits else data
+
+
 @dataclass
 class Evidence:
     rows: dict = field(default_factory=dict)
@@ -232,7 +282,7 @@ class Evidence:
                 ref = f"r{len(self.rows) + 1}"
             if "body" in row:
                 row = {**row, "body": scrub_pii(row["body"])[:1800]}
-            complete_offer = tool in {"get_offer", "recalled_offers"} or detailed_search
+            complete_offer = tool in {"get_offer", "recalled_offers", "referenced_offers"} or detailed_search
             if ref not in self.detailed or complete_offer:
                 self.rows[ref] = row
             if complete_offer:
@@ -561,6 +611,7 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
     steps = []
     evidence = Evidence()
     searches = {}
+    displayed_catalog = {}
     index = settings.catalog_index_path
     # Include the exchange before a chain of follow-up questions, where the product was last shown.
     discovery = discovery_context(history, text, max_turns=8)
@@ -570,6 +621,7 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         for m in history[-window:]
         if m.role in {"client", "agent"}
     ]
+    available_tools = [*TOOLS, RECALL_TOOL] if context else TOOLS
     messages = [
         {"role": "system", "content": instructions()},
         *context,
@@ -834,19 +886,40 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                 [],
                 None,
             )
+        links, parts = t31.buyer_references(text)
+        if (links or parts) and index.is_file():
+            supplied = await read(
+                "referenced_offers",
+                {"links": len(links), "parts": len(parts)},
+                t31.referenced_offers,
+                index,
+                links,
+                parts,
+            )
+            if supplied["results"]:
+                messages[-1]["content"] += "\n" + serialize(
+                    {
+                        "exact_catalog_references_in_buyer_message": supplied["results"],
+                        "instruction": (
+                            "Это точные совпадения ссылок или кодов производителя из сообщения. "
+                            "Используй refs для ответа на вопрос. Упоминание не означает выбор для покупки. "
+                            "Учитывай запрошенные ограничения и исключённые варианты."
+                        ),
+                    }
+                )
         calls = 0
         repeated_results = 0
         selection_errors = set()
         truncated = False
         last_catalog_round = False
         for _ in range(settings.agent_max_model_calls):
-            if len(serialize([messages, TOOLS]).encode()) > MAX_CONTEXT_BYTES:
+            if len(serialize([messages, available_tools]).encode()) > MAX_CONTEXT_BYTES:
                 raise LLMError("context_limit")
             response = await llm_call(
                 messages,
                 session_id=session.id,
                 step="support_tools",
-                tools=TOOLS,
+                tools=available_tools,
                 temperature=0.2,
                 max_tokens=MAX_OUTPUT_TOKENS,
             )
@@ -897,6 +970,20 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                 fn = call["function"]
                 name = fn.get("name")
                 try:
+                    if name == "recall_message" and context:
+                        recall = Recall.model_validate_json(fn.get("arguments", ""))
+                        data = recall_message(history, recall)
+                        catalog_round = False
+                        await record(
+                            StepTrace(tool=name, args={"message": data["message"]}, result_summary="Найдена реплика")
+                        )
+                        if recall.quote_to_customer:
+                            if len(response.tool_calls) != 1:
+                                raise ValueError("Ответь цитатой отдельным вызовом.")
+                            who = "Вы написали" if recall.author == "customer" else "Я ответил"
+                            return f"{who}: «{data['text']}»", "answer", [], [], None
+                        messages.append({"role": "tool", "tool_call_id": call["id"], "content": serialize(data)})
+                        continue
                     if name not in FUNCTIONS:
                         raise ValueError("Инструмент отсутствует.")
                     args = FUNCTIONS[name][0].model_validate_json(fn.get("arguments", ""))
@@ -962,6 +1049,8 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                 except ValueError as exc:
                     catalog_round = False
                     data = {"error": str(exc)[:180]}
+                if name in {"search_catalog", "get_offer"}:
+                    data = catalog_feedback(data, displayed_catalog)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": serialize(data)})
             repeated_results = (
                 repeated_results + 1

@@ -5,6 +5,7 @@ from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
+from catalog import tools as catalog_tools
 from tests.conftest import api as stand_api  # noqa: F401
 from tests.conftest import client as client
 from tests.conftest import env as env
@@ -14,8 +15,34 @@ from tests.test_t32_agent import tool
 from app.agent.handoff import ASK_DETAIL, offers_operator
 from app.agent.test_catalog_selection import index as index
 from app.agent.test_catalog_selection import say
-from app.agent.tool_agent import Answer, Evidence, checked_answer
+from app.agent.tool_agent import Answer, Evidence, Recall, catalog_feedback, checked_answer, recall_message
 from app.config import get_settings
+
+
+def test_exact_vendor_part_in_buyer_request_is_available_before_first_model_round(stand_api, provider, index):  # noqa: F811
+    with closing(sqlite3.connect(index)) as db:
+        db.execute("UPDATE offers SET vendor_code='SL-901-BA' WHERE id='desk'")
+        db.commit()
+    replies, requests = provider
+    replies.append(tool("respond", kind="product", refs=["r1"], field="price"))
+    events = say(stand_api, stand_api.new_conversation(), "Сколько стоит sl-901-ba?")
+    assert len(requests) == 1
+    assert "790 ₽" in events[-1]["text"] and events[-1]["sources"][0]["url"].endswith("/desk")
+
+
+def test_buyer_reference_matches_whole_store_url_and_skips_codes_in_external_urls(index):  # noqa: F811
+    url = "https://store.softline.ru/software/atlas-321"
+    with closing(sqlite3.connect(index)) as db:
+        db.execute("UPDATE offers SET id='321', source=?, vendor_code='AX-23-STD' WHERE id='desk'", (url + "/",))
+        db.commit()
+
+    def matches(text):
+        return catalog_tools.referenced_offers(index, *catalog_tools.buyer_references(text)).data
+
+    assert [row["offerId"] for row in matches(url + "/?ref=demo")] == ["321"]
+    assert not matches(url.replace("atlas", "another"))
+    assert not matches("https://other.example/AX-23-STD")
+    assert not matches(url.replace("store.softline.ru", "store.softline.ru.other.example"))
 
 
 def test_capabilities_do_not_replace_an_existing_selection(stand_api, provider, index):  # noqa: F811
@@ -266,3 +293,28 @@ def test_buyers_confirmation_rechecks_candidate_before_quote(stand_api, provider
     assert [p["offerId"] for e in selected if e["type"] == "products" for p in e["products"]] == ["desk"]
     assert selected[-1]["purpose"] == "answer" and "795 ₽" in selected[-1]["text"] and len(requests) == 4
     assert stand_api.say(cid, "Подготовить КП").headers["X-Chat-Action"] == "open-quote-form"
+
+
+def test_recall_separates_speakers_and_returns_latest_matching_correction():
+    history = [
+        SimpleNamespace(role="client", text="Нужно 12 мест для проекта Астра."),
+        SimpleNamespace(role="agent", text="Верно ли, что нужно 12 мест?"),
+        SimpleNamespace(role="operator", text="Заметка сотрудника"),
+        SimpleNamespace(role="client", text="Поправка: нужно 8 мест для проекта Астра."),
+    ]
+    first = recall_message(history, Recall(author="customer", which="first"))
+    assert first["message"] == 1 and first["text"] == history[0].text
+    match = recall_message(history, Recall(author="customer", which="matching", words="Астра"))
+    assert match["message"] == 4 and match["text"] == history[-1].text
+    assert recall_message(history, Recall(author="assistant", which="last"))["message"] == 2
+    with pytest.raises(ValueError):
+        recall_message(history, Recall(author="assistant", which="matching", words="Заметка"))
+
+
+def test_same_catalog_ref_is_sent_in_full_again_when_the_record_changes():
+    shown = {}
+    row = {"ref": "r1", "offerId": "007", "name": "Suite", "available": False, "seatLimit": None}
+    assert catalog_feedback({"results": [row]}, shown)["results"][0]["available"] is False
+    assert catalog_feedback({"results": [row]}, shown)["results"][0]["already_shown"]
+    changed = {**row, "seatLimit": ["20"]}
+    assert catalog_feedback({"results": [changed]}, shown)["results"][0]["seatLimit"] == ["20"]

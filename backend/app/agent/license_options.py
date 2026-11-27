@@ -57,7 +57,7 @@ def name_pattern(name):
 
 def license_dialog_context(history, text):
     """Resolve a short numeric answer against the unit in the question that elicited it."""
-    turns = discovery_context(history, text)
+    turns = discovery_context(history, text, max_turns=8)
     exchanges = history[len(history) - 2 * (len(turns) - 1) :]
     for i, question in enumerate(exchanges[1::2], 1):
         count = re.fullmatch(r"(?:на\s+)?([1-9]\d{0,5})[.!]?", turns[i].strip(), re.I)
