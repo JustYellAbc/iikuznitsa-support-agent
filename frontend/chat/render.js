@@ -75,6 +75,8 @@ export function renderEvent({ data, at, actionId }, conversationId, submit, card
         row.append(element("div", label + ": " + (data.quote.terms[field] || "требует согласования")));
       }
       if (data.quote.state === "needs_review") {
+        const pendingPrices = data.quote.lines.filter(line => line.unitPriceKopecks == null).length;
+        if (pendingPrices) row.append(element("p", "Ожидают подтверждения цены: " + pendingPrices + " из " + data.quote.lines.length));
         row.append(element("small", "Сумма известных строк: " + money(data.quote.knownSubtotalKopecks)));
         const link = element("a", "Скачать черновик КП");
         link.href = buyerUrl("/api/v1/conversations/" + encodeURIComponent(conversationId) + "/quotes/" +
