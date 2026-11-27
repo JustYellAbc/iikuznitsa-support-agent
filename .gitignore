@@ -24,6 +24,8 @@ __pycache__/
 .next/
 /dist/
 
+# OS metadata
+.DS_Store
 # Runtime data, databases, partner feeds and generated documents
 /data/
 /data_raw/

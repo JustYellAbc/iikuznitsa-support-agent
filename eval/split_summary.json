@@ -1,0 +1,87 @@
+{
+  "schema_version": "1.2",
+  "archive_filename": "чаты поддержки.zip",
+  "archive_sha256": "08b810ba0e705daa4b817be6c01a654bef5f1ed7e8f2c8ef47f539973bbb85a6",
+  "seed_policy": "secret EVAL_SPLIT_SEED (>= 128 bit), HMAC-SHA256 cluster order; seed is never published",
+  "holdout_ratio_target": 0.2,
+  "similarity_rules": {
+    "shingle_k": 4,
+    "char_shingle_jaccard_threshold": 0.55,
+    "sequence_matcher_prefilter_jaccard": 0.3,
+    "sequence_matcher_threshold": 0.7,
+    "greeting_stripping_min_chars": 12
+  },
+  "total_records": 495,
+  "unique_ids_count": 495,
+  "open_dev_count": 396,
+  "private_holdout_count": 99,
+  "open_dev_ratio": 0.8,
+  "private_holdout_ratio": 0.2,
+  "overlap_count": 0,
+  "cluster_overlap_count": 0,
+  "pinned_ids_count": 22,
+  "pinned_files_applied": [
+    "buy_part_3_masked.txt"
+  ],
+  "anchor_100646_in_open_dev": true,
+  "anchor_100646_cluster_in_open_dev": true,
+  "duplicate_clusters": {
+    "total_clusters": 489,
+    "multi_item_clusters": 5,
+    "clustered_records": 11,
+    "size_distribution": {
+      "1": 484,
+      "2": 4,
+      "3": 1
+    },
+    "open_dev_clusters": 392,
+    "private_holdout_clusters": 97
+  },
+  "categories": {
+    "Follow-up / не дозвонился": {
+      "total": 3,
+      "open_dev": 2,
+      "private_holdout": 1
+    },
+    "Госзакупки / процедуры": {
+      "total": 8,
+      "open_dev": 6,
+      "private_holdout": 2
+    },
+    "Доступность вендора (можно ли купить)": {
+      "total": 45,
+      "open_dev": 36,
+      "private_holdout": 9
+    },
+    "Конфигурация / спецификация": {
+      "total": 70,
+      "open_dev": 56,
+      "private_holdout": 14
+    },
+    "Просто цена конкретного товара": {
+      "total": 131,
+      "open_dev": 105,
+      "private_holdout": 26
+    },
+    "Прочее (покупка)": {
+      "total": 120,
+      "open_dev": 96,
+      "private_holdout": 24
+    },
+    "Скидки / льготы / спецусловия": {
+      "total": 15,
+      "open_dev": 12,
+      "private_holdout": 3
+    },
+    "Счет / КП как документ (с реквизитами)": {
+      "total": 76,
+      "open_dev": 61,
+      "private_holdout": 15
+    },
+    "Физлицо / самозанятый / срок": {
+      "total": 27,
+      "open_dev": 22,
+      "private_holdout": 5
+    }
+  }
+}
