@@ -33,6 +33,7 @@ def test_memory_correction_after_plain_text_uses_buyer_journal(api, provider):
         [
             tool("respond", kind="clarify", question="Какие условия нужны?"),
             {"content": "Вы уточнили количество."},
+            tool("recall_message", author="buyer", which="last", quote_to_customer=True),
             tool("recall_message", author="customer", which="last", quote_to_customer=True),
         ]
     )
@@ -41,7 +42,9 @@ def test_memory_correction_after_plain_text_uses_buyer_journal(api, provider):
     say(api, cid, statement)
     reply = say(api, cid, "Сколько пользователей я указал?")[-1]
     assert reply["text"] == f"Вы написали: «{statement}»"
-    assert "recall_message" in requests[-1]["messages"][-1]["content"]
+    assert "recall_message" in requests[-2]["messages"][-1]["content"]
+    issue = json.loads(requests[-1]["messages"][-1]["content"])["issues"][0]
+    assert issue["field"] == "author" and "customer" in issue["constraint"]
     assert not reply["sources"]
 
 

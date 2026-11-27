@@ -94,9 +94,9 @@ class Knowledge(Arguments):
 
 
 class Recall(Arguments):
-    author: Literal["customer", "assistant"]
-    which: Literal["first", "last", "matching"]
-    words: str = Field(default="", max_length=120)
+    author: Literal["customer", "assistant"] = Field(description="customer — покупатель, assistant — ответы бота.")
+    which: Literal["first", "last", "matching"] = Field(description="Порядок first/last или поиск matching.")
+    words: str = Field(default="", max_length=120, description="Для matching — слова из искомого сообщения.")
     quote_to_customer: bool = False
 
 
@@ -136,7 +136,7 @@ class Answer(Arguments):
     )
     required_seats: Annotated[int, Field(ge=1, le=1000000)] | None = None
     excerpt: str = Field(default="", max_length=550)
-    question: str = Field(default="", max_length=240)
+    question: str = Field(default="", max_length=240, description="Для clarify — только один вопрос, без цен и ссылок.")
     reason: Literal[
         "technical",
         "tender",
@@ -194,6 +194,15 @@ def instructions():
 
 def serialize(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def argument_feedback(exc):
+    # Pydantic's field paths and constraints tell the model what to fix. Do not echo submitted values.
+    issues = [
+        {"field": ".".join(map(str, problem["loc"])), "constraint": problem["msg"]}
+        for problem in exc.errors(include_input=False, include_url=False)[:4]
+    ]
+    return {"error": "Исправь указанные поля вызова.", "issues": issues}
 
 
 def catalog_feedback(data, displayed):
@@ -1004,9 +1013,9 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                         return exc.question, "clarification", [], [], None
                     selection_errors.add(marker)
                     data = {"error": str(exc), "customer_question": exc.question}
-                except ValidationError:
+                except ValidationError as exc:
                     catalog_round = False
-                    data = {"error": "Исправь аргументы по схеме инструмента."}
+                    data = argument_feedback(exc)
                     if name == "select_licenses":
                         data["example_schema"] = {
                             "variants": [{"name": "<название из сообщения покупателя>", "seats": None}]
@@ -1014,6 +1023,9 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                 except ValueError as exc:
                     catalog_round = False
                     data = {"error": str(exc)[:180]}
+                    if name == "respond":
+                        data["catalog_refs"] = [ref for ref, row in evidence.rows.items() if "offerId" in row]
+                        data["article_refs"] = [ref for ref, row in evidence.rows.items() if "body" in row]
                 if name in {"search_catalog", "get_offer"}:
                     data = catalog_feedback(data, displayed_catalog)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": serialize(data)})
