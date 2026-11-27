@@ -155,7 +155,7 @@ def catalog_lookup(query, expression):
     return f'name:"mdaemon" AND ({expression})'
 
 
-def search(index, query, scope="catalog", limit=5, *, license_type=None):
+def search(index, query, scope="catalog", limit=5, *, license_type=None, include_snapshot=False, by_need=False):
     # Quote FTS tokens and bind MATCH to keep raw user input out of query syntax.
     named_family = scope == "catalog" and MDAEMON.search(query)
     normalized = MDAEMON.sub("MDaemon", query) if named_family else query
@@ -163,6 +163,13 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None):
     if not words:
         return []
     expression = " OR ".join(f'"{word}"*' for word in dict.fromkeys(words))
+    if by_need and not named_family:
+        if re.search(r"редакт\w*.*pdf|pdf.*редакт\w*", query, re.I):
+            expression = 'name:"PDF Editor"'
+        elif re.search(r"резервн\w* коп|б[эе]кап|\bbackup\b", query, re.I):
+            expression = "category:резервн* AND category:копирован*"
+        elif re.search(r"почтов\w+ сервер|почтов\w+ ящик", query, re.I):
+            expression = 'name:"Messaging Server" OR name:"Mail Server"'
     with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
         if scope == "knowledge":
@@ -203,6 +210,10 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None):
                 [*bindings, limit],
             )
         result = [dict(r) for r in rows]
+        if include_snapshot and result:
+            snapshot = db.execute("SELECT snapshot FROM metadata").fetchone()[0]
+            for item in result:
+                item["snapshot"] = snapshot
         for item in result:
             if "params" in item:
                 item["params"] = json.loads(item["params"])
