@@ -61,6 +61,24 @@ def test_account_action_and_reference_have_separate_links(source, excerpt, accou
         assert result[0] == "Откройте личный кабинет." and result[3][0].label == "Открыть личный кабинет"
 
 
+@pytest.mark.parametrize(("family", "choice"), [("1С", "1С Бухгалтерия"), ("Renga", "Renga Professional")])
+def test_short_answers_continue_sizing_and_reach_manager_with_scope(family, choice):
+    def msg(role, text):
+        return SimpleNamespace(role=role, text=text)
+
+    initial = f"Нужен комплект {family} на 150 человек"
+    history = [msg("client", initial), msg("agent", "Какое решение нужно?")]
+    handoff = Answer(kind="handoff", reason="outside_catalog")
+    misses = Evidence(catalog_miss=True)
+    scope, purpose, _, _, case = checked_answer(handoff, misses, history, choice, [])
+    assert "150" in scope and purpose == "clarification" and case is None
+    history.extend([msg("client", choice), msg("agent", scope)])
+    fewer = checked_answer(handoff, misses, history, "Это всего в компании", [])
+    assert "Сколько сотрудников" in fewer[0] and fewer[-1] is None
+    direct = checked_answer(handoff, misses, history, "150 одновременных пользователей", [])
+    assert direct[-1].reason == "outside_catalog" and initial in direct[-1].question and choice in direct[-1].question
+
+
 def offer(sku, name, **details):
     return {
         "offerId": sku,

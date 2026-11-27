@@ -130,6 +130,9 @@ def instructions():
 Если спрашивают, что умеет конкретная программа, проверь сведения именно о ней.
 При прямом совпадении используй опубликованный ответ. Проверяй, что статья отвечает именно на вопрос.
 Для нового вопроса о факте товара получи свежую карточку. Не подменяй её смежным товаром.
+При сложной закупке вместе учитывай исходную задачу и ответы на свои уточнения. Численность организации
+сама по себе не задаёт число лицензий. Выясни, сколько людей будет работать в ПО, и нужны ли одновременные сеансы.
+Если выдача содержит дополнения или чужие редакции, уточни существенное различие или проверь карточки кандидатов.
 Ответ на твой вопрос о выборе — продолжение покупки. Сохрани количество и тип покупателя.
 Если ответ подходит нескольким предложенным вариантам, спроси только об оставшемся различии (clarify).
 Не выбирай версию за покупателя. Если выбор однозначен, верни product с field=summary.
@@ -306,6 +309,37 @@ def detail_reply(row, field_name, title_edition, *, compact):
     return f"{summary} {missing} в карточке.", True
 
 
+def discovery_context(history, text):
+    """Keep the buyer's consecutive answers to discovery questions together."""
+    turns = [text]
+    end = len(history)
+    while end >= 2 and len(turns) < 4:
+        buyer, agent = history[end - 2 : end]
+        if buyer.role != "client" or agent.role != "agent" or not agent.text.rstrip().endswith("?"):
+            break
+        if re.search(r"\b(?:другой вопрос|новая тема|другая тема|вместо этого)\b", turns[0], re.I):
+            break
+        if agent.text in {ASK_PRODUCT, OFFER_HELP} or offers_quote(agent.text) or offers_operator(agent.text):
+            break
+        turns.insert(0, buyer.text)
+        end -= 2
+    return turns
+
+
+def capacity_question(turns):
+    body = " ".join(turns).casefold()
+    if not re.search(r"комплект|лицензи|купить|покуп|закуп|подобрать|нуж[ен]|требуется", body):
+        return None
+    people = re.search(r"\b(\d[\d\u00a0 ]{0,7})\s*(?:человек|сотрудник)", body)
+    if not people or re.search(r"одновременн|рабочих мест|\d+\s*(?:лицензи|пользовател|мест\b)", body):
+        return None
+    if len(turns) > 1 and re.fullmatch(r"\s*\d+[.! ]*", turns[-1]):
+        return None
+    if re.search(r"всего|вс[еяю]\s+(?:компани|организаци)|штат", turns[-1], re.I):
+        return "Сколько сотрудников будут непосредственно работать в программе?"
+    return f"{people[1].strip()} — это все сотрудники компании или столько человек будут работать в программе?"
+
+
 def checked_answer(answer, evidence, history, text, previous):
     """Derive all commercial facts, customer links and handoff products from this turn's records."""
     if answer.kind == "capabilities":
@@ -343,6 +377,9 @@ def checked_answer(answer, evidence, history, text, previous):
         ):
             raise ValueError("Нужен один короткий уточняющий вопрос без цен и ссылок.")
         question = answer.question
+        turns = discovery_context(history, text)
+        if len(turns) > 1 and re.search(r"\d+\s*(?:пользовател|лицензи|мест\b)", question, re.I):
+            question = capacity_question(turns) or question
         if history and history[-1].role == "agent" and history[-1].text == question:
             question += "\n\n" + OPERATOR_QUESTION
         return question, "clarification", [], [], None
@@ -364,6 +401,10 @@ def checked_answer(answer, evidence, history, text, previous):
         current = products or ([] if evidence.replaced or conditions != Selection("") else previous)
         route = route_action(history, text, products)
         reason = route.reason if route and not route.clarification else None
+        turns = discovery_context(history, text)
+        scope = capacity_question(turns)
+        if not reason and scope and answer.reason in {"outside_catalog", "insufficient_evidence"}:
+            return scope, "clarification", [], [], None
         if (
             answer.reason == "outside_catalog"
             and evidence.catalog_miss
@@ -376,7 +417,7 @@ def checked_answer(answer, evidence, history, text, previous):
                 "notice",
                 products,
                 [],
-                HandoffRequest(reason=reason, question=text, products=current),
+                HandoffRequest(reason=reason, question=" → ".join(turns), products=current),
             )
         detail = requested_detail(text) if products and answer.reason == "insufficient_evidence" else None
         if detail:
