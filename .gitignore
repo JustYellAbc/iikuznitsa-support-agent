@@ -1,8 +1,9 @@
-# Local credentials
+# Local credentials and pricing overrides
 .env
 .env.*
 !.env.example
 !.env.*.example
+config/pricing.yaml
 *.pem
 *.key
 /secrets/
@@ -24,6 +25,8 @@ __pycache__/
 .next/
 /dist/
 
+# OS metadata
+.DS_Store
 # Runtime data, databases, partner feeds and generated documents
 /data/
 /data_raw/

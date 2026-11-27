@@ -5,7 +5,7 @@ from tests.conftest import api as stand_api  # noqa: F401
 from tests.conftest import client as client
 from tests.conftest import env as env
 
-from app.agent.handoff import OFFER_HELP
+from app.agent.handoff import offers_operator
 from app.agent.product_answers import DELIVERY_GUIDE
 from app.agent.test_catalog_selection import index as index
 from app.agent.test_catalog_selection import say
@@ -21,7 +21,7 @@ def test_known_facts_follow_the_selected_offer_and_keep_selection(stand_api, ind
     assert all(word in answer["text"] for word in ("Pro 9", "Электронный", "электронной почте"))
     assert [s["url"] for s in answer["sources"]] == ["https://example.org/store/desk", DELIVERY_GUIDE]
     changed = say(api, cid, "Какая версия у Widget Server?")[-1]
-    assert changed["text"] == OFFER_HELP and "Pro 9" not in str(changed)
+    assert offers_operator(changed["text"]) and "Pro 9" not in str(changed)
     assert changed["sources"][0]["url"].endswith("/verify")
 
 
@@ -32,9 +32,9 @@ def test_partial_answer_offers_real_handoff_and_preserves_original_question(stan
     say(api, cid, "Для компании, впервые")
     question = "Что точно входит на год? Можно ли пользоваться после?"
     answer = say(api, cid, question)[-1]
-    assert answer["text"] == OFFER_HELP
+    assert offers_operator(answer["text"])
     [ref] = answer["sources"]
-    assert "12 мес" in ref["label"] and "право использования" in ref["label"] and ref["url"].endswith("/new20")
+    assert "12 мес" in answer["text"] and "право использования" in answer["text"] and ref["url"].endswith("/new20")
     api.login()
     assert api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] == []
     say(api, cid, "Да")
@@ -76,8 +76,8 @@ def test_compatibility_and_order_status_cannot_be_inferred_from_delivery_method(
     say(stand_api, cid, "SKU desk")
     for question, label in [("Совместим ли с Windows?", "совместимость"), ("Когда придёт мой заказ?", "состояние")]:
         msg = say(stand_api, cid, question)[-1]
-        assert msg["text"] == OFFER_HELP
-        assert msg["sources"][0]["url"].endswith("/desk") and label in msg["sources"][0]["label"]
+        assert offers_operator(msg["text"])
+        assert msg["sources"][0]["url"].endswith("/desk") and label in msg["text"]
 
 
 def test_missing_knowledge_article_does_not_supply_delivery_instructions(stand_api, index):  # noqa: F811
@@ -134,7 +134,7 @@ def test_partial_fact_consent_preserves_question_and_drops_removed_offer(stand_a
     cid = api.new_conversation()
     question = "Какая версия и какой срок лицензии?"
     say(api, cid, question)
-    assert say(api, cid, "SKU verify")[-1]["text"] == OFFER_HELP
+    assert offers_operator(say(api, cid, "SKU verify")[-1]["text"])
     with sqlite3.connect(index) as db:
         db.execute("DELETE FROM offers WHERE id='verify'")
     if button:
@@ -184,3 +184,42 @@ def test_lowercase_new_product_never_inherits_old_price_or_handoff(stand_api, in
     response = say(stand_api, cid, question)[-1]
     assert "790" not in str(response) and "/desk" not in str(response)
     assert say(stand_api, cid, "Позовите оператора")[-1]["handoff"]["products"] == []
+
+
+@pytest.mark.parametrize("button", [True, False])
+def test_price_and_unknown_term_reach_customer_and_operator(stand_api, index, button):  # noqa: F811
+    with sqlite3.connect(index) as db:
+        db.execute(
+            "UPDATE offers SET params=json_set(params, '$.\"Срок действия\"', json_array(?)) WHERE id=?",
+            ("Не определено", "desk"),
+        )
+    api = stand_api
+    cid = api.new_conversation()
+    question = "Сколько стоит лицензия PaperDesk (артикул desk) и на какой срок она действует — на год или бессрочно?"
+    _, cards, reply = say(api, cid, question)
+    [p] = cards["products"]
+    assert (p["offerId"], p["unitPriceKopecks"], p["licenseTerm"]) == ("desk", 79000, None)
+    assert "790 ₽" in reply["text"] and "срок" in reply["text"].casefold() and "не указан" in reply["text"]
+    assert reply["purpose"] == "clarification" and reply["sources"][0]["url"] == p["source"]["url"]
+    assert "год" not in reply["text"] and "бессроч" not in reply["text"]
+    api.login()
+    assert not api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+    if button:
+        assert (
+            api.call(
+                "customer", "POST", f"/api/v1/conversations/{cid}/actions", json={"type": "request_operator"}
+            ).status_code
+            == 202
+        )
+    else:
+        say(api, cid, "Да")
+    api.idle()
+    [handoff] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+    assert handoff["question"] == question and handoff["products"] == [p]
+
+
+def test_known_term_answers_alternatives_without_handoff(stand_api, index):  # noqa: F811
+    cid = stand_api.new_conversation()
+    reply = say(stand_api, cid, "Какая цена у SKU new20 и на какой срок она действует — на год или бессрочно?")[-1]
+    assert reply["purpose"] == "answer" and "12 мес" in reply["text"] and "1 234,56 ₽" in reply["text"]
+    assert reply["sources"][0]["url"].endswith("/new20")

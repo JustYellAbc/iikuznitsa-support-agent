@@ -1,0 +1,3 @@
+# Закрытая контрольная выборка T10 (holdout_eval.json, dev_ids.json, seed) лежит вне репозитория,
+# в EVAL_HOLDOUT_DIR (по умолчанию ~/.local/share/iikuznitsa-eval-private), поэтому здесь её не перечисляем.
+# data/private/ не закрываем: там индекс каталога для T07/T14 (catalog.sqlite3).

@@ -10,13 +10,14 @@ from app.agent.catalog_selection import (
     CODE,
     LATIN,
     MDAEMON,
+    TERM_ALTERNATIVES,
     Selection,
     named_request,
     offer_assessment,
     offer_product,
     result,
 )
-from app.agent.handoff import OFFER_HELP, PRICE, STOCK
+from app.agent.handoff import OFFER_HELP, OPERATOR_QUESTION, PRICE, STOCK
 from app.contracts.t04 import Product, Source
 from app.services.price_policy import is_supported_currency
 
@@ -90,6 +91,8 @@ def topics_for(text: str, has_products: bool) -> set[str]:
         topics.add("order_status")
     if "rights" in topics:
         topics.add("term")
+        if not re.search(TOPICS["rights"], TERM_ALTERNATIVES.sub("", body)):
+            topics.discard("rights")
     if PRICE.search(body):
         topics.add("price")
     if (
@@ -192,8 +195,9 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
             else:
                 unknown.append(label.lower())
 
-        if "term" in topics:
-            field("Срок по карточке", values("Срок действия"))
+        term = values("Срок действия") if "term" in topics else None
+        if term:
+            field("Срок по карточке", term)
         if "updates" in topics:
             included = re.search(r"подписк[а-яё]* на обновления на \d+ (?:год[а-я]*|лет|месяц[а-я]*)", name, re.I)
             if included:
@@ -237,12 +241,13 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
             facts.append("Наличие требует подтверждения.")
         elif "availability" in topics:
             facts.append("По снимку каталога позиция в наличии." if p.available else "Наличие требует подтверждения.")
+        details = [*facts, *(ref.label for ref in refs)]
+        if term == "":
+            details.append("Срок действия в карточке не указан.")
         if unknown:
-            # The T09/T12 offer opens the operator button. Show the sourced partial answer
-            # alongside it, even when one detail requires the manager.
-            label = " ".join([*facts, "Требует уточнения: " + ", ".join(unknown) + "."])
-            reply = result(OFFER_HELP, products=[p], sources=[Source(url=p.source.url, label=label), *refs])
-        else:
-            reply = result(" ".join([*facts, *(ref.label for ref in refs)]), "answer", [p], sources=[p.source, *refs])
+            details.append("Требует уточнения: " + ", ".join(unknown) + ".")
+        partial = term == "" or bool(unknown)
+        body = " ".join(details) + ("\n\n" + OPERATOR_QUESTION if partial else "")
+        reply = result(body, "clarification" if partial else "answer", [p], sources=[p.source, *refs])
         reply.handoff_reason = assessment.handoff_reason
         return reply
