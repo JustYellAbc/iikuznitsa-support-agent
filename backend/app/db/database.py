@@ -102,6 +102,18 @@ CREATE TABLE IF NOT EXISTS kb_patches (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS kb_phrasings (
+    patch_id TEXT NOT NULL REFERENCES kb_patches(id),
+    question TEXT NOT NULL,
+    PRIMARY KEY (patch_id, question)
+);
+CREATE TABLE IF NOT EXISTS kb_retirements (
+    patch_id TEXT PRIMARY KEY REFERENCES kb_patches(id),
+    replacement_id TEXT REFERENCES kb_patches(id),
+    decided_by TEXT NOT NULL,
+    decided_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS llm_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
@@ -160,6 +172,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5(
     title, body,
     content='kb_articles', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
 );
+
+CREATE VIEW IF NOT EXISTS kb_public_snapshots AS
+    SELECT p.id, a.title, a.body FROM kb_patches p
+    JOIN kb_articles a ON a.url='kb-patch:' || p.id
+    JOIN handoffs h ON h.id=p.handoff_id
+    WHERE p.scope='public_faq' AND p.status='approved' AND p.approved_by IS NOT NULL
+      AND a.origin='patch' AND a.section='public_faq'
+      AND h.status='resolved' AND a.created_at >= h.updated_at
+      AND length(trim(a.title)) > 0 AND length(trim(a.body)) > 0;
+CREATE VIEW IF NOT EXISTS kb_live_publications AS
+    SELECT s.* FROM kb_public_snapshots s
+    WHERE NOT EXISTS (SELECT 1 FROM kb_retirements r WHERE r.patch_id=s.id);
 """
 
 
@@ -189,6 +213,12 @@ class Database:
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
+
+    @asynccontextmanager
+    async def committed_read(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Readers sharing the writer connection must wait for a moderation transaction to finish."""
+        async with self._lock:
+            yield self.conn
 
     @asynccontextmanager
     async def tx(self) -> AsyncIterator[aiosqlite.Connection]:

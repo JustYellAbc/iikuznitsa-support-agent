@@ -3,6 +3,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path
+from pydantic import Field
 
 from app.config import get_settings
 from app.contracts.schemas import (
@@ -16,7 +17,7 @@ from app.contracts.schemas import (
     PatchStatus,
     TelemetrySummary,
 )
-from app.contracts.t04 import ID_PATTERN, Error
+from app.contracts.t04 import ID_PATTERN, Error, Handoff, Id
 from app.core.auth import Principal, require_manager
 from app.core.errors import ApiError, not_found
 from app.core.llm import today_spend_rub, today_start
@@ -95,27 +96,41 @@ async def list_patches(
     return await repository.list_kb_patches(status)
 
 
+class ArticleDraft(KBPatchCreate):
+    phrasings: list[Annotated[str, Field(min_length=1, max_length=1000)]] = Field(default_factory=list, max_length=20)
+
+
+@router.get("/kb/resolved", response_model=list[Handoff])
+async def resolved_cases(principal: Principal = Depends(require_manager)):
+    return await repository.list_resolved_handoffs()
+
+
+@router.get("/kb/articles")
+async def article_history(principal: Principal = Depends(require_manager)):
+    return await repository.publication_history()
+
+
 @router.post("/kb/patches", response_model=KBPatch, status_code=201)
-async def create_patch(body: KBPatchCreate, principal: Principal = Depends(require_manager)) -> KBPatch:
+async def create_patch(body: ArticleDraft, principal: Principal = Depends(require_manager)) -> KBPatch:
     """Предложить ответ в базу знаний (например, итог обращения)."""
-    return await repository.create_kb_patch(body.question, body.answer, body.handoff_id, body.scope)
-
-
-async def _moderate(patch_id: str, new_status: PatchStatus, principal: Principal) -> KBPatch:
-    patch = await repository.get_kb_patch(patch_id)
-    if patch is None:
-        raise not_found("Патч не найден.")
-    if patch.status != "proposed":
-        raise ApiError(409, "already_resolved", f"Патч уже {patch.status}.")
-    return await repository.set_kb_patch_status(patch_id, new_status, principal.id.removeprefix("manager:"))
+    return await repository.create_kb_patch(
+        body.question, body.answer, body.handoff_id, body.scope, tuple(body.phrasings)
+    )
 
 
 @router.post("/kb/patches/{patchId}/approve", response_model=KBPatch)
-async def approve_patch(patchId: PathId, principal: Principal = Depends(require_manager)) -> KBPatch:
+async def approve_patch(
+    patchId: PathId, replaces: Id | None = None, principal: Principal = Depends(require_manager)
+) -> KBPatch:
     """Одобренный патч сразу попадает в kb_articles и полнотекстовый поиск."""
-    return await _moderate(patchId, "approved", principal)
+    return await repository.set_kb_patch_status(patchId, "approved", principal.id.removeprefix("manager:"), replaces)
 
 
 @router.post("/kb/patches/{patchId}/reject", response_model=KBPatch)
 async def reject_patch(patchId: PathId, principal: Principal = Depends(require_manager)) -> KBPatch:
-    return await _moderate(patchId, "rejected", principal)
+    return await repository.set_kb_patch_status(patchId, "rejected", principal.id.removeprefix("manager:"))
+
+
+@router.post("/kb/patches/{patchId}/withdraw", status_code=204)
+async def withdraw_patch(patchId: PathId, principal: Principal = Depends(require_manager)):
+    await repository.withdraw_kb_patch(patchId, principal.id.removeprefix("manager:"))

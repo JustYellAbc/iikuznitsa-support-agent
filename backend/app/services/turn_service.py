@@ -4,12 +4,14 @@ import asyncio
 import logging
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.agent import runner
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Mode, Session, StepTrace
 from app.contracts.t04 import HandoffData, MessageData, ProductsData
 from app.core import events
+from app.core.errors import ApiError
 from app.core.llm import BudgetExceededError
 from app.db import repository
 from app.db.database import get_db
@@ -114,8 +116,7 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
     if turn.decision == "answer" and current is not None and current.session.mode == "pilot":
         turn = turn.model_copy(update={"decision": "draft"})
     for step in turn.steps:
-        if step.tool == "catalog_search" or step.args.get("replaces_products"):
-            step.args["journal_action_id"] = action_id
+        step.args["journal_action_id"] = action_id
     await repository.save_turn(turn)
 
     if turn.decision == "answer":
@@ -157,17 +158,23 @@ async def send_draft(draft_id: str, text: str | None) -> list[dict[str, Any]] | 
 
     None — черновика нет или он уже отправлен.
     """
-    draft = await repository.get_draft(draft_id)
-    if draft is None or draft.status != "pending":
-        return None
-    datas = [dict(d) for d in draft.events]
-    if text is not None:
-        for d in datas:
-            if d.get("type") == "message":
-                d["text"] = text
-        if not any(d.get("type") == "message" for d in datas):
-            datas.append(MessageData(author="agent", purpose="answer", text=text, sources=[]).model_dump(mode="json"))
     async with get_db().tx() as conn:
+        draft = await repository.get_draft(draft_id)
+        if draft is None or draft.status != "pending":
+            return None
+        datas = [dict(d) for d in draft.events]
+        messages = [d for d in datas if d.get("type") == "message"]
+        if text is not None and not messages:
+            datas.append(MessageData(author="agent", purpose="answer", text=text, sources=[]).model_dump(mode="json"))
+        for message in messages:
+            if text is not None and text.strip() != message["text"].strip():
+                message.update(text=text, sources=[])
+                continue
+            for source in message["sources"]:
+                path = urlsplit(source["url"]).path
+                _, route, patch_id = path.rpartition("/api/v1/knowledge/")
+                if route and patch_id.startswith("p_") and not await repository.live_article(conn, patch_id):
+                    raise ApiError(409, "stale_revision", "Статья снята или заменена. Проверьте и измените ответ.")
         await repository.mark_draft_sent(draft_id, conn=conn)
         written = await repository.append_events(draft.conversation_id, draft.action_id, datas, conn=conn)
     events.publish(draft.conversation_id, written)

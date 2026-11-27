@@ -26,6 +26,7 @@ from app.contracts.schemas import (
     StepStats,
 )
 from app.contracts.t04 import Handoff, HandoffReason
+from app.core.errors import ApiError, invalid_input, not_found
 from app.db.database import get_db
 
 EVENTS_PAGE = 100
@@ -320,6 +321,11 @@ async def list_open_handoffs() -> list[Handoff]:
     return [_handoff(r).handoff for r in rows]
 
 
+async def list_resolved_handoffs() -> list[Handoff]:
+    rows = await get_db().fetchall("SELECT * FROM handoffs WHERE status='resolved' ORDER BY updated_at DESC")
+    return [_handoff(r).handoff for r in rows]
+
+
 async def resolve_handoff(handoff_id: str, conn: aiosqlite.Connection | None = None) -> None:
     async with _tx(conn) as c:
         await c.execute("UPDATE handoffs SET status = 'resolved', updated_at = ? WHERE id = ?", (now_iso(), handoff_id))
@@ -409,6 +415,15 @@ async def sent_draft_actions(conversation_id: str) -> set[str]:
     return {row["action_id"] for row in rows}
 
 
+async def visible_turns(conversation_id: str) -> list[AgentTurn]:
+    """Only restore decisions that have actually reached this buyer."""
+    turns = await list_turns(conversation_id)
+    if not any(t.decision == "draft" for t in turns):
+        return turns
+    sent = await sent_draft_actions(conversation_id)
+    return [t for t in turns if t.decision != "draft" or any(s.args.get("journal_action_id") in sent for s in t.steps)]
+
+
 def _draft(row: aiosqlite.Row) -> Draft:
     return Draft(
         id=row["id"],
@@ -464,7 +479,9 @@ def _patch(row: aiosqlite.Row) -> KBPatch:
     return KBPatch(**{k: row[k] for k in row.keys()})
 
 
-async def create_kb_patch(question: str, answer: str, handoff_id: str | None = None, scope: str = "general") -> KBPatch:
+async def create_kb_patch(
+    question: str, answer: str, handoff_id: str | None = None, scope: str = "general", phrasings: tuple[str, ...] = ()
+) -> KBPatch:
     patch = KBPatch(
         id=new_id("p"),
         handoff_id=handoff_id,
@@ -475,10 +492,19 @@ async def create_kb_patch(question: str, answer: str, handoff_id: str | None = N
         created_at=now_iso(),
     )
     async with get_db().tx() as conn:
+        if scope == "public_faq":
+            if not handoff_id or not await _fetchone(conn, "SELECT id FROM handoffs WHERE id=?", (handoff_id,)):
+                raise invalid_input("Для публичной статьи выберите исходное обращение.")
+            if not question.strip() or not answer.strip():
+                raise invalid_input("Заполните общий вопрос и ответ.")
         await conn.execute(
             "INSERT INTO kb_patches(id, handoff_id, question, answer, scope, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (patch.id, handoff_id, question, answer, scope, "proposed", to_iso(patch.created_at)),
+        )
+        await conn.executemany(
+            "INSERT INTO kb_phrasings(patch_id,question) VALUES (?,?)",
+            [(patch.id, q) for q in dict.fromkeys(q.strip() for q in phrasings) if q],
         )
     return patch
 
@@ -496,25 +522,83 @@ async def list_kb_patches(status: PatchStatus | None = None) -> list[KBPatch]:
     return [_patch(r) for r in rows]
 
 
-async def set_kb_patch_status(patch_id: str, status: PatchStatus, approved_by: str | None) -> KBPatch | None:
-    """Одобрение сразу публикует патч в kb_articles + kb_fts (живое обновление поиска)."""
+async def publication_history() -> list[dict]:
+    async with get_db().committed_read() as conn:
+        rows = await conn.execute_fetchall("""SELECT p.id,p.handoff_id,p.question,p.answer,p.approved_by,
+            CASE WHEN p.status='approved' AND r.patch_id IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM kb_public_snapshots s WHERE s.id=p.id)
+                 THEN 'proposed' ELSE p.status END AS status,
+            r.decided_at AS retired_at,r.decided_by,r.replacement_id FROM kb_patches p
+            LEFT JOIN kb_retirements r ON r.patch_id=p.id WHERE p.scope='public_faq' ORDER BY p.created_at DESC""")
+        variants = await conn.execute_fetchall("SELECT patch_id,question FROM kb_phrasings ORDER BY rowid")
+    by_id: dict[str, list[str]] = {}
+    for v in variants:
+        by_id.setdefault(v["patch_id"], []).append(v["question"])
+    return [dict(row, phrasings=by_id.get(row["id"], [])) for row in rows]
+
+
+async def live_article(conn: aiosqlite.Connection, patch_id: str) -> aiosqlite.Row | None:
+    return await _fetchone(conn, "SELECT * FROM kb_live_publications WHERE id=?", (patch_id,))
+
+
+async def _retire_patch(conn: aiosqlite.Connection, patch_id: str, manager: str, replacement: str | None) -> None:
+    active = await live_article(conn, patch_id)
+    if not active or patch_id == replacement:
+        raise ApiError(409, "stale_revision", "Эта версия статьи уже снята или недоступна для замены.")
+    await conn.execute("INSERT INTO kb_retirements VALUES (?,?,?,?)", (patch_id, replacement, manager, now_iso()))
+
+
+async def withdraw_kb_patch(patch_id: str, manager: str) -> None:
     async with get_db().tx() as conn:
+        await _retire_patch(conn, patch_id, manager, None)
+
+
+async def set_kb_patch_status(
+    patch_id: str, status: PatchStatus, approved_by: str, replaces: str | None = None
+) -> KBPatch:
+    """Serialize moderation, publication and optional withdrawal of the previous version."""
+    async with get_db().tx() as conn:
+        row = await _fetchone(conn, "SELECT * FROM kb_patches WHERE id=?", (patch_id,))
+        if row is None:
+            raise not_found("Черновик не найден.")
+        # Older versions could report approval before the case closed. Such a
+        # patch never had a public snapshot. An explicit manager decision can recover it.
+        premature = (
+            row["status"] == "approved"
+            and row["scope"] == "public_faq"
+            and not await _fetchone(
+                conn,
+                "SELECT id FROM kb_public_snapshots WHERE id=? "
+                "UNION SELECT patch_id FROM kb_retirements WHERE patch_id=?",
+                (patch_id, patch_id),
+            )
+        )
+        if row["status"] != "proposed" and not premature:
+            raise ApiError(409, "already_resolved", "По этому черновику уже принято решение.")
+        if status == "approved" and row["scope"] == "public_faq":
+            case = await _fetchone(conn, "SELECT status FROM handoffs WHERE id=?", (row["handoff_id"],))
+            if not case or case["status"] != "resolved":
+                raise ApiError(409, "terms_pending", "Сначала закройте исходное обращение.")
+            if not row["question"].strip() or not row["answer"].strip():
+                raise invalid_input("Заполните общий вопрос и ответ.")
+        if replaces:
+            if status != "approved" or row["scope"] != "public_faq":
+                raise invalid_input("Заменить статью можно только при публикации общего правила.")
+            await _retire_patch(conn, replaces, approved_by, patch_id)
         await conn.execute(
             "UPDATE kb_patches SET status = ?, approved_by = ? WHERE id = ?", (status, approved_by, patch_id)
         )
         if status == "approved":
-            row = await _fetchone(conn, "SELECT question, answer, scope FROM kb_patches WHERE id = ?", (patch_id,))
-            if row:
-                cur = await conn.execute(
-                    "INSERT INTO kb_articles(url, title, section, body, origin, created_at) "
-                    "VALUES (?, ?, ?, ?, 'patch', ?)",
-                    (f"kb-patch:{patch_id}", row["question"], row["scope"], row["answer"], now_iso()),
-                )
-                await conn.execute(
-                    "INSERT INTO kb_fts(rowid, title, body) VALUES (?, ?, ?)",
-                    (cur.lastrowid, row["question"], row["answer"]),
-                )
-    return await get_kb_patch(patch_id)
+            cur = await conn.execute(
+                "INSERT INTO kb_articles(url, title, section, body, origin, created_at) "
+                "VALUES (?, ?, ?, ?, 'patch', ?)",
+                (f"kb-patch:{patch_id}", row["question"], row["scope"], row["answer"], now_iso()),
+            )
+            await conn.execute(
+                "INSERT INTO kb_fts(rowid, title, body) VALUES (?, ?, ?)",
+                (cur.lastrowid, row["question"], row["answer"]),
+            )
+        return _patch(row).model_copy(update={"status": status, "approved_by": approved_by})
 
 
 # --- LLM-вызовы и телеметрия -----------------------------------------------------------

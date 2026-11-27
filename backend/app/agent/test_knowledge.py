@@ -1,5 +1,9 @@
 """Check publication, independent buyer access and the actual T04 journal."""
 
+import asyncio
+import sqlite3
+from contextlib import closing
+
 import pytest
 from tests.conftest import api as stand_api  # noqa: F401
 from tests.conftest import client as client
@@ -11,6 +15,8 @@ from app.agent.test_catalog_selection import index as index
 from app.agent.test_catalog_selection import say
 from app.agent.test_handoff import publish_product
 from app.config import get_settings
+from app.core.errors import ApiError
+from app.db import repository
 
 PATCHES = "/api/v1/manager/kb/patches"
 QUESTION = "Где настроить уведомления в Softline Store?"
@@ -81,18 +87,96 @@ def test_publish_and_verify_both_journals(stand_api, monkeypatch):  # noqa: F811
     assert ask_new_buyer(api, "Где нельзя настроить уведомления в Softline Store?")[1]["text"] != ANSWER
 
 
-@pytest.mark.parametrize("case", ["rejected", "old_scope", "deal", "missing_handoff", "approved_before_close"])
+@pytest.mark.parametrize("case", ["rejected", "old_scope", "deal"])
 def test_unpublished_material_is_private(stand_api, case):  # noqa: F811
     api = stand_api
-    _, hid = source_case(api, resolve=case != "approved_before_close")
+    _, hid = source_case(api)
     scope = {"old_scope": "general", "deal": "customer"}.get(case, "public_faq")
-    pid = propose(api, None if case == "missing_handoff" else hid, scope=scope)
+    pid = propose(api, hid, scope=scope)
     decision = "reject" if case == "rejected" else "approve"
     assert api.call("manager", "POST", f"{PATCHES}/{pid}/{decision}").status_code == 200
-    if case == "approved_before_close":
-        close(api, hid)
     assert api.call("second", "GET", ARTICLE_PATH + pid).status_code == 404
     assert ask_new_buyer(api, QUESTION)[1]["text"] != ANSWER
+
+
+def test_early_approval_is_retryable_after_close(stand_api):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api, resolve=False)
+    invalid = api.call("manager", "POST", PATCHES, json={"scope": "public_faq", "question": QUESTION, "answer": ANSWER})
+    assert invalid.status_code == 422
+    pid = propose(api, hid)
+    approve = f"{PATCHES}/{pid}/approve"
+    assert api.call("manager", "POST", approve).status_code == 409
+    assert api.call("manager", "GET", PATCHES, params={"status": "proposed"}).json()[0]["id"] == pid
+    assert api.call("second", "GET", ARTICLE_PATH + pid).status_code == 404
+    close(api, hid)
+    assert api.call("manager", "POST", approve).status_code == 200
+    assert ask_new_buyer(api, QUESTION)[1]["text"] == ANSWER
+
+
+def test_manager_can_recover_a_premature_approval_from_an_older_database(stand_api):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api, resolve=False)
+    pid = propose(api, hid)
+    with closing(sqlite3.connect(get_settings().db_path)) as db:
+        db.execute("UPDATE kb_patches SET status='approved', approved_by='manager' WHERE id=?", (pid,))
+        db.execute(
+            """INSERT INTO kb_articles(url,title,body,section,origin,created_at)
+            VALUES (?,?,?,'public_faq','patch','2025-01-01')""",
+            ("kb-patch:" + pid, QUESTION, ANSWER),
+        )
+        db.commit()
+    close(api, hid)
+    assert api.call("other", "GET", ARTICLE_PATH + pid).status_code == 404
+    assert api.call("manager", "GET", "/api/v1/manager/kb/articles").json()[0]["status"] == "proposed"
+    assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
+    assert ask_new_buyer(api, QUESTION)[1]["text"] == ANSWER
+
+
+def test_concurrent_publication_has_one_winner(stand_api):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api)
+    pid = propose(api, hid)
+
+    async def run():
+        return await asyncio.gather(
+            *(repository.set_kb_patch_status(pid, "approved", "manager") for _ in range(2)), return_exceptions=True
+        )
+
+    outcomes = api.client.portal.call(run)
+    assert sum(isinstance(o, ApiError) and o.status == 409 for o in outcomes) == 1
+    with closing(sqlite3.connect(get_settings().db_path)) as db:
+        assert db.execute("SELECT count(*) FROM kb_articles WHERE url=?", ("kb-patch:" + pid,)).fetchone()[0] == 1
+
+
+def test_atomic_replacement_withdrawal_and_aliases(stand_api):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api)
+    old = propose(api, hid)
+    assert api.call("manager", "POST", f"{PATCHES}/{old}/approve").status_code == 200
+    alias = "Каким способом поменять уведомления в магазине?"
+    data = {
+        "question": QUESTION,
+        "answer": "Новый порядок.",
+        "scope": "public_faq",
+        "handoff_id": hid,
+        "phrasings": [alias],
+    }
+    new = api.call("manager", "POST", PATCHES, json=data).json()["id"]
+    assert api.call("manager", "POST", f"{PATCHES}/{new}/approve", params={"replaces": old}).status_code == 200
+    assert api.call("other", "GET", ARTICLE_PATH + old).status_code == 404
+    assert ask_new_buyer(api, alias)[1]["text"] == data["answer"]
+    assert ask_new_buyer(api, "Как в Softline Store изменить настройки уведомлений?")[1]["text"] == data["answer"]
+    assert ask_new_buyer(api, alias.replace("поменять", "не поменять"))[1]["text"] != data["answer"]
+    third = propose(api, hid, answer="Следующая версия.")
+    assert api.call("manager", "POST", f"{PATCHES}/{third}/approve", params={"replaces": old}).status_code == 409
+    assert api.call("other", "GET", ARTICLE_PATH + third).status_code == 404
+    assert api.call("second", "POST", f"{PATCHES}/{new}/withdraw").status_code == 403
+    assert api.call("manager", "POST", f"{PATCHES}/{new}/withdraw").status_code == 204
+    assert api.call("other", "GET", ARTICLE_PATH + new).status_code == 404
+    assert ask_new_buyer(api, alias)[1]["text"] != data["answer"]
+    audit = {r["id"]: r for r in api.call("manager", "GET", "/api/v1/manager/kb/articles").json()}
+    assert audit[old]["replacement_id"] == new and audit[new]["decided_by"] == "manager"
 
 
 def test_conflict_and_mandatory_handoff(stand_api):  # noqa: F811
@@ -135,3 +219,100 @@ def test_faq_keeps_prior_catalog_selection(stand_api, index):  # noqa: F811
     assert say(api, cid, QUESTION)[-1]["text"] == ANSWER
     _, after, _ = say(api, cid, "Продлеваем, подписка действует.")
     assert after["products"][0]["offerId"] == "renew"
+
+
+@pytest.mark.parametrize("question", ["Цена этой лицензии", "Назовите цену лицензии", "Цена этой лицензии?"])
+def test_catalog_wins_over_published_amount(stand_api, index, question):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api)
+    pid = propose(api, hid, question=question, answer="Цена 7000 рублей.")
+    assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
+    cid = api.new_conversation()
+    say(api, cid, "Покупаем впервые MDaemon на 20 пользователей для юрлица")
+    answer = say(api, cid, question)[-1]
+    assert "1 234,56 ₽" in answer["text"] and "/store/new20" in answer["sources"][0]["url"]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Как поменять электронную почту в профиле?",
+        "Как отправить запрос на смену адреса электронной почты?",
+        "Куда отправить запрос в Softline Store?",
+    ],
+)
+def test_approved_procedure_can_interrupt_discovery(stand_api, question):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api)
+    pid = propose(api, hid, question=question)
+    assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
+    cid = api.new_conversation()
+    say(api, cid, "Не знаю, что выбрать")
+    assert say(api, cid, question)[-1]["text"] == ANSWER
+
+
+def pilot_draft(api, cid, question):
+    say(api, cid, question)
+    drafts = api.call("manager", "GET", "/api/v1/manager/drafts").json()
+    return next(d for d in drafts if d["conversation_id"] == cid)
+
+
+def send_draft(api, draft, text=None):
+    return api.call(
+        "manager", "POST", f"/api/v1/manager/drafts/{draft['id']}/send", json={} if text is None else {"text": text}
+    )
+
+
+def test_faq_between_sent_pilot_drafts_keeps_renewal_on_operator_card(stand_api, index):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api)
+    pid = propose(api, hid)
+    assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
+    api.call("manager", "POST", "/api/v1/manager/mode", json={"mode": "pilot"})
+    cid = api.new_conversation()
+    for q in ["Покупаем впервые MDaemon на 20 пользователей для юрлица", QUESTION, "Продлеваем, подписка действует."]:
+        assert send_draft(api, pilot_draft(api, cid, q)).status_code == 200
+    card = say(api, cid, "Позовите оператора")[-1]["handoff"]
+    assert [(p["offerId"], p["unitPriceKopecks"]) for p in card["products"]] == [("renew", 87500)]
+
+
+@pytest.mark.parametrize("decision", ["withdraw", "replace"])
+@pytest.mark.parametrize("base", ["https://demo.example.org", "https://demo.example.org/support"])
+def test_stale_pilot_draft_must_be_revised_before_delivery(stand_api, decision, base, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("PUBLIC_BASE_URL", base)
+    get_settings.cache_clear()
+    api = stand_api
+    _, hid = source_case(api)
+    pid = propose(api, hid)
+    assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
+    api.call("manager", "POST", "/api/v1/manager/mode", json={"mode": "pilot"})
+    cid = api.new_conversation()
+    draft = pilot_draft(api, cid, QUESTION)
+    assert send_draft(api, draft, ANSWER).status_code == 200
+    assert api.events(cid)[-1]["data"]["sources"]
+    draft = pilot_draft(api, cid, QUESTION)
+    if decision == "replace":
+        new = propose(api, hid, answer="Другая процедура.")
+        assert api.call("manager", "POST", f"{PATCHES}/{new}/approve", params={"replaces": pid}).status_code == 200
+    else:
+        assert api.call("manager", "POST", f"{PATCHES}/{pid}/withdraw").status_code == 204
+    previous = api.events(cid)
+    assert send_draft(api, draft).status_code == 409
+    assert previous == api.events(cid)
+    assert send_draft(api, draft, "Помогу изменить настройки вручную.").status_code == 200
+    assert api.events(cid)[-1]["data"]["sources"] == []
+
+
+def test_seat_answer_after_a_faq_cannot_become_an_article_number(stand_api, index):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api)
+    pid = propose(api, hid)
+    assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
+    with closing(sqlite3.connect(index)) as db:
+        db.execute("UPDATE offers SET id='20' WHERE id='desk'")
+        db.commit()
+    cid = api.new_conversation()
+    assert "На сколько пользователей" in say(api, cid, "Покупаем впервые MDaemon для юрлица")[-1]["text"]
+    assert say(api, cid, QUESTION)[-1]["text"] == ANSWER
+    _, cards, _ = say(api, cid, "20")
+    assert [p["offerId"] for p in cards["products"]] == ["new20"]

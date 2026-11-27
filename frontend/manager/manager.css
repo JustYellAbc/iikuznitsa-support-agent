@@ -39,6 +39,12 @@ textarea { resize: vertical; }
 .primary { border-color: #244f67; background: #244f67; color: white; }
 .feedback { margin: 12px 0 0; }
 .feedback:empty { margin: 0; }
+details summary { cursor: pointer; margin: 16px 0 8px; }
+#resolved, #articles { display: grid; gap: 8px; }
+#resolved button { text-align: left; }
+#articles article { padding: 10px; border: 1px solid #dce4e8; border-radius: 8px; margin-bottom: 10px; }
+#articles p { white-space: pre-wrap; }
+#articles select { max-width: 100%; }
 .login { max-width: 400px; margin-top: 22px; }
 .login h2 { margin-bottom: 18px; }
 @media (max-width: 710px) {

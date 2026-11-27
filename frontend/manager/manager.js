@@ -121,12 +121,18 @@ function openCard(item) {
   $("result").textContent = "";
   $("card").hidden = !item;
   $("no-selection").hidden = Boolean(item);
+  const resolved = item?.status === "resolved";
+  $("compose").hidden = Boolean(resolved);
+  $("knowledge").hidden = !resolved;
+  $("article-form").reset();
+  $("articles").replaceChildren();
+  $("kb-result").textContent = "";
   if (item) {
     $("reason").textContent = reasons[item.reason];
     $("question").textContent = item.question;
     $("products").replaceChildren();
     if (item.products.length) $("products").append(element("h3", "Выбранные позиции"), productList(item.products));
-    showComposer();
+    if (resolved) loadArticles(item.handoffId); else showComposer();
     readHistory();
   }
   showQueue();
@@ -138,6 +144,8 @@ function connectionError(error) {
     refreshNumber++;
     clearTimeout(timer);
     drafts.clear();
+    $("archive").open = false;
+    $("resolved").replaceChildren();
     items = [];
     openCard(null);
     $("desk").hidden = true;
@@ -184,9 +192,11 @@ async function refresh() {
     $("connection").textContent = "Очередь обновлена · " + clock.format(new Date());
     const changed = JSON.stringify(items) !== JSON.stringify(incoming);
     items = incoming;
-    if (selected && !items.some(item => item.handoffId === selected.handoffId)) {
+    if (selected && selected.status !== "resolved" && !items.some(item => item.handoffId === selected.handoffId)) {
       const id = selected.handoffId;
-      openCard(null);
+      const closed = await loadArchive();
+      if (attempt !== refreshNumber) return;
+      if (selected?.handoffId === id) openCard(closed.find(item => item.handoffId === id) || null);
       drafts.delete(id);
       $("result").textContent = "Обращение закрыто.";
     } else {
@@ -249,4 +259,4 @@ $("compose").onsubmit = async e => {
   }
 };
 
-refresh();
+window.addEventListener("DOMContentLoaded", refresh);

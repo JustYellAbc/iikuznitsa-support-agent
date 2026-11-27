@@ -12,55 +12,56 @@ from app.contracts.schemas import AgentReply, AgentTurn, StepTrace
 from app.contracts.t04 import Id, Source
 from app.core.errors import not_found
 from app.db.database import get_db
-from app.db.repository import new_id
+from app.db.repository import live_article, new_id
 
 router = APIRouter()
 ARTICLE_PATH = "/api/v1/knowledge/"
 
-# Existing patches default to "general". Publication for other buyers must be explicit.
-# Read the actual publication snapshot, and never select text from the source conversation.
-PUBLISHED = """
-    SELECT p.id, a.title, a.body
-    FROM kb_articles AS a
-    JOIN kb_patches AS p ON a.url = 'kb-patch:' || p.id
-    JOIN handoffs AS h ON h.id = p.handoff_id
-    WHERE a.origin = 'patch' AND a.section = 'public_faq'
-      AND p.scope = 'public_faq' AND p.status = 'approved' AND p.approved_by IS NOT NULL
-      AND h.status = 'resolved' AND a.created_at >= h.updated_at
-      AND length(trim(a.title)) > 0 AND length(trim(a.body)) > 0
-"""
-
 
 @router.get(ARTICLE_PATH + "{article_id}", response_class=PlainTextResponse, tags=["База знаний"])
 async def public_article(article_id: Id) -> PlainTextResponse:
-    article = await get_db().fetchone(PUBLISHED + " AND p.id = ?", (article_id,))
+    async with get_db().committed_read() as conn:
+        article = await live_article(conn, article_id)
     if article is None:
         raise not_found("Статья не найдена.")
-    return PlainTextResponse(f"{article['title']}\n\n{article['body']}", headers={"X-Content-Type-Options": "nosniff"})
+    return PlainTextResponse(
+        f"{article['title']}\n\n{article['body']}",
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+    )
 
 
 def question_key(text: str) -> str:
     text = " ".join(text.casefold().replace("ё", "е").split())
     text = re.sub(r"^(?:(?:здравствуйте|добрый день|подскажите|пожалуйста)[\s,!:.-]+)+", "", text)
-    return text.strip(" ?!.")
+    text = text.strip(" ?!.")
+    # Only normalise a how/where configuration question. Keep every qualifier,
+    # including the store, negations and numbers. Other paraphrases are curated.
+    if text.startswith(("как ", "где ")):
+        body = text[4:]
+        platform = re.search(r"\b(?:в|на) [a-z][a-z0-9.-]*(?: [a-z][a-z0-9.-]*)*\b", body)
+        if platform:
+            body = " ".join((body[: platform.start()] + " " + body[platform.end() :]).split())
+        body = re.sub(r"^изменить настройки\b", "настроить", body)
+        if body.startswith("настроить "):
+            body = re.sub(r"\b([а-я]+(?:ени|ани))(?:й|я)\b", r"\1я", body)
+            return body + (" " + platform[0] if platform else "")
+    return text
 
 
 async def answer_published(session_id: str, question: str, emit_step) -> AgentReply | None:
     started = perf_counter()
     key = question_key(question)
-    # Match the whole question, retaining negation, numbers and qualifiers.
-    words = re.findall(r"[^\W_]+", key)
-    if len(words) < 2:
+    if len(key.split()) < 2:
         return None
-    # FTS is only a candidate filter. unicode61 treats ё and е differently in Cyrillic.
-    tokens = [word for word in words if "е" not in word]
-    sql = PUBLISHED
-    params = ()
-    if tokens:
-        sql += " AND a.id IN (SELECT rowid FROM kb_fts WHERE kb_fts MATCH ?)"
-        params = ("title : (" + " AND ".join(f'"{word}"' for word in tokens[:6]) + ")",)
-    rows = await get_db().fetchall(sql + " ORDER BY a.id DESC", params)
-    matches = [row for row in rows if question_key(row["title"]) == key]
+    async with get_db().committed_read() as conn:
+        rows = await conn.execute_fetchall("""SELECT p.*, v.question AS phrasing FROM kb_live_publications p
+            LEFT JOIN kb_phrasings v ON v.patch_id=p.id ORDER BY p.id""")
+    matches_by_id = {
+        row["id"]: row
+        for row in rows
+        if key == question_key(row["title"]) or (row["phrasing"] and key == question_key(row["phrasing"]))
+    }
+    matches = list(matches_by_id.values())
     if not matches:
         return None
     article = matches[0]
