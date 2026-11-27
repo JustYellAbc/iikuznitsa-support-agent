@@ -30,9 +30,19 @@ function sourceLink(source, label = source.label) {
   return link;
 }
 
+// T04 exposes the catalogue name but no separate sale unit.
+function priceLabel(name) {
+  const parts = name.toLowerCase().split(/[,;()]/).map(part => part.trim());
+  const kit = /^(?:базовый\s+)?комплект\s+(?:лицензий(?:\s|$)|(?:из\s+|на\s+)?\d+\s+(?:лицензи|пользовател))/;
+  const key = /^(?:тип поставки:\s*)?электронный ключ(?:\s+на\s+\d+\s+рабоч(?:ее место|их мест[а]?))?$/;
+  if (parts.some(part => kit.test(part))) return "Цена комплекта";
+  if (parts.some(part => key.test(part))) return "Цена электронного ключа";
+  return "Цена позиции";
+}
+
 function productCard(product) {
   const card = element("div", null, "result");
-  const price = product.priceState === "on_request" ? "Цена по запросу" : money(product.unitPriceKopecks) + " за единицу по карточке";
+  const price = product.priceState === "on_request" ? "Цена по запросу" : priceLabel(product.name) + ": " + money(product.unitPriceKopecks);
   card.append(element("strong", product.name), element("small", "Артикул " + product.offerId), element("div", price));
   if (product.priceState === "availability_check") card.append(element("small", "Наличие требует подтверждения"));
   const link = sourceLink(product.source, "Открыть в магазине");
@@ -68,8 +78,8 @@ export function renderEvent({ data, at, actionId }, conversationId, submit, card
       row.append(element("strong", "Расчёт · версия " + data.quote.revision),
         element("p", data.quote.totalKopecks == null ? "Условия на согласовании" : "Итого " + money(data.quote.totalKopecks)));
       for (const line of data.quote.lines) {
-        row.append(element("p", line.name + " · " + line.packages + " уп. × " +
-          (line.unitPriceKopecks == null ? "цена на согласовании" : money(line.unitPriceKopecks))));
+        const price = line.unitPriceKopecks == null ? "Цена на согласовании" : priceLabel(line.name) + ": " + money(line.unitPriceKopecks);
+        row.append(element("p", line.name + " · " + price + " · Количество: " + line.packages));
       }
       for (const [field, label] of [["payment","Оплата"],["delivery","Поставка"],["taxNote","Налоги"],["validUntil","Действует до"]]) {
         row.append(element("div", label + ": " + (data.quote.terms[field] || "требует согласования")));

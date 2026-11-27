@@ -113,7 +113,7 @@ export function setupQuotes(conversation, request, newKey) {
         check.checked = items.has(id) || (!saved.requiresReselection && (offers || !items.size) &&
           (choices.length === 1 || (prefillCurrent && selection.has(id))));
         qty.type = "number"; qty.min = "1"; qty.max = "100000"; qty.step = "1";
-        qty.setAttribute("aria-label", "Упаковки: " + name);
+        qty.setAttribute("aria-label", "Количество: " + name);
         qty.value = String(items.get(id) || 1); qty.disabled = !check.checked;
         check.onchange = () => { qty.disabled = !check.checked; updateSubmit(); };
         const priceNote = selection.get(id) === "on_request" ? " · Цена по запросу" : "";
