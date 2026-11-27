@@ -39,6 +39,28 @@ def test_capabilities_of_named_product_still_use_catalog(stand_api, provider, in
     assert len(requests) == 2 and any(e["type"] == "products" for e in reply)
 
 
+@pytest.mark.parametrize(
+    ("source", "excerpt", "account_link"),
+    [
+        (
+            "https://docs.softline.com/ru-ru/lk/view-statuses",
+            "Откройте личный кабинет ( https://lk.softline.ru/ ).",
+            True,
+        ),
+        ("https://docs.softline.com/ru-ru/lk/view-statuses", "Заказ отображается после оплаты.", False),
+        ("https://other.example/ru-ru/lk/view-statuses", "Откройте личный кабинет.", False),
+    ],
+)
+def test_account_action_and_reference_have_separate_links(source, excerpt, account_link):
+    row = {"title": "Просмотр статуса заказа", "source": source, "body": excerpt + " https://lk.softline.ru/"}
+    result = checked_answer(
+        Answer(kind="knowledge", refs=["r1"], excerpt=excerpt), Evidence(rows={"r1": row}), [], "", []
+    )
+    assert [s.url for s in result[3]] == (["https://lk.softline.ru/", source] if account_link else [source])
+    if account_link:
+        assert result[0] == "Откройте личный кабинет." and result[3][0].label == "Открыть личный кабинет"
+
+
 def offer(sku, name, **details):
     return {
         "offerId": sku,

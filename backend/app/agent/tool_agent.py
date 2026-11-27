@@ -9,6 +9,7 @@ from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from catalog import tools as t31
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -317,7 +318,20 @@ def checked_answer(answer, evidence, history, text, previous):
             raise ValueError("Требуется одна подходящая статья. Учитывай точную публикацию менеджера.")
         if not answer.excerpt or answer.excerpt not in rows[0]["body"]:
             raise ValueError("Верни дословный короткий фрагмент body.")
-        return answer.excerpt, "answer", [], [Source(url=rows[0]["source"], label=rows[0]["title"])], None
+        row = rows[0]
+        sources = [Source(url=row["source"], label=row["title"])]
+        excerpt = answer.excerpt
+        guide = urlsplit(row["source"])
+        account = "https://lk.softline.ru/"
+        if (
+            guide.hostname in {"docs.softline.com", "docs.softline.ru"}
+            and guide.path.startswith("/ru-ru/lk/")
+            and account in row["body"]
+            and (account in excerpt or re.search(r"личн\w* кабинет|раздел\w* [«\"]?счета и платежи", excerpt, re.I))
+        ):
+            sources.insert(0, Source(url=account, label="Открыть личный кабинет"))
+            excerpt = re.sub(r"\s*\(\s*" + re.escape(account) + r"\s*\)", "", excerpt)
+        return excerpt, "answer", [], sources, None
     if any("offerId" not in row for row in rows):
         raise ValueError("Для товара используй refs карточек.")
     products = [product_from_row(row) for row in rows]
