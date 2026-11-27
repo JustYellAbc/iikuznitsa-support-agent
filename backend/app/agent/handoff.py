@@ -13,6 +13,13 @@ OPERATOR_QUESTION = "Подключить оператора, чтобы он у
 OFFER_HELP = f"В источнике нет подтверждённых сведений. {OPERATOR_QUESTION}"
 ASK_TOPIC = "Подскажите, с каким вопросом нужна помощь?"
 CONFIRMED = "Передал вопрос оператору. Он увидит переписку и ответит в этом чате."
+# Only a bare report of being stuck. New product names, symptoms and error codes need a normal answer.
+STILL_STUCK = re.compile(
+    r"(?=.*\b(?:непонятно|не\s|что (?:мне )?делать))"
+    r"(?:(?:я|и|но|это|мне|опять|пока|вс[её] равно|вс[её] ещ[её]|по-прежнему|так и|"
+    r"не понял[аи]?|не понимаю|непонятно|не получается|не помогло|не работает|что (?:мне )?делать)"
+    r"(?:[\s,.!?—-]+|$))+"
+)
 ASK_PRODUCT = "О какой программе идёт речь и что вы хотите узнать о ней?"
 ASK_DETAIL = "Что уточнить по выбранному товару — цену, условия лицензии или оформление заказа?"
 SERVICE_FAILURE = (
@@ -164,6 +171,15 @@ def route_action(
         return Routing(reason, text)
     if history and history[-1].role == "agent" and offers_operator(history[-1].text) and AFFIRMATIVE.fullmatch(body):
         return Routing("insufficient_evidence", open_question(history, text, True))
+    if (
+        len(history) >= 2
+        and history[-1].role == "agent"
+        and history[-1].text.rstrip().endswith("?")
+        and history[-2].role == "client"
+        and not opening_chatter(history[-2].text.strip().casefold())
+        and STILL_STUCK.fullmatch(body)
+    ):
+        return Routing("insufficient_evidence", history[-2].text, clarification=OFFER_HELP)
     if finding == "partner_required":
         return Routing("outside_catalog", text)
     if len(products) == 1:
