@@ -27,6 +27,24 @@ test("Виджет Т09 на примерах контракта", async t => {
     once(lines, "line"),
     once(preview, "exit").then(() => { throw new Error("Предпросмотр завершился до запуска"); }),
   ]);
+  for (const entry of ["/chat", "/chat/"]) {
+    await t.test(`Прямой вход и перезагрузка по ${entry}`, async t => {
+      const page = await browser.newPage();
+      t.after(() => page.close());
+      const address = new URL(entry + "?source=demo", url).href;
+      await page.goto(address);
+      for (const reload of [false, true]) {
+        if (reload) await page.reload();
+        assert.equal(page.url(), address);
+        assert.ok(await page.locator('link[rel="stylesheet"]').evaluate(el => el.sheet?.cssRules.length > 0));
+        await page.getByRole("button", { name: "Чат с поддержкой" }).click();
+        await page.getByRole("textbox", { name: "Ваше сообщение" }).waitFor();
+        for (const logo of [".brand img", ".wordmark"]) {
+          assert.ok(await page.locator(logo).evaluate(img => img.complete && img.naturalWidth > 0));
+        }
+      }
+    });
+  }
   await t.test("На мобильном экране видны три состояния цены и источники", async t => {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
     t.after(() => page.close());
