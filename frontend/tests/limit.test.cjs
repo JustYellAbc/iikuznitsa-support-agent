@@ -62,13 +62,13 @@ test("Чат считает 500 символов как сервер и не т�
   const send = page.getByRole("button", { name: "Отправить сообщение" });
   const counter = page.locator("#counter");
   const feedback = page.locator("#feedback");
-  assert.equal(await counter.isVisible(), true);
-  assert.equal(await counter.innerText(), "0 / 500");
+  assert.equal(await counter.isVisible(), false);
 
   for (const [name, make] of Object.entries(samples)) {
     await t.test(name, async () => {
       const over = make(limit + 1);
       await message.fill(over);
+      assert.equal(await counter.isVisible(), true);
       assert.equal(await counter.innerText(), "501 / 500");
       assert.equal(await send.isDisabled(), true);
       assert.equal(await message.getAttribute("aria-invalid"), "true");
