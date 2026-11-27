@@ -2,6 +2,9 @@
 # CORS выставляет FastAPI (CORS_ORIGINS в .env): дублирование заголовков здесь ломает браузерный CORS.
 
 (stand) {
+	# #90: стенд не индексируется. `?` — только если заголовок не выставил backend (NoIndexMiddleware).
+	header ?X-Robots-Tag "noindex, nofollow"
+
 	@backend path /api/* /health
 	handle @backend {
 		reverse_proxy backend:8000 {

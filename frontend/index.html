@@ -3,20 +3,34 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
   <title>Softline · ИИ-агент поддержки</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 16px; color: #1a1a1a; background: #fff; }
+    :root { --demo-h: 30px; }
+    body { font-family: system-ui, sans-serif; margin: 0; color: #1a1a1a; background: #fff; }
+    main { max-width: 640px; margin: 48px auto; padding: 0 16px; }
     code { background: #f2f2f2; padding: 2px 4px; border-radius: 4px; }
+    .demo-banner { position: sticky; top: 0; display: flex; align-items: center; justify-content: center; height: var(--demo-h); padding: 0 12px; overflow: hidden; background: #22212a; color: #fff; font-size: 13px; line-height: 16px; text-align: center; white-space: nowrap; }
+    .demo-banner > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    @media (max-width: 800px) {
+      :root { --demo-h: 36px; }
+      .demo-banner { font-size: 12px; line-height: 15px; white-space: normal; }
+      .demo-extra { display: none; }
+    }
+    @media (max-width: 360px) { .demo-banner { font-size: 11px; } }
   </style>
 </head>
 <body>
+  <div class="demo-banner" role="note"><span><b>Демо-прототип конкурса „ИИкузница“</b><span class="demo-extra"> — учебно-конкурсный стенд,</span> не является официальным магазином store.softline.ru</span></div>
   <!-- Заглушка. frontend/ — зона Михаила: замените этот файл виджетом и консолью менеджера. -->
-  <h1>ИИ-агент поддержки Softline</h1>
-  <p>Стенд работает. Интерфейс чата появится здесь.</p>
-  <ul>
-    <li><a href="/manager/">Рабочее место менеджера</a></li>
-    <li><a href="/health">/health</a> — состояние стенда</li>
-    <li><a href="/api/docs">/api/docs</a> — OpenAPI (Swagger UI)</li>
-  </ul>
+  <main>
+    <h1>ИИ-агент поддержки Softline</h1>
+    <p>Стенд работает. Интерфейс чата появится здесь.</p>
+    <ul>
+      <li><a href="/manager/">Рабочее место менеджера</a></li>
+      <li><a href="/health">/health</a> — состояние стенда</li>
+      <li><a href="/api/docs">/api/docs</a> — OpenAPI (Swagger UI)</li>
+    </ul>
+  </main>
 </body>
 </html>

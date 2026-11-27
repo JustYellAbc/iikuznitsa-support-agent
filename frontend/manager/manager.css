@@ -1,6 +1,15 @@
 * { box-sizing: border-box; }
-:root { --accent: #a20c33; --line: #dedbe0; color-scheme: light; font: 16px/1.5 Inter, "Segoe UI", sans-serif; color: #22212a; background: #f7f6f2; }
+:root { --accent: #a20c33; --line: #dedbe0; --demo-h: 30px; color-scheme: light; font: 16px/1.5 Inter, "Segoe UI", sans-serif; color: #22212a; background: #f7f6f2; }
 body { margin: 0; }
+/* #90: маркировка конкурсного стенда. */
+.demo-banner { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: center; height: var(--demo-h); padding: 0 12px; overflow: hidden; background: #22212a; color: #fff; font-size: 13px; line-height: 16px; text-align: center; white-space: nowrap; }
+.demo-banner > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 800px) {
+  :root { --demo-h: 36px; }
+  .demo-banner { font-size: 12px; line-height: 15px; white-space: normal; }
+  .demo-extra { display: none; }
+}
+@media (max-width: 360px) { .demo-banner { font-size: 11px; } }
 [hidden] { display: none !important; }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; border: 1px solid #b7aeb3; background: white; color: inherit; border-radius: 8px; padding: .56rem .95rem; min-height: 44px; }
