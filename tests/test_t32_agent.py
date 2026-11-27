@@ -50,6 +50,48 @@ def test_repeated_search_without_new_offers_stops_and_clarifies(api, provider):
     assert any(step.tool == "catalog_repeated_results" for step in trace)
 
 
+@pytest.mark.usefixtures("index")
+def test_refining_search_can_use_same_card_without_an_extra_model_round(api, provider):
+    answers, requests = provider
+    queries = ["PaperDesk", "PaperDesk Pro", "PaperDesk для покупки", "PaperDesk Pro"]
+    answers.extend(tool("search_catalog", query=q) for q in queries)
+    answers.append(tool("respond", kind="product", refs=["r1"], field="delivery"))
+    cid = api.new_conversation()
+    result = say(api, cid, "Какая поставка у PaperDesk Pro?")
+    assert "Электронный" in result[-1]["text"] and result[-1]["sources"][0]["url"].endswith("/desk")
+    trace = api.client.portal.call(list_turns, cid)[-1].steps
+    assert sum(s.tool == "search_catalog" for s in trace) == 3
+    assert not any(s.tool == "get_offer" for s in trace)
+    assert len(requests) == len(queries) + 1
+
+
+@pytest.mark.usefixtures("index")
+@pytest.mark.parametrize("model_offers_help", [True, False])
+def test_empty_catalog_results_offer_operator_before_opening_case(api, provider, model_offers_help):
+    answers, requests = provider
+    search = tool("search_catalog", query="NotACatalogProduct")
+    answers.extend(
+        [search, tool("respond", kind="handoff", reason="outside_catalog")] if model_offers_help else [search] * 3
+    )
+    cid = api.new_conversation()
+    first = say(api, cid, "Хочу купить NotACatalogProduct")
+    assert "оператора" in first[-1]["text"] and first[-1]["purpose"] == "clarification"
+    assert not any(e["type"] == "handoff" for e in first)
+    assert len(requests) == (2 if model_offers_help else 3)
+    accepted = say(api, cid, "Да, подключайте.")
+    assert len([e for e in accepted if e["type"] == "handoff"]) == 1
+
+
+@pytest.mark.usefixtures("index")
+def test_exact_sku_with_wrong_buyer_reports_verified_restriction(api, provider):
+    answers, requests = provider
+    answers.append(tool("get_offer", offer_id="new20"))
+    events = say(api, api.new_conversation(), "Я физлицо. Хочу купить артикул new20 для себя.")
+    assert len(requests) == 1
+    assert "Юрлицо" in events[-1]["text"] and events[-1]["sources"][0]["url"].endswith("/new20")
+    assert not any(e["type"] in {"products", "handoff"} for e in events)
+
+
 @pytest.fixture
 def provider(monkeypatch):
     responses = []

@@ -65,7 +65,13 @@ def _offer(row, version: str, *, detail: bool) -> dict:
 
 
 def search_catalog(
-    index: Path, query: str, *, by_need: bool = False, limit: int = 3, license_type: str | None = None
+    index: Path,
+    query: str,
+    *,
+    by_need: bool = False,
+    limit: int = 3,
+    license_type: str | None = None,
+    detail: bool = False,
 ) -> ToolResult:
     """Retrieve candidates using a product/family, category or task keywords."""
     if not 1 <= limit <= 5 or len(query) > 500:
@@ -74,7 +80,7 @@ def search_catalog(
         rows = search(index, query, limit=limit, license_type=license_type, include_snapshot=True, by_need=by_need)
     except sqlite3.Error:
         return ToolResult(ok=False, error="catalog_unavailable")
-    return _results([_offer(row, row["snapshot"], detail=False) for row in rows if _public_link(row["source"])])
+    return _results([_offer(row, row["snapshot"], detail=detail) for row in rows if _public_link(row["source"])])
 
 
 def get_offer(index: Path, offer_id: str) -> ToolResult:

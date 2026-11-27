@@ -38,6 +38,7 @@ from eval.pii import scrub_pii
 
 MAX_OUTPUT_TOKENS = 800
 MAX_CONTEXT_BYTES = 80_000
+MISSING_PRODUCT_HELP = "По вашему описанию не удалось подтвердить подходящий товар.\n\n" + OPERATOR_QUESTION
 Query = Annotated[str, Field(min_length=1, max_length=500)]
 CAPABILITIES = (
     "Помогу подобрать ПО и лицензии, проверить цену и условия по каталогу, "
@@ -135,6 +136,10 @@ def instructions():
 Для SKU из запроса сначала get_offer. Для смены условий заново ищи товар под новые условия.
 При сравнении двух явно названных продуктов или редакций сразу вызови compare_catalog с их названиями.
 При поиске товара по названию или задаче сначала search_catalog. Не угадывай offerId.
+Поиск возвращает проверенные карточки с условиями из каталога. Если данных хватает, сразу вызови respond с их refs.
+Ищи разные компоненты комплекта и разные условия столько раз, сколько требуется для обоснованного ответа.
+Если новая лицензия и продление отличаются по цене, уточни тип покупки перед выбором SKU, если покупатель его не указал.
+Совпадения по одному слову могут относиться к другим товарам. Если подходящего нет, предложи помощь оператора.
 Для процедур, восстановления доступа и проблем после покупки вызови search_knowledge.
 Сообщай, что проверил источник, только после его чтения. Пустая выдача относится только к запросу.
 На общий вопрос о возможностях ассистента верни capabilities без поиска и refs, даже если уже обсуждали товар.
@@ -174,7 +179,7 @@ class Evidence:
     published: str | None = None
     catalog_miss: bool = False
 
-    def add(self, result, tool):
+    def add(self, result, tool, *, detailed_search=False):
         if not result.ok:
             return {"error": result.error}
         if tool in {"search_catalog", "get_offer"}:
@@ -195,9 +200,10 @@ class Evidence:
                 ref = f"r{len(self.rows) + 1}"
             if "body" in row:
                 row = {**row, "body": scrub_pii(row["body"])[:1800]}
-            if ref not in self.detailed or tool == "get_offer":
+            complete_offer = tool == "get_offer" or detailed_search
+            if ref not in self.detailed or complete_offer:
                 self.rows[ref] = row
-            if tool == "get_offer":
+            if complete_offer:
                 self.detailed.add(ref)
             if tool == "search_published_knowledge":
                 self.published = ref
@@ -409,12 +415,11 @@ def checked_answer(answer, evidence, history, text, previous):
         scope = capacity_question(turns)
         if not reason and scope and answer.reason in {"outside_catalog", "insufficient_evidence"}:
             return scope, "clarification", [], [], None
-        if (
-            answer.reason == "outside_catalog"
-            and evidence.catalog_miss
-            and not any("offerId" in r for r in evidence.rows.values())
-        ):
-            reason = "outside_catalog"
+        if answer.reason == "outside_catalog" and not reason and not products:
+            if evidence.catalog_miss and len(turns) > 1 and not any("offerId" in r for r in evidence.rows.values()):
+                reason = "outside_catalog"
+            elif evidence.replaced:
+                return MISSING_PRODUCT_HELP, "clarification", [], [], None
         if reason:
             return (
                 handoff_notice(reason),
@@ -503,8 +508,6 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
     steps = []
     evidence = Evidence()
     searches = {}
-    seen_offers = set()
-    repeated_results = 0
     index = settings.catalog_index_path
     context = [
         {"role": "user" if m.role == "client" else "assistant", "content": scrub_pii(m.text)[:600]}
@@ -546,10 +549,9 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         )
         if not result.ok:
             raise LLMError(result.error or "tool_unavailable")
-        return evidence.add(result, name)
+        return evidence.add(result, name, detailed_search=name == "search_catalog" and kwargs.get("detail", False))
 
     async def execute(name, args):
-        nonlocal repeated_results
         if name == "search_knowledge":
             original = (kb_retry or text)[:500]
             pub = await read("search_published_knowledge", {}, t31.search_published_knowledge, original)
@@ -570,12 +572,11 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         evidence.replaced = True
         key = (" ".join(args.query.casefold().split()), args.by_need, args.license_type)
         if key not in searches:
-            searches[key] = await read(name, args.model_dump(), t31.search_catalog, index, **args.model_dump(), limit=3)
+            searches[key] = await read(
+                name, args.model_dump(), t31.search_catalog, index, **args.model_dump(), limit=3, detail=True
+            )
         data = searches[key]
         evidence.catalog_miss = not data["results"]
-        found = {row["offerId"] for row in data["results"]}
-        repeated_results = repeated_results + 1 if found and not found.difference(seen_offers) else 0
-        seen_offers.update(found)
         return data
 
     async def compare(args):
@@ -593,22 +594,19 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         if not re.search(r"сравн|между|отлич|разниц|или|чем лучше|вариант", text, re.I):
             raise ValueError("Уточни, просит ли покупатель сравнение, или подбери товар по его запросу.")
         lines, sources = [], []
-        for label, option in zip(labels, tokens, strict=True):
-            result = await execute("search_catalog", Search(query=label))
+        results = await asyncio.gather(
+            *(execute("search_catalog", Search(query=label)) for label in labels), return_exceptions=True
+        )
+        for label, option, result in zip(labels, tokens, results, strict=True):
+            if isinstance(result, BaseException):
+                raise result
             wanted = set(option) - {"для", "и", "на", "for", "the"}
             hits = [row for row in result["results"] if wanted and wanted.issubset(words(row["name"]))]
             if not hits:
                 lines.append(f"{label} — точного совпадения в результатах поиска не нашёл.")
                 continue
-            sku = hits[0]["offerId"]
-            details = await execute("get_offer", Lookup(offer_id=sku))
-            if not details["results"]:
-                lines.append(f"{label} — актуальную карточку подтвердить не удалось.")
-                continue
-            row = details["results"][0]
-            if not wanted.issubset(words(row["name"])):
-                lines.append(f"{label} — найденная карточка изменилась. Нужно уточнить артикул.")
-                continue
+            row = hits[0]
+            sku = row["offerId"]
             sources.append(product_from_row(row).source)
             if len(hits) == 1:
                 lines.append(product_line(row, "summary"))
@@ -693,6 +691,8 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                 None,
             )
         calls = 0
+        repeated_results = 0
+        last_catalog_round = False
         for _ in range(settings.agent_max_model_calls):
             if len(serialize([messages, TOOLS]).encode()) > MAX_CONTEXT_BYTES:
                 raise LLMError("context_limit")
@@ -729,6 +729,8 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
             if calls > settings.agent_max_tool_calls:
                 break
             messages.append(response.message)
+            catalog_round = True
+            previous_searches = len(searches)
             for call in response.tool_calls:
                 if not isinstance(call, dict) or not isinstance(call.get("function"), dict) or not call.get("id"):
                     raise LLMError("invalid_tool_call")
@@ -747,9 +749,19 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                             raise ValueError("Заверши ход отдельным вызовом после чтения результатов.")
                         return checked_answer(args, evidence, history, text, previous)
                     data = await execute(name, args)
+                    if name != "search_catalog":
+                        catalog_round = False
                     if name == "get_offer" and len(response.tool_calls) == 1 and data["results"]:
                         row = data["results"][0]
                         named = re.search(r"(?<!\w)" + re.escape(row["offerId"]) + r"(?!\w)", text)
+                        buyer = Selection("").qualifiers(text, followup=False).buyer
+                        if named and buyer and row.get("buyer") and buyer not in row["buyer"]:
+                            permitted = ", ".join(row["buyer"])
+                            body = (
+                                f"У артикула {row['offerId']} в карточке указан тип покупателя «{permitted}». "
+                                "Подобрать вариант для вашего типа покупателя?"
+                            )
+                            return body, "clarification", [], [product_from_row(row).source], None
                         policy = route_action(history, text, [product_from_row(row)])
                         if named and policy and policy.reason in {"price_request", "availability"}:
                             field_name = "price" if policy.reason == "price_request" else "availability"
@@ -761,13 +773,22 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                                 previous,
                             )
                 except ValidationError:
+                    catalog_round = False
                     data = {"error": "Исправь аргументы по схеме инструмента."}
                 except ValueError as exc:
+                    catalog_round = False
                     data = {"error": str(exc)[:180]}
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": serialize(data)})
-            if repeated_results >= 2 and all(
-                c.get("function", {}).get("name") == "search_catalog" for c in response.tool_calls
-            ):
+            repeated_results = (
+                repeated_results + 1
+                if catalog_round and last_catalog_round and len(searches) == previous_searches
+                else 0
+            )
+            last_catalog_round = catalog_round
+            if repeated_results >= 2:
+                if not any("offerId" in row for row in evidence.rows.values()):
+                    await record(StepTrace(tool="catalog_repeated_results", args={}, result_summary="Пустая выдача"))
+                    return MISSING_PRODUCT_HELP, "clarification", [], [], None
                 await record(StepTrace(tool="catalog_repeated_results", args={}, result_summary="Повторяются позиции"))
                 return (
                     "Повторный поиск показывает те же позиции. Какую редакцию, артикул или условие лицензии проверить?",
