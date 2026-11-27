@@ -340,6 +340,16 @@ def capacity_question(turns):
     return f"{people[1].strip()} — это все сотрудники компании или столько человек будут работать в программе?"
 
 
+def asks_for_order_tracking(text):
+    words = text.casefold()
+    if re.search(r"отмен|возврат|вернуть|скидк|поменять|изменить|частичн|не обнов|не меня|ошибк", words):
+        return False
+    return bool(
+        re.search(r"\bзаказ\w*", words)
+        and re.search(r"статус|отсле[дж]|на какой стадии|где\s+(?:(?:же|сейчас)\s+)?мой\s+заказ|где.*посмотреть", words)
+    )
+
+
 def checked_answer(answer, evidence, history, text, previous):
     """Derive all commercial facts, customer links and handoff products from this turn's records."""
     if answer.kind == "capabilities":
@@ -567,6 +577,30 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
             )
         if ABOUT_ASSISTANT.fullmatch(" ".join(text.casefold().strip(" .!?").split())):
             return CAPABILITIES, "answer", [], [], None
+        turns = discovery_context(history, text)
+        if len(turns) > 1 and len(text.split()) <= 6 and "?" not in text:
+            scope = capacity_question(turns)
+            if scope and not re.search(r"\b(?:цен\w*|стоимость|стоит|покаж\w*|открой\w*|вместо)\b", text, re.I):
+                return scope, "clarification", [], [], None
+        if asks_for_order_tracking(text) and index.is_file():
+            found = await read(
+                "search_store_knowledge", {}, t31.search_store_knowledge, index, "Просмотр статуса заказа", limit=3
+            )
+            for row in found["results"]:
+                guide = urlsplit(row["source"])
+                if (
+                    guide.hostname in {"docs.softline.com", "docs.softline.ru"}
+                    and guide.path == "/ru-ru/lk/view-statuses"
+                ):
+                    excerpt = row["body"].split("\nУзнайте подробнее")[0][:550].strip()
+                    if excerpt:
+                        return checked_answer(
+                            Answer(kind="knowledge", refs=[row["ref"]], excerpt=excerpt),
+                            evidence,
+                            history,
+                            text,
+                            previous,
+                        )
         confirmed = confirmed_candidate(history, text)
         if confirmed:
             offer_id, source = confirmed
