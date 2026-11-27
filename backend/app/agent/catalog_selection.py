@@ -14,6 +14,7 @@ from app.contracts.t04 import HandoffReason, Product, Source
 from app.services.price_policy import OfferAssessment, assess, is_supported_currency, snapshot_from_row
 
 WORD = re.compile(r"[^\W_]+")
+CANDIDATE_QUESTION = "Вам подходит именно этот вариант?"
 MDAEMON = re.compile(r"\b(?:mda?e?mo?n|mdeamon|мд[еэ]й?мон|мдаймон|эмдеймон)\b", re.I)
 SEATS = re.compile(r"\b(\d{1,9})\s*[- ]?\s*(?:пользоват|человек|сотрудник|рабочи[хе] мест|мест|users?|seats?)", re.I)
 CODE = re.compile(r"\b(?:артикул(?:а|у|е|ом)?\b|offerid|sku|код(?:а|у|е|ом)? товара\b|id)\s*[:#№-]?\s*([\w.-]+)", re.I)
@@ -36,6 +37,17 @@ TRANSACTION_ONLY = re.compile(
     r"(?:продлени[еяюия]|продлить|нов(?:ая|ое|ую|ой|ые)|перв(?:ая|ую|ичной|ичную|ичная)|покупк\w*|лицензи\w*|подписк\w*|"
     r"действующ\w*|действует|активн\w*|просроч\w*|ист[её]к\w*|уже|ещ[её]|не|на|для)"
 )
+
+
+def confirmed_candidate(history, text):
+    """Recover the proposed SKU only from the last sourced assistant confirmation."""
+    if not history or history[-1].role != "agent" or not history[-1].text.endswith(CANDIDATE_QUESTION):
+        return None
+    if not re.fullmatch(r"(?:да(?:[, ]+подходит)?|подходит|бер[её]м|верно|всё верно)[.! ]*", text.strip(), re.I):
+        return None
+    prior = history[-1]
+    ids = re.findall(r"\(артикул ([^()\n]{1,100})\)\.", prior.text)
+    return (ids[0], prior.sources[0]) if len(ids) == len(prior.sources) == 1 else None
 
 
 @dataclass
