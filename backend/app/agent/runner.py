@@ -50,6 +50,11 @@ from app.db.repository import last_products, new_id, visible_turns
 EmitStep = Callable[[StepTrace], Awaitable[None]]
 
 SYSTEM_PROMPT = "Ты — ассистент интернет-магазина Softline. Это тестовый stub каркаса: ответь одной фразой."
+CASE_REFERENCE = re.compile(
+    r"\b(?:обращени[еяю]|заявк[аиуе]|тикет[ау]?)(?:\s+(?:номер|id))?\s*[№#:]?\s*"
+    r"(?=[\w/-]*\d)[\w]+(?:[-/][\w]+)*\b",
+    re.I,
+)
 
 
 def commercial_clause(clause: str) -> bool:
@@ -131,7 +136,7 @@ async def run_turn(
         search_text = ""
         if action_type == "message" and not bare and route.reason != "insufficient_evidence":
             # Keep the original question on the card, and look up any accompanying change of terms.
-            remaining = HUMAN_REQUEST.sub(" ", user_text).strip(" .,!?:;")
+            remaining = CASE_REFERENCE.sub(" ", HUMAN_REQUEST.sub(" ", user_text)).strip(" .,!?:;")
             clauses = re.split(r"[!?;]|\.(?=\s|$)", remaining)
             search_text = ". ".join(c for c in clauses if commercial_clause(c))
     previous = None
