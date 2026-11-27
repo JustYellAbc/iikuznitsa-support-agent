@@ -50,6 +50,28 @@ def provider(monkeypatch):
 
 
 @pytest.mark.usefixtures("index")
+def test_multi_offer_summary_keeps_evidence_and_does_not_repeat_card_names(api, provider):
+    responses, _ = provider
+    responses.extend(
+        [
+            tool("get_offer", offer_id="new20"),
+            tool("get_offer", offer_id="new5"),
+            tool("respond", kind="product", refs=["r1", "r2"], field="summary"),
+            tool("get_offer", offer_id="new20"),
+            tool("respond", kind="product", refs=["r1"], field="term"),
+        ]
+    )
+    cid = api.new_conversation()
+    result = say(api, cid, "Сравните артикулы new20 и new5.")
+    cards, reply = result[-2:]
+    assert [p["offerId"] for p in cards["products"]] == ["new20", "new5"]
+    assert len(reply["sources"]) == 2 and "2 позиции" in reply["text"]
+    assert all(p["name"] not in reply["text"] for p in cards["products"])
+    details = say(api, cid, "Какой срок у артикула new20?")[-1]["text"]
+    assert "12 мес." in details and "мес.." not in details
+
+
+@pytest.mark.usefixtures("index")
 def test_model_uses_tools_and_cannot_reuse_twenty_for_thirty_seven(api, provider):
     responses, requests = provider
     responses.extend(
