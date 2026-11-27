@@ -243,7 +243,7 @@ def needs_choice_confirmation(history, text, row):
     if not history or history[-1].role != "agent" or topics_for(text, True):
         return False
     question = history[-1].text.strip()
-    if not question.endswith("?"):
+    if not question.endswith("?") or question.endswith(CANDIDATE_QUESTION):
         return False
     options = re.split(r"\bили\b", re.split(r":\s+", question)[-1], flags=re.I)
     if len(options) < 2:

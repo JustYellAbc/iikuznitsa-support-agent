@@ -1,5 +1,7 @@
 """Customer-visible replies for complete, partial and conflicting catalog evidence."""
 
+import sqlite3
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ from app.agent.handoff import ASK_DETAIL, offers_operator
 from app.agent.test_catalog_selection import index as index
 from app.agent.test_catalog_selection import say
 from app.agent.tool_agent import Answer, Evidence, checked_answer
+from app.config import get_settings
 
 
 def offer(sku, name, **details):
@@ -144,7 +147,10 @@ def test_buyers_confirmation_rechecks_candidate_before_quote(stand_api, provider
     pending = say(stand_api, cid, "PaperDesk")
     assert pending[-1]["purpose"] == "clarification" and "790 ₽" in pending[-1]["text"]
     assert not any(e["type"] in {"products", "handoff"} for e in pending)
+    with closing(sqlite3.connect(get_settings().catalog_index_path)) as db:
+        db.execute("UPDATE offers SET price='795' WHERE id='desk'")
+        db.commit()
     selected = say(stand_api, cid, confirmation)
     assert [p["offerId"] for e in selected if e["type"] == "products" for p in e["products"]] == ["desk"]
-    assert selected[-1]["purpose"] == "answer" and len(requests) == 4
+    assert selected[-1]["purpose"] == "answer" and "795 ₽" in selected[-1]["text"] and len(requests) == 4
     assert stand_api.say(cid, "Подготовить КП").headers["X-Chat-Action"] == "open-quote-form"
