@@ -50,6 +50,28 @@ def provider(monkeypatch):
 
 
 @pytest.mark.usefixtures("index")
+def test_multi_offer_summary_keeps_evidence_and_does_not_repeat_card_names(api, provider):
+    responses, _ = provider
+    responses.extend(
+        [
+            tool("get_offer", offer_id="new20"),
+            tool("get_offer", offer_id="new5"),
+            tool("respond", kind="product", refs=["r1", "r2"], field="summary"),
+            tool("get_offer", offer_id="new20"),
+            tool("respond", kind="product", refs=["r1"], field="term"),
+        ]
+    )
+    cid = api.new_conversation()
+    result = say(api, cid, "Сравните артикулы new20 и new5.")
+    cards, reply = result[-2:]
+    assert [p["offerId"] for p in cards["products"]] == ["new20", "new5"]
+    assert len(reply["sources"]) == 2 and "2 позиции" in reply["text"]
+    assert all(p["name"] not in reply["text"] for p in cards["products"])
+    details = say(api, cid, "Какой срок у артикула new20?")[-1]["text"]
+    assert "12 мес." in details and "мес.." not in details
+
+
+@pytest.mark.usefixtures("index")
 def test_model_uses_tools_and_cannot_reuse_twenty_for_thirty_seven(api, provider):
     responses, requests = provider
     responses.extend(
@@ -83,8 +105,57 @@ def test_mandatory_price_route_uses_verified_sku_once(api, provider):
     events = say(api, api.new_conversation(), "Сколько стоит артикул ask?")
     assert len(requests) == 1 and not responses
     assert "Цена по запросу" in events[-2]["text"]
+    assert "подтвердить менеджер" in events[-2]["text"]
     h = events[-1]["handoff"]
     assert h["reason"] == "price_request" and [p["offerId"] for p in h["products"]] == ["ask"]
+
+
+@pytest.mark.usefixtures("index")
+def test_ambiguous_turns_offer_help_then_recover_without_a_ticket(api, provider):
+    from app.agent.handoff import ASK_PRODUCT, OFFER_HELP
+
+    responses, _ = provider
+    responses.extend(
+        [
+            tool("respond", kind="handoff", reason="insufficient_evidence"),
+            tool("respond", kind="handoff", reason="technical"),
+            tool("get_offer", offer_id="new20"),
+            tool("respond", kind="product", refs=["r1"], field="price"),
+        ]
+    )
+    cid = api.new_conversation()
+    first = say(api, cid, "Как с этим быть?")
+    assert first[-1]["text"] == ASK_PRODUCT and first[-1]["purpose"] == "clarification"
+    second = say(api, cid, "А с другим вариантом как быть?")
+    assert second[-1]["text"] == OFFER_HELP and second[-1]["purpose"] == "clarification"
+    resolved = say(api, cid, "Вот артикул new20. Сколько стоит?")
+    assert resolved[-1]["purpose"] == "answer" and "1 234,56" in resolved[-1]["text"]
+    assert all(e["data"]["type"] != "handoff" for e in api.events(cid))
+
+
+def test_confirmed_help_after_two_misses_opens_one_case(api, provider):
+    responses, _ = provider
+    responses.extend([tool("respond", kind="handoff")] * 2)
+    cid = api.new_conversation()
+    say(api, cid, "Что с этим делать?")
+    say(api, cid, "Пока не понимаю.")
+    result = say(api, cid, "Да, пожалуйста")
+    assert [e["handoff"]["reason"] for e in result if e["type"] == "handoff"] == ["insufficient_evidence"]
+
+
+@pytest.mark.usefixtures("index")
+def test_stalled_clarification_cannot_trigger_an_unrelated_knowledge_search(api, provider):
+    from app.agent.handoff import OFFER_HELP
+
+    responses, requests = provider
+    responses.append(tool("respond", kind="clarify", question="О какой операции идёт речь?"))
+    cid = api.new_conversation()
+    say(api, cid, "А это как там сделать?")
+    unresolved = say(api, cid, "Не понял, всё ещё не получается. Что делать?")
+    assert unresolved[-1]["text"] == OFFER_HELP and len(requests) == 1
+    responses.extend([tool("get_offer", offer_id="new20"), tool("respond", kind="product", refs=["r1"], field="price")])
+    answered = say(api, cid, "Всё ещё не понимаю, сколько стоит артикул new20?")
+    assert "1 234,56" in answered[-1]["text"] and answered[-1]["purpose"] == "answer"
 
 
 def test_repeated_unregistered_tool_stops_without_showing_invented_price(api, provider):
@@ -166,7 +237,10 @@ def test_tools_retrieve_new_manager_publication_for_different_buyer(api, provide
 
 
 @pytest.mark.usefixtures("index")
-def test_quote_acceptance_uses_verified_selection_without_another_model_call(api, provider):
+@pytest.mark.parametrize(
+    "question", ["И что дальше?", "Я выбрал этот товар. Можете предложить подготовить коммерческое предложение?"]
+)
+def test_quote_acceptance_uses_verified_selection_without_another_model_call(api, provider, question):
     responses, requests = provider
     responses.extend(
         [
@@ -178,7 +252,7 @@ def test_quote_acceptance_uses_verified_selection_without_another_model_call(api
     )
     cid = api.new_conversation()
     say(api, cid, "Цена по артикулу new20?")
-    say(api, cid, "И что дальше?")
+    say(api, cid, question)
     for prompt in ("Да", "Эй бля подготавливай КП"):
         receipt = api.say(cid, prompt, key=prompt.encode().hex())
         assert receipt.status_code == 202 and receipt.headers["X-Chat-Action"] == "open-quote-form"

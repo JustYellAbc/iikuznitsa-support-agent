@@ -371,6 +371,22 @@ def test_conversation_mode_switch(api: Api):
     assert r.status_code == 404
 
 
+def test_handoff_on_confirmation_preserves_the_buyer_question(api: Api, monkeypatch):
+    cid = api.new_conversation()
+    question = "Можно получить документы по лицензии?"
+    api.say(cid, question)
+    api.idle()
+
+    async def failed(*args, **kwargs):
+        raise BudgetExceededError("лимит")
+
+    monkeypatch.setattr(runner, "run_turn", failed)
+    assert api.say(cid, "Да").is_success
+    api.idle()
+    cases = [e["data"]["handoff"] for e in api.events(cid) if e["data"]["type"] == "handoff"]
+    assert cases[-1]["question"] == question
+
+
 def test_budget_exceeded_hands_off_instead_of_500(api: Api, monkeypatch):
     async def broke(*args, **kwargs):
         raise BudgetExceededError("лимит")
@@ -382,7 +398,7 @@ def test_budget_exceeded_hands_off_instead_of_500(api: Api, monkeypatch):
         api.idle()
     datas = [e["data"] for e in api.events(cid)]
     assert [d["type"] for d in datas] == ["message", "message", "handoff", "message", "message"]
-    assert datas[1]["text"] == turn_service.HANDOFF_TEXT and datas[2]["handoff"]["reason"] == "technical"
+    assert "Не удалось получить ответ от сервиса" in datas[1]["text"] and datas[2]["handoff"]["reason"] == "technical"
     assert datas[2]["handoff"]["question"] == "Первый вопрос"
     api.login()
     assert len(api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]) == 1

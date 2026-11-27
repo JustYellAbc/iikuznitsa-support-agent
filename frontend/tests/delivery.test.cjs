@@ -44,7 +44,128 @@ test("Виджет Т09 на примерах контракта", async t => {
     assert.match(await card("48093").innerText(), /Наличие требует подтверждения/);
     assert.match(await card("504").innerText(), /Цена по запросу/);
     assert.doesNotMatch(await card("504").innerText(), /₽/);
+    await page.locator("#log .handoff").waitFor();
+    for (const link of await cards.locator("a").all()) {
+      const href = await link.getAttribute("href");
+      assert.equal(await page.locator(`#log a[href="${href}"]`).count(), 1);
+    }
+    assert.equal(await page.locator("#log .entry:has(.result) .quote-open").count(), 1);
+    assert.equal(await page.locator("footer .quote-open").count(), 0);
+    await page.route("**/quotes/current?*", route => route.fulfill({ json: {
+      revision: 0, items: [], choices: [{ offerId: "61557", name: "BookOffice" }]
+    } }));
+    await page.getByRole("button", { name: "Подготовить КП" }).click();
+    assert.equal(await page.getByLabel("BookOffice · ID 61557").isChecked(), true);
+    await page.getByRole("button", { name: "Закрыть", exact: true }).click();
+    for (const logo of await page.locator(".brand img, .wordmark").all()) {
+      assert.ok(await logo.evaluate(img => img.complete && img.naturalWidth > 0));
+    }
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  });
+  await t.test("Статья остаётся рядом с подборкой, а новый ответ сохраняет свой источник", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    const steps = cases.find(item => item.id === "c-price").steps;
+    const batch = structuredClone(steps.find(step => step.operationId === "readEvents").response.events);
+    const reply = batch.find(e => e.data.author === "agent");
+    const article = {url: "https://support.softline.ru/kb/demo", label: "Как оформить заказ"};
+    reply.data.sources.push(article);
+    batch.push({...reply, seq: batch.at(-1).seq + 1, actionId: "later-turn",
+      data: {...reply.data, text: "Отдельный ответ", sources: [reply.data.sources[0]]}});
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({json:{events:batch.filter(e => e.seq > after),nextAfter:batch.at(-1).seq,hasMore:false}});
+    });
+    await page.route("**/events/stream?*", route => route.abort());
+    await page.goto(url);
+    await page.locator("#launch").click();
+    await page.getByText("Отдельный ответ", {exact:true}).waitFor();
+    assert.equal(await page.locator(`#log a[href="${article.url}"]`).count(), 1);
+    assert.equal(await page.locator(`#log a[href="${reply.data.sources[0].url}"]`).count(), 2);
+  });
+  await t.test("Подборки открывают собственные позиции, изменить можно только актуальный расчёт", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    await page.addInitScript(() => { window.EventSource = undefined; });
+    const product = id => ({ offerId: id, name: "Товар " + id, source: { url: "https://example.org/" + id, label: id },
+      priceState: "listed", unitPriceKopecks: 100 });
+    const quote = revision => ({ type: "quote", quote: { quoteId: "q", revision, lines: [], terms: {} } });
+    const data = [{ type: "products", products: [product("A")] }, { type: "products", products: [product("B")] },
+      quote(1), quote(2)];
+    const journal = data.map((data, index) => ({ seq: index + 1, at: "2026-11-27T12:00:00Z", data }));
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({ json: { events: journal.slice(after), nextAfter: journal.length, hasMore: false } });
+    });
+    const saved = { revision: 2, items: [{ offerId: "B", packages: 3 }], choices: ["A", "B"].map(product) };
+    await page.route("**/quotes/history?*", route => route.fulfill({json:{revisions:[
+      {quoteId:"q",revision:2,previous:1,changes:["Позиция B · количество 1 → 3 уп."]}
+    ]}}));
+    await page.route("**/quotes/current?*", route => route.fulfill({ json: saved }));
+    await page.goto(url);
+    await page.locator("#launch").click();
+    const prepare = page.getByRole("button", { name: "Подготовить КП" });
+    const edit = page.getByRole("button", { name: "Изменить КП" });
+    const close = page.getByRole("button", { name: "Закрыть", exact: true });
+    await edit.nth(1).waitFor();
+    await page.getByText("Изменения к версии 1. Позиция B · количество 1 → 3 уп.").waitFor();
+    assert.equal(await page.getByText("Предыдущая версия", {exact:true}).count(), 1);
+    assert.equal(await page.getByText("Последняя версия в чате", {exact:true}).count(), 1);
+    for (const [index, id] of ["A", "B"].entries()) {
+      await prepare.nth(index).click();
+      await page.getByRole("checkbox", { name: "Товар " + id + " · ID " + id }).waitFor();
+      assert.equal(await page.getByRole("checkbox").count(), 1);
+      await close.click();
+    }
+    assert.equal(await edit.first().isDisabled(), true);
+    await edit.nth(1).click();
+    await page.getByLabel("Упаковки: Товар B").waitFor();
+    assert.equal(await page.getByLabel("Упаковки: Товар B").inputValue(), "3");
+    await close.click();
+    saved.revision = 3;
+    await edit.nth(1).click();
+    await page.getByText("КП изменилось. Откройте последнюю версию расчёта в чате.").waitFor();
+    assert.equal(await page.locator('#quote-form [type="submit"]').isDisabled(), true);
+  });
+  await t.test("Адресат сохраняется после перезагрузки и сбрасывается после закрытия обращений", async t => {
+    const page = await browser.newPage({ viewport: { width: 320, height: 690 } });
+    t.after(() => page.close());
+    await page.addInitScript(() => { window.EventSource = undefined; });
+    const journal = [];
+    function handoff(id, question, status) {
+      const seq = journal.length + 1;
+      journal.push({ seq, at: "2026-11-27T12:00:00Z", actionId: "action-" + seq,
+        data: { type: "handoff", handoff: { handoffId: id, question, status } } });
+    }
+    handoff("first", "Срок лицензии", "open");
+    handoff("second", "Условия поставки", "open");
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({ json: { events: journal.slice(after), nextAfter: journal.length, hasMore: false } });
+    });
+    await page.goto(url);
+    const open = () => page.locator("#launch").click();
+    await open();
+    const summary = page.locator("#recipient-summary");
+    await summary.click();
+    await page.getByLabel("Оператор · Условия поставки").check();
+    assert.match(await summary.textContent(), /Условия поставки/);
+    await page.reload();
+    await open();
+    await page.getByText("Сообщение оператору · Условия поставки", { exact: true }).waitFor();
+    await summary.click();
+    await page.getByRole("radio", { name: "Ассистент", exact: true }).click();
+    assert.equal(await summary.textContent(), "Сообщение ассистенту");
+    const sent = page.waitForRequest(req => new URL(req.url()).pathname.endsWith("/actions"));
+    await page.locator("#message").fill("Теперь вопрос ассистенту");
+    await page.locator("#send").click();
+    assert.deepEqual((await sent).postDataJSON(), { type: "message", text: "Теперь вопрос ассистенту" });
+    handoff("first", "Срок лицензии", "resolved");
+    handoff("second", "Условия поставки", "resolved");
+    await page.reload();
+    await open();
+    await page.getByText("Обращение закрыто", { exact: true }).last().waitFor();
+    assert.equal(await page.locator("#recipient").isVisible(), false);
   });
   await t.test("Подтверждение из чата открывает форму с обеими выбранными позициями", async t => {
     const page = await browser.newPage();

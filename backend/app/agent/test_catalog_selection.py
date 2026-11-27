@@ -14,6 +14,14 @@ from app.agent.handoff import OFFER_HELP, offers_operator
 from app.config import get_settings
 
 
+def test_quote_name_does_not_hide_an_actual_customer_type():
+    assert not Selection("").qualifiers("Нужна копия коммерческого предложения.", followup=False).organization
+    assert (
+        Selection("").qualifiers("Коммерческое предложение для коммерческой компании.", followup=False).organization
+        == "Коммерческая"
+    )
+
+
 @pytest.fixture
 def index(tmp_path):
     path = get_settings().data_dir / "private" / "catalog.sqlite3"
@@ -100,6 +108,8 @@ def test_selection_survives_multiple_turns_and_reaches_manager(stand_api, index)
         ("Нужно продление для Adobe InCopy, подписка действует.", True, None),
         ("Продлеваем, подписка действует. Это тендер.", True, ("renew", 87500)),
         ("Нужен Adobe InCopy для тендера.", True, None),
+        ("Закупаем по тендеру. Пришлите пакет документов. Обращение T11-7433510c.", True, ("new20", 123456)),
+        ("Закупаем по тендеру. Обращение T11-7433510c, нужен PaperDesk.", True, ("desk", 79000)),
         ("Продлеваем для тендера, подписка действует. Спасибо.", True, ("renew", 87500)),
     ],
 )

@@ -106,6 +106,35 @@ def test_draft_history_access_identity_and_selection(api, tmp_path):
     assert api.call("customer", "GET", path).content == pdf.content
 
 
+def test_version_notes_compare_published_snapshots_and_keep_customer_fields_private(api, tmp_path):
+    cid = setup_quote(api, tmp_path, ["t1"])
+    assert request(api, cid, [("t1", 1)]).status_code == 202
+    customer = {**COMPANY, "company": "ООО Вторая компания", "kpp": "770002002"}
+    for rev, packs in [(1, 1), (2, 3)]:
+        r = api.call(
+            "customer",
+            "POST",
+            f"/api/v1/conversations/{cid}/quotes",
+            json={"baseRevision": rev, "customer": customer, "items": [{"offerId": "t1", "packages": packs}]},
+        )
+        assert r.status_code == 202, r.text
+    url = f"/api/v1/conversations/{cid}/quotes/history"
+    res = api.call("customer", "GET", url)
+    v2, v3 = res.json()["revisions"]
+    assert (v2["previous"], v2["revision"], v3["previous"], v3["revision"]) == (1, 2, 2, 3)
+    assert v2["changes"] == ["Изменены реквизиты — название организации.", "Изменены реквизиты — КПП."]
+    assert v3["changes"] == ["Позиция t1 · количество 1 → 3 уп."]
+    assert customer["company"] not in res.text and customer["kpp"] not in res.text
+    api.new_conversation("other")
+    assert api.call("other", "GET", url).status_code == 404
+    api.login()
+    assert api.call(
+        "manager", "POST", "/api/v1/manager/mode", json={"mode": "pilot", "conversation_id": cid}
+    ).is_success
+    assert request(api, cid, [("t1", 42)], 3).is_success
+    assert api.call("customer", "GET", url).json() == res.json()
+
+
 def test_quote_approval_publishes_new_revision_and_exact_document(api, tmp_path):
     cid = setup_quote(api, tmp_path, ["t1", "x"], rules=True)
     assert request(api, cid, [("t1", 2), ("x", 1)]).status_code == 202

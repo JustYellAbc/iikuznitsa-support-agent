@@ -81,6 +81,64 @@ async def published(cid, qid, revision):
     )
 
 
+def revision_changes(before, after):
+    changes = []
+    for field, label in (("company", "название организации"), ("inn", "ИНН"), ("kpp", "КПП")):
+        if getattr(before.customer, field) != getattr(after.customer, field):
+            changes.append(f"Изменены реквизиты — {label}.")
+    old = {line.offerId: line for line in before.quote.lines}
+    new = {line.offerId: line for line in after.quote.lines}
+    for sku, line in new.items():
+        if sku not in old:
+            changes.append(f"Добавлена позиция {sku} · {line.packages} уп.")
+            continue
+        if line.packages != old[sku].packages:
+            changes.append(f"Позиция {sku} · количество {old[sku].packages} → {line.packages} уп.")
+        if line.unitPriceKopecks != old[sku].unitPriceKopecks:
+            changes.append(f"Изменилась цена за упаковку позиции {sku}.")
+    for sku in old:
+        if sku not in new:
+            changes.append(f"Удалена позиция {sku}.")
+    for field, label in (
+        ("payment", "оплата"),
+        ("delivery", "поставка"),
+        ("taxNote", "налоги"),
+        ("validUntil", "срок действия КП"),
+    ):
+        if getattr(before.quote.terms, field) != getattr(after.quote.terms, field):
+            changes.append(f"Изменены условия — {label}.")
+    if not changes:
+        changes.append("Состав, количество, цены, реквизиты и условия совпадают.")
+    return changes
+
+
+async def revision_history(cid):
+    db = get_db()
+    async with db.committed_read():
+        rows = await db.fetchall(
+            """SELECT quote_id, revision, snapshot FROM quote_revisions q WHERE conversation_id=?
+               AND EXISTS (SELECT 1 FROM events e WHERE e.conversation_id=q.conversation_id
+               AND json_extract(e.data,'$.quote.quoteId')=q.quote_id
+               AND json_extract(e.data,'$.quote.revision')=q.revision) ORDER BY quote_id,revision""",
+            (cid,),
+        )
+    notes = []
+    previous = None
+    for row in rows:
+        current = Snapshot.model_validate_json(row["snapshot"])
+        if previous and previous.quote.quoteId == current.quote.quoteId:
+            notes.append(
+                {
+                    "quoteId": row["quote_id"],
+                    "revision": row["revision"],
+                    "previous": previous.quote.revision,
+                    "changes": revision_changes(previous, current),
+                }
+            )
+        previous = current
+    return notes
+
+
 async def require_published(row):
     if row and not await published(row["conversation_id"], row["quote_id"], row["revision"]):
         raise ApiError(409, "terms_pending", "Ревизию КП проверяет менеджер.")

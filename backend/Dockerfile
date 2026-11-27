@@ -28,7 +28,10 @@ COPY catalog /app/catalog
 COPY evals/t35/skills.md /app/evals/t35/skills.md
 COPY eval/pii.py /app/eval/pii.py
 
-RUN useradd --uid 1000 --create-home app && mkdir -p /app/data && chown app:app /app/data
+RUN useradd --uid 1000 --create-home app \
+    && mkdir -p /app/data \
+    && chown app:app /app/data \
+    && chmod -R a+rX /app/app /app/scripts /app/catalog /app/evals /app/eval
 USER app
 
 EXPOSE 8000

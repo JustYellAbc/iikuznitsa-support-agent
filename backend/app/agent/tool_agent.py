@@ -14,7 +14,16 @@ from catalog import tools as t31
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agent.catalog_selection import Selection
-from app.agent.handoff import CONFIRMED, OFFER_HELP, route_action
+from app.agent.handoff import (
+    ASK_DETAIL,
+    ASK_PRODUCT,
+    OFFER_HELP,
+    OPERATOR_QUESTION,
+    SERVICE_FAILURE,
+    handoff_notice,
+    offers_operator,
+    route_action,
+)
 from app.agent.quote_intent import offers_quote
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, StepTrace
@@ -118,10 +127,13 @@ class Evidence:
     detailed: set = field(default_factory=set)
     replaced: bool = False
     published: str | None = None
+    catalog_miss: bool = False
 
     def add(self, result, tool):
         if not result.ok:
             return {"error": result.error}
+        if tool in {"search_catalog", "get_offer"}:
+            self.catalog_miss = not result.data
         hits = []
         for row in result.data:
             ref = next(
@@ -160,8 +172,8 @@ def product_from_row(row):
     )
 
 
-def product_line(row, field_name):
-    parts = [f"{row['name']} (артикул {row['offerId']})."]
+def product_line(row, field_name, *, compact=False):
+    parts = [f"Артикул {row['offerId']}." if compact else f"{row['name']} (артикул {row['offerId']})."]
     if field_name in {"summary", "price"}:
         kopecks = row["unitPriceKopecks"]
         if kopecks is None:
@@ -176,10 +188,26 @@ def product_line(row, field_name):
     if field_name == "availability" and not row.get("priceCaveat"):
         parts.append("В наличии по каталогу." if row["available"] else "Поставку нужно подтвердить.")
     if field_name in {"summary", "term"} and row["licenseTerm"]:
-        parts.append("Срок по карточке — " + row["licenseTerm"] + ".")
+        parts.append("Срок по карточке — " + row["licenseTerm"].rstrip(". ") + ".")
     if field_name in {"delivery", "edition", "platform", "licenseType"} and row.get(field_name):
         value = row[field_name]
         parts.append(", ".join(value) if isinstance(value, list) else value)
+    return " ".join(parts)
+
+
+def selection_summary(rows, seats):
+    parts = [f"Нашёл {len(rows)} позиции в каталоге."]
+    if seats and all(str(seats) in (row.get("seatLimit") or []) for row in rows):
+        parts.append(f"В каждой карточке указана лицензия на {seats} мест.")
+    if any(row["priceState"] == "on_request" for row in rows):
+        parts.append("Стоимость позиций с пометкой «Цена по запросу» уточнит менеджер.")
+    notes = {}
+    for row in rows:
+        for note in dict.fromkeys([row.get("salesNotes"), row.get("priceCaveat")]):
+            if note:
+                notes.setdefault(note, []).append(row["offerId"])
+    for note, ids in notes.items():
+        parts.append(note if len(ids) == len(rows) else f"Артикул {', '.join(ids)} — {note}")
     return " ".join(parts)
 
 
@@ -204,7 +232,10 @@ def checked_answer(answer, evidence, history, text, previous):
             or re.search(r"https?://|₽|рубл|\n", answer.question, re.I)
         ):
             raise ValueError("Нужен один короткий уточняющий вопрос без цен и ссылок.")
-        return answer.question, "clarification", [], [], None
+        question = answer.question
+        if history and history[-1].role == "agent" and history[-1].text == question:
+            question += "\n\n" + OPERATOR_QUESTION
+        return question, "clarification", [], [], None
     conditions = Selection("").qualifiers(text, followup=False)
     seats = conditions.seats or answer.required_seats
     for row in rows:
@@ -221,7 +252,27 @@ def checked_answer(answer, evidence, history, text, previous):
         raise ValueError("Подтверди выбранные товары через get_offer.")
     if answer.kind == "handoff":
         current = products or ([] if evidence.replaced or conditions != Selection("") else previous)
-        return CONFIRMED, "notice", products, [], HandoffRequest(reason=answer.reason, question=text, products=current)
+        route = route_action(history, text, products)
+        reason = route.reason if route and not route.clarification else None
+        if (
+            answer.reason == "outside_catalog"
+            and evidence.catalog_miss
+            and not any("offerId" in r for r in evidence.rows.values())
+        ):
+            reason = "outside_catalog"
+        if reason:
+            return (
+                handoff_notice(reason),
+                "notice",
+                products,
+                [],
+                HandoffRequest(reason=reason, question=text, products=current),
+            )
+        prior = history[-1].text if history and history[-1].role == "agent" else ""
+        question = ASK_DETAIL if current else ASK_PRODUCT
+        if prior in {ASK_DETAIL, ASK_PRODUCT} or offers_operator(prior):
+            question = OFFER_HELP
+        return question, "clarification", products, [p.source for p in products], None
     if not products:
         raise ValueError("Сначала проверь товар в каталоге.")
     details = {
@@ -239,10 +290,13 @@ def checked_answer(answer, evidence, history, text, previous):
         reason = "price_request"
     if answer.field == "availability" and len(products) == 1 and not products[0].available:
         reason = "availability"
-    body = "\n".join(product_line(row, answer.field) for row in rows)
+    if len(rows) > 1 and answer.field == "summary":
+        body = selection_summary(rows, seats)
+    else:
+        body = "\n".join(product_line(row, answer.field, compact=len(rows) > 1) for row in rows)
     handoff = HandoffRequest(reason=reason, question=text, products=products) if reason else None
     return (
-        body + (" " + CONFIRMED if handoff else ""),
+        body + (" " + handoff_notice(reason) if handoff else ""),
         "notice" if handoff else "answer",
         products,
         [p.source for p in products],
@@ -397,12 +451,18 @@ async def run_tool_turn(session, history, text, previous, emit):
         cause = "timeout" if isinstance(exc, TimeoutError) else str(exc)
         reason = cause if cause in limits | {"timeout"} else "unavailable"
         await record(StepTrace(tool="support_failure", args={"reason": reason}, result_summary="Передача менеджеру"))
-        body, purpose, products, sources = CONFIRMED, "notice", [], []
+        body, purpose, products, sources = SERVICE_FAILURE, "notice", [], []
         current = (
             [] if evidence.replaced or Selection("").qualifiers(text, followup=False) != Selection("") else previous
         )
         handoff = HandoffRequest(reason="technical", question=text, products=current)
     replaces = evidence.replaced or bool(previous and purpose == "clarification")
+    if (
+        body in {ASK_DETAIL, OFFER_HELP}
+        and not evidence.replaced
+        and Selection("").qualifiers(text, followup=False) == Selection("")
+    ):
+        replaces = False
     if purpose == "clarification" and offers_quote(body) and previous:
         previous_ids = {p.offerId for p in previous}
         checked_ids = {row["offerId"] for row in evidence.rows.values() if "offerId" in row}
