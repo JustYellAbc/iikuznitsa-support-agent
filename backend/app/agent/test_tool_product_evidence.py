@@ -61,6 +61,9 @@ def test_team_size_and_named_product_are_kept_before_another_model_call(stand_ap
     assert not requests and "1000" in reply[-1]["text"] and reply[-1]["purpose"] == "clarification"
     reply = say(stand_api, cid, "Это всего по компании")
     assert not requests and "Сколько сотрудников" in reply[-1]["text"]
+    sent = say(stand_api, cid, "Позовите оператора")[-1]["handoff"]
+    assert sent["reason"] == "customer_request"
+    assert all(part in sent["question"] for part in ("1000 человек", "1С Бухгалтерия", "всего по компании"))
 
 
 @pytest.mark.parametrize(

@@ -21,6 +21,7 @@ from app.agent.handoff import (
     OFFER_HELP,
     OPERATOR_QUESTION,
     SERVICE_FAILURE,
+    discovery_context,
     handoff_notice,
     offers_operator,
     route_action,
@@ -319,23 +320,6 @@ def detail_reply(row, field_name, title_edition, *, compact):
     return f"{summary} {missing} в карточке.", True
 
 
-def discovery_context(history, text):
-    """Keep the buyer's consecutive answers to discovery questions together."""
-    turns = [text]
-    end = len(history)
-    while end >= 2 and len(turns) < 4:
-        buyer, agent = history[end - 2 : end]
-        if buyer.role != "client" or agent.role != "agent" or not agent.text.rstrip().endswith("?"):
-            break
-        if re.search(r"\b(?:другой вопрос|новая тема|другая тема|вместо этого)\b", turns[0], re.I):
-            break
-        if agent.text in {ASK_PRODUCT, OFFER_HELP} or offers_quote(agent.text) or offers_operator(agent.text):
-            break
-        turns.insert(0, buyer.text)
-        end -= 2
-    return turns
-
-
 def capacity_question(turns):
     body = " ".join(turns).casefold()
     if not re.search(r"комплект|лицензи|купить|покуп|закуп|подобрать|нуж[ен]|требуется", body):
@@ -478,10 +462,10 @@ def checked_answer(answer, evidence, history, text, previous):
                     product_line(rows[0], "summary") + f" Для отдельных рабочих мест нужно {requested} таких лицензий."
                 )
                 return body, "answer", products, [products[0].source], None
-            body = f"В каталоге есть {names}. Пока не подтверждено, какой вариант покроет {requested} мест. " + (
-                OPERATOR_QUESTION
+            body = f"В каталоге есть {names}. Пока не подтверждено, какой вариант покроет {requested} мест." + (
+                "\n\n" + OPERATOR_QUESTION
                 if per_seat
-                else "Подбираем отдельную лицензию на каждое место или одну многопользовательскую?"
+                else " Подбираем отдельную лицензию на каждое место или одну многопользовательскую?"
             )
             return body, "clarification", [], [p.source for p in products], None
     if (
