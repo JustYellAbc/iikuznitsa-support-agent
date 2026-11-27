@@ -64,6 +64,8 @@ class Selection:
     organization: str = ""
     edition: str = ""
     group_id: str | None = None
+    platforms: tuple[str, ...] = ()
+    delivery: str = ""
 
     def qualifiers(self, text: str, *, followup: bool) -> "Selection":
         updated = replace(self)
@@ -368,6 +370,22 @@ def select(index: Path, selection: Selection) -> Result:
         rows = [r for r in rows if selection.kind in r["params"].get(KIND, [])]
     if selection.organization:
         rows = [r for r in rows if selection.organization in r["params"].get("Тип организации", [])]
+    if selection.platforms:
+        rows = [
+            r
+            for r in rows
+            if all(
+                any(
+                    re.search(r"(?<!\w)" + re.escape(platform) + r"(?!\w)", v, re.I)
+                    for v in r["params"].get("Платформа", [])
+                )
+                for platform in selection.platforms
+            )
+        ]
+    if selection.delivery:
+        rows = [
+            r for r in rows if any(selection.delivery in v.casefold() for v in r["params"].get("Способ доставки", []))
+        ]
     if selection.edition:
         rows = [
             r

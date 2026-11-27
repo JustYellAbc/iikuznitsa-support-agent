@@ -345,3 +345,21 @@ def test_missing_capacity_only_retries_if_the_evidence_changes(api, provider):
     events = say(api, api.new_conversation(), "Хочу лицензию PaperDesk Pro.")
     assert len(requests) == 2 and "сколько пользователей" in events[-1]["text"]
     assert all(event["type"] not in {"handoff", "products"} for event in events)
+
+
+@pytest.mark.parametrize("request_text", ["два КП", "2 коммерческих предложения", "КП на каждый товар"])
+def test_separate_quotes_do_not_publish_a_combined_basket(api, index, provider, request_text):  # noqa: F811
+    import sqlite3
+
+    with sqlite3.connect(index) as db:
+        db.execute("UPDATE offers SET available=1 WHERE id='verify'")
+    responses, _ = provider
+    responses.append(tool("select_licenses", variants=[{"name": "PaperDesk Pro"}, {"name": "Widget Server"}]))
+    events = say(
+        api,
+        api.new_conversation(),
+        f"Пришлите {request_text} на PaperDesk Pro и Widget Server. Для юрлица, покупаем впервые.",
+    )
+    reply = events[-1]
+    assert reply["purpose"] == "clarification" and "отдельное КП" in reply["text"]
+    assert "910 ₽" not in reply["text"] and all(e["type"] not in {"products", "quote"} for e in events)

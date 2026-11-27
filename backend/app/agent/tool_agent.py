@@ -27,7 +27,7 @@ from app.agent.handoff import (
     route_action,
 )
 from app.agent.knowledge import keeps_question_qualifiers
-from app.agent.license_options import SelectionInputError, quote_preview, resolve_options
+from app.agent.license_options import SelectionInputError, alternate_proposals, quote_preview, resolve_options
 from app.agent.product_answers import topics_for
 from app.agent.quote_intent import offers_quote
 from app.config import get_settings
@@ -649,8 +649,11 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                 sources,
                 HandoffRequest(reason=policy.reason, question=policy.question, products=products),
             )
-        if purpose == "answer" and re.search(r"\bкп\b|коммерческ\w* предложен", " ".join(buyer_turns), re.I):
-            preview = await asyncio.to_thread(quote_preview, settings, hits, buyer_turns)
+        if purpose == "answer" and re.search(r"\bкп\b|коммерческ\w*\s+предложен", " ".join(buyer_turns), re.I):
+            if alternate_proposals(buyer_turns, args.variants) and len(hits) > 1:
+                question = "Для каждого варианта оформим отдельное КП. С какого начать?"
+                return body + "\n" + question, "clarification", [], sources, None
+            preview = await asyncio.to_thread(quote_preview, settings, hits, buyer_turns, args.variants)
             if preview:
                 body = preview
             body += "\nПроверьте количество в форме «Подготовить КП» и укажите организацию, ИНН и КПП."

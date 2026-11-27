@@ -19,9 +19,62 @@ class SelectionInputError(ValueError):
         self.question = question
 
 
+def name_pattern(name):
+    return re.compile(r"(?<!\w)" + re.escape(name) + r"(?!\w)", re.I)
+
+
+def scoped_turns(name, variants, turns):
+    """Preserve shared basket requirements; keep line-specific edits with their named line."""
+    names = sorted({v.name.casefold() for v in variants}, key=len, reverse=True)
+    labels = re.compile(r"(?<!\w)(?:" + "|".join(map(re.escape, names)) + r")(?!\w)", re.I)
+    scope = []
+    active = set()
+    for turn in turns:
+        matches = list(labels.finditer(turn))
+        if not matches:
+            shared = re.search(r"об(?:е|а|оих)|все(?:х)?|(?:этот|тот) же состав", turn, re.I)
+            if name.casefold() in active or shared and scope:
+                scope.append(turn)
+            continue
+        active = {m[0].casefold() for m in matches}
+        if name.casefold() not in active:
+            continue
+        if len(active) == 1 or all(
+            re.fullmatch(r"[\s,]*(?:и|или|плюс|\+)?[\s,]*", turn[left.end() : right.start()], re.I)
+            for left, right in zip(matches, matches[1:], strict=False)
+        ):
+            scope.append(turn)
+            continue
+        clauses = re.split(r"\s+(?:и|а)\s+|;", turn, flags=re.I)
+        for clause in clauses:
+            if name_pattern(name).search(clause):
+                if len(set(m[0].casefold() for m in labels.finditer(clause))) > 1:
+                    raise SelectionInputError(
+                        "line_capacity",
+                        "Уточни число мест и условия каждой позиции.",
+                        "Какие условия нужны для каждой позиции?",
+                    )
+                scope.append(clause)
+    return scope
+
+
+def attribute_values(pattern, text, question):
+    matches = list(pattern.finditer(text))
+    for m in matches:
+        left = re.split(r"[,.;!?]", text[: m.start()])[-1]
+        right = text[m.end() :]
+        if re.search(r"\b(?:не|без|кроме|исключ\w*)(?:\s+\w+){0,3}\s*$", left, re.I) or re.match(
+            r"^\s*[-—:]?\s*не\s+(?:нуж\w*|подход\w*|предлаг\w*|допуск\w*|интерес\w*)", right, re.I
+        ):
+            raise SelectionInputError(
+                "excluded_attribute", "Покупатель исключил это условие. Уточни допустимое.", question
+            )
+    return [m[0].casefold() for m in matches]
+
+
 def license_selection(name, seats, turns):
     """Only bind a label and seat count grounded in the buyer's messages."""
-    pattern = re.compile(r"(?<!\w)" + re.escape(name) + r"(?!\w)", re.I)
+    pattern = name_pattern(name)
     anchor = next((i for i in reversed(range(len(turns))) if pattern.search(turns[i])), None)
     if anchor is None:
         raise SelectionInputError(
@@ -29,10 +82,33 @@ def license_selection(name, seats, turns):
             "Передай название дословно из сообщений покупателя.",
             "Как точно называется нужный продукт или какая задача у него должна быть?",
         )
-    scope = turns[anchor:]
+    scope = turns
+    for m in pattern.finditer(turns[anchor]):
+        before, after = turns[anchor][: m.start()], turns[anchor][m.end() :]
+        if re.search(
+            r"(?:\bне(?:\s+(?:нуж\w*|предлаг\w*|интерес\w*|добавля\w*|включа\w*))?|кроме|без|исключ\w*)\s*$",
+            before,
+            re.I,
+        ) or re.match(r"\s*[,—:-]?\s*не\s+(?:нуж\w*|предлаг\w*|интерес\w*|добавля\w*|включа\w*)", after, re.I):
+            raise SelectionInputError(
+                "excluded", "Покупатель исключил эту позицию.", "Какой продукт подобрать вместо исключённого?"
+            )
+
     selection = named_request(name) if MDAEMON.search(name) else Selection(name)
     for turn in scope:
         selection = selection.qualifiers(turn, followup=True)
+        technical_text = name_pattern(name).sub("", turn)
+        platform = re.compile(r"\b(?:linux|windows(?:\s+(?:server\s+)?\d+(?:\s+r2)?)?|macos|android|ios)\b", re.I)
+        delivery = re.compile(r"\b(?:электронн|коробочн)\w*\s+(?:поставк|доставк)\w*|\bкоробк\w*", re.I)
+        systems = attribute_values(platform, technical_text, "Какая операционная система вам подходит?")
+        formats = attribute_values(delivery, technical_text, "Какой способ поставки вам подходит?")
+        if systems:
+            selection.platforms = tuple(systems)
+        if formats:
+            types = {"электрон" if fmt.startswith("электрон") else "короб" for fmt in formats}
+            if len(types) > 1:
+                raise SelectionInputError("delivery", "Уточни способ поставки.", "Какой способ поставки нужен?")
+            selection.delivery = types.pop()
     if seats is not None:
         counts = {int(n) for n in SEATS.findall(scope[-1])}
         for group in re.finditer(r"\b(\d+(?:\s*(?:,|и|или)\s*\d+)+)\s+(?:мест|пользовател)", scope[-1], re.I):
@@ -48,32 +124,9 @@ def license_selection(name, seats, turns):
 
 
 def resolve_options(index, variants, turns):
-    selections = [license_selection(item.name, item.seats, turns) for item in variants]
-    # Different products may have different quantities. Only attribute a count to a
-    # product when that count is attached to its name in the same clause.
-    names = {item.name.casefold() for item in variants}
-    if len(names) > 1:
-        for turn in turns:
-            terms = [Selection("").qualifiers(part, followup=False) for part in re.split(r"[;,]|\s+и\s+", turn)]
-            if any(len({getattr(t, key) for t in terms if getattr(t, key)}) > 1 for key in ("kind", "buyer", "months")):
-                raise SelectionInputError(
-                    "terms",
-                    "Разные условия покупки: уточни или подбери каждую позицию отдельно.",
-                    "Какие позиции покупаете впервые, а какие продлеваете?",
-                )
-    if len(names) > 1 and any(len(set(SEATS.findall(turn))) > 1 for turn in turns):
-        for item, selection in zip(variants, selections, strict=True):
-            clauses = (part for turn in turns for part in re.split(r"[;,]|\s+и\s+", turn, flags=re.I))
-            counts = {
-                int(n) for part in clauses if item.name.casefold() in part.casefold() for n in SEATS.findall(part)
-            }
-            if len(counts) != 1 or (item.seats is not None and item.seats not in counts):
-                raise SelectionInputError(
-                    "line_capacity",
-                    "Уточни отдельно число мест для каждой позиции.",
-                    "Сколько пользователей требуется для каждой позиции комплекта?",
-                )
-            selection.seats = counts.pop()
+    selections = [
+        license_selection(item.name, item.seats, scoped_turns(item.name, variants, turns)) for item in variants
+    ]
     if len({(s.name.casefold(), s.seats) for s in selections}) != len(selections):
         raise SelectionInputError(
             "duplicate",
@@ -89,9 +142,24 @@ def resolve_options(index, variants, turns):
     return hits
 
 
-def quote_preview(settings, hits, turns):
+def alternate_proposals(turns, variants=()):
+    names = [v.name.casefold() for v in variants]
+    if len(names) != len(set(names)):
+        return True
+    document = r"(?:кп|коммерческ\w*\s+предложен\w*)"
+    plural = r"(?:[2-9]|[1-9]\d+|два|две|три|четыре|пять|несколько|отдельн\w*)"
+    separate = rf"{plural}\s+(?:отдельн\w*\s+)?{document}|{document}\s+(?:на|для|по)\s+кажд\w*"
+    return any(
+        re.search(rf"\b(?:{separate}|или|сравн\w*|вариант\w*|альтернатив\w*|по отдельности|раздельн\w*)\b", turn, re.I)
+        for turn in turns
+    )
+
+
+def quote_preview(settings, hits, turns, variants=()):
     """Price a provisional basket at one sale unit per line using T16's actual document policy."""
-    if any(len(hit.products) != 1 for hit in hits) or re.search(r"\b(?:или|сравн\w*)\b", turns[-1], re.I):
+    if any(len(hit.products) != 1 for hit in hits) or alternate_proposals(turns, variants):
+        return None
+    if len(hits) > 1 and len({hit.products[0].name.split(" (")[0].casefold() for hit in hits}) != len(hits):
         return None
     items = [Item(offerId=hit.products[0].offerId, packages=1) for hit in hits]
     if len({item.offerId for item in items}) != len(items):
