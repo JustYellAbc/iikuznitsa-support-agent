@@ -27,7 +27,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
 
 import app.agent.needs as needs
-from app.agent.catalog_selection import Selection, named_request, select, selection_for
+from app.agent.catalog_selection import Selection, confirmed_candidate, named_request, select, selection_for
 from app.agent.handoff import (
     HUMAN_REQUEST,
     OFFER_HELP,
@@ -80,11 +80,15 @@ async def run_turn(
     intake_started = time.perf_counter()
     if products is None:
         products = [Product.model_validate(p) for p in await last_products(session.id)]
-    if action_type == "message" and re.fullmatch(
-        r"(?:да[, ]+)?(?:бер[её]м|подходит|(?:пришлите|сформируйте|оформите|подготовьте|можно|нужно|хочу)?\s*"
-        r"(?:кп|коммерческое предложение))(?:[, ]+(?:пришлите |оформите )?кп)?[.!? ]*",
-        user_text.strip(),
-        re.I,
+    if (
+        action_type == "message"
+        and not confirmed_candidate(history, user_text)
+        and re.fullmatch(
+            r"(?:да[, ]+)?(?:бер[её]м|подходит|(?:пришлите|сформируйте|оформите|подготовьте|можно|нужно|хочу)?\s*"
+            r"(?:кп|коммерческое предложение))(?:[, ]+(?:пришлите |оформите )?кп)?[.!? ]*",
+            user_text.strip(),
+            re.I,
+        )
     ):
         text = (
             "Выберите позиции и количество упаковок в форме «Подготовить КП», затем укажите организацию, ИНН и КПП."
