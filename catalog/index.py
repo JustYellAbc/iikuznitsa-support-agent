@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
 
 KNOWLEDGE = Path(__file__).with_name("knowledge.json")
@@ -162,6 +163,30 @@ def source_version(db):
     return row[0]
 
 
+@lru_cache(maxsize=1)
+def bundled_help():
+    return json.loads(KNOWLEDGE.read_text(encoding="utf8"))
+
+
+def search_help(db, expression, limit):
+    # Old stand volumes may hold only the original six guides. Prefer their installed
+    # full articles, supplement missing sources offline and rank all sections together.
+    present = {row[0] for row in db.execute("SELECT DISTINCT source FROM knowledge")}
+    missing = [row for row in bundled_help() if row["source"] not in present]
+    if not missing:
+        return db.execute(
+            "SELECT title,body,source FROM knowledge WHERE knowledge MATCH ? ORDER BY bm25(knowledge,4,1,0) LIMIT ?",
+            (expression, limit),
+        )
+    db.execute("CREATE VIRTUAL TABLE temp.help USING fts5(title,body,source UNINDEXED)")
+    db.execute("INSERT INTO temp.help SELECT title,body,source FROM knowledge")
+    db.executemany("INSERT INTO temp.help VALUES(:title,:body,:source)", missing)
+    return db.execute(
+        "SELECT title,body,source FROM temp.help WHERE help MATCH ? ORDER BY bm25(help,4,1,0) LIMIT ?",
+        (expression, limit),
+    )
+
+
 def search(index, query, scope="catalog", limit=5, *, license_type=None, include_snapshot=False, by_need=False):
     # Quote FTS tokens and bind MATCH to keep raw user input out of query syntax.
     named_family = scope == "catalog" and MDAEMON.search(query)
@@ -185,11 +210,7 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None, include
         if include_snapshot:
             snapshot = source_version(db)
         if scope == "knowledge":
-            rows = db.execute(
-                "SELECT title,body,source FROM knowledge WHERE knowledge MATCH ? "
-                "ORDER BY bm25(knowledge,4,1,0) LIMIT ?",
-                (expression, limit),
-            )
+            rows = search_help(db, expression, limit)
         else:
             filters = ["products MATCH ?"]
             bindings = [catalog_lookup(query, expression) if named_family else expression]

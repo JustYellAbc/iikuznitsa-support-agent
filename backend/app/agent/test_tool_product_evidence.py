@@ -130,6 +130,18 @@ def test_selected_offer_with_sparse_attributes_can_be_presented_for_purchase():
     assert not offers_operator(body)
 
 
+@pytest.mark.parametrize("family", ["Renga Professional", "Design Suite"])
+def test_single_unrated_offer_cannot_confirm_a_many_seat_purchase(family):
+    row = offer("one", f"{family} для 1 рабочего места", seatLimit=None)
+    body, purpose, cards, sources, case = reply([row], text="Одновременно нужны 12 лицензий")
+    assert "12 мест" in body and family in body and purpose == "clarification"
+    assert not cards and sources[0].url == row["source"] and case is None
+    body, purpose, cards, _, _ = reply([row], text="Нужно 12 отдельных лицензий")
+    assert "12 таких лицензий" in body and purpose == "answer" and len(cards) == 1
+    row["seatLimit"] = ["12"]
+    assert reply([row], text="Нужен комплект на 12 мест")[2][0].offerId == "one"
+
+
 @pytest.mark.parametrize(
     ("field", "detail", "known", "missing"),
     [

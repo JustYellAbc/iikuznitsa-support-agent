@@ -26,6 +26,19 @@ def test_exact_and_search(index):  # noqa: F811
     assert not get_offer(index.parent / "missing.db", "new20").ok
 
 
+def test_legacy_catalog_gains_bundled_guides_and_prefers_installed_articles(index):  # noqa: F811
+    source = "https://docs.softline.com/ru-ru/lk/view-statuses"
+    with closing(sqlite3.connect(index)) as db, db:
+        db.execute("DELETE FROM knowledge WHERE source=?", (source,))
+    result = search_store_knowledge(index, "Просмотр статуса заказа").data
+    assert result[0]["source"] == source and "https://lk.softline.ru/" in result[0]["body"]
+    installed = "Специальная инструкция установленного справочника."
+    with closing(sqlite3.connect(index)) as db, db:
+        db.execute("INSERT INTO knowledge VALUES(?,?,?)", ("Просмотр статуса заказа", installed, source))
+    result = search_store_knowledge(index, "Просмотр статуса заказа").data
+    assert [row["body"] for row in result if row["source"] == source] == [installed]
+
+
 @pytest.mark.parametrize("question", [QUESTION, "Доставка?"])
 def test_only_published_answers(api, question):  # noqa: F811
     _, hid = source_case(api)
