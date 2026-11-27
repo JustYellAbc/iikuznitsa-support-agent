@@ -18,6 +18,27 @@ from app.agent.tool_agent import Answer, Evidence, checked_answer
 from app.config import get_settings
 
 
+def test_capabilities_do_not_replace_an_existing_selection(stand_api, provider, index):  # noqa: F811
+    answers, requests = provider
+    answers.extend([tool("get_offer", offer_id="new20"), tool("respond", kind="product", refs=["r1"])])
+    cid = stand_api.new_conversation()
+    say(stand_api, cid, "Покажите артикул new20")
+    for question in ["Что ты умеешь?", "А ты сам чем можешь помочь?"]:
+        answers.append(tool("respond", kind="capabilities"))
+        reply = say(stand_api, cid, question)
+        assert len(reply) >= 1 and "подключить менеджера" in reply[-1]["text"]
+        assert not any(e["type"] in {"products", "handoff"} for e in reply)
+    assert stand_api.say(cid, "Подготовить КП").headers["X-Chat-Action"] == "open-quote-form"
+    assert len(requests) == 3
+
+
+def test_capabilities_of_named_product_still_use_catalog(stand_api, provider, index):  # noqa: F811
+    answers, requests = provider
+    answers.extend([tool("get_offer", offer_id="new20"), tool("respond", kind="product", refs=["r1"])])
+    reply = say(stand_api, stand_api.new_conversation(), "Что умеет MDaemon, артикул new20?")
+    assert len(requests) == 2 and any(e["type"] == "products" for e in reply)
+
+
 def offer(sku, name, **details):
     return {
         "offerId": sku,
