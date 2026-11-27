@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     mock_llm: bool = True
+    agent_engine: Literal["rules", "tools"] = "rules"
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_proxy_url: str = ""

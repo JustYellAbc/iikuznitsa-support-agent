@@ -14,7 +14,9 @@ function sourceLink(source) {
   try {
     const url = new URL(source.url);
     if (url.protocol === "https:") {
-      link.href = url.href;
+      // Local preview may serve this same API over HTTP. Published articles belong to this stand.
+      link.href = url.host === window.location.host && url.pathname.startsWith("/api/v1/knowledge/")
+        ? url.pathname : url.href;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
     }
