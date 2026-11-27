@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.agent.quote_calculation import ProposalRequest
 from app.contracts.schemas import ManagerLogin
 from app.contracts.t04 import (
     ID_PATTERN,
@@ -20,7 +21,9 @@ from app.core import auth, events
 from app.core.auth import Principal, require_manager, require_principal
 from app.core.errors import ApiError, not_found
 from app.db import repository
+from app.db.database import get_db
 from app.services import conversation_service as svc
+from app.services import quotes
 
 router = APIRouter(prefix="/api/v1")
 
@@ -168,8 +171,89 @@ async def resolve_handoff(
     responses={200: {"content": {"application/pdf": {}}}, **ERRORS},
 )
 async def download_document(documentId: PathId, principal: Principal = Depends(require_principal)) -> Response:
-    """Документы КП появятся вместе с блоком расчётов."""
-    raise not_found("Документ не найден.")
+    row = await get_db().fetchone(
+        "SELECT conversation_id, quote_id, revision FROM quote_revisions "
+        "WHERE document_id=? AND issued_action IS NOT NULL",
+        (documentId,),
+    )
+    if row is None:
+        raise not_found("Документ не найден.")
+    return await quote_preview(row["conversation_id"], row["quote_id"], row["revision"], principal)
+
+
+@router.get("/conversations/{conversationId}/quotes/{quoteId}/{revision}/preview.pdf", tags=["КП"])
+async def quote_preview(
+    conversationId: PathId,
+    quoteId: PathId,
+    revision: Annotated[int, Path(ge=1)],
+    principal: Principal = Depends(require_principal),
+) -> Response:
+    await svc.conversation_for(principal, conversationId)
+    async with get_db().committed_read():
+        if principal.role == "customer" and not await quotes.published(conversationId, quoteId, revision):
+            raise not_found("Документ не найден.")
+        row = await get_db().fetchone(
+            "SELECT pdf, issued_action, json_extract(snapshot,'$.quote.state') AS state FROM quote_revisions "
+            "WHERE conversation_id=? AND quote_id=? AND revision=?",
+            (conversationId, quoteId, revision),
+        )
+    if row is None or (principal.role == "customer" and row["state"] == "ready" and not row["issued_action"]):
+        raise not_found("Документ не найден.")
+    return Response(
+        row["pdf"],
+        media_type="application/pdf",
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": f'attachment; filename="Softline-{quoteId}-v{revision}.pdf"',
+        },
+    )
+
+
+@router.post("/conversations/{conversationId}/quotes", status_code=202, response_model=Receipt, tags=["КП"])
+async def prepare_quote(
+    request: Request,
+    conversationId: PathId,
+    body: ProposalRequest,
+    key: IdempotencyKey,
+    principal: Principal = Depends(require_principal),
+) -> JSONResponse:
+    if principal.role != "customer":
+        raise ApiError(403, "forbidden", "Выбор подтверждает покупатель.")
+    await svc.conversation_for(principal, conversationId)
+    return _json(
+        await svc.idempotent(
+            principal,
+            "POST",
+            request.url.path,
+            key,
+            body.model_dump(mode="json"),
+            lambda: quotes.prepare(conversationId, body),
+        )
+    )
+
+
+@router.get("/conversations/{conversationId}/quotes/current", tags=["КП"])
+async def quote_inputs(conversationId: PathId, principal: Principal = Depends(require_principal)) -> JSONResponse:
+    await svc.conversation_for(principal, conversationId)
+    async with get_db().committed_read():
+        row = await quotes.latest(conversationId)
+        if principal.role == "customer" and row and not row["reselect"]:
+            await quotes.require_published(row)
+        choices = await quotes.selectable_products(conversationId)
+    snapshot = quotes.read(row) if row else None
+    reselect = bool(row and row["reselect"])
+    return JSONResponse(
+        {
+            "revision": snapshot.quote.revision if snapshot else 0,
+            "requiresReselection": reselect,
+            "choices": [{"offerId": offer_id, "name": name} for offer_id, name in choices.items()],
+            "customer": snapshot.customer.model_dump() if snapshot else None,
+            "items": [{"offerId": d.product.offerId, "packages": d.packages} for d in snapshot.details]
+            if snapshot and not reselect
+            else [],
+        },
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 # --- Вход менеджера ------------------------------------------------------------------------

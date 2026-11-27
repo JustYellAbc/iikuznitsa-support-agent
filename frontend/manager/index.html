@@ -24,6 +24,7 @@
         <div class="section-title"><h2>Открытые обращения</h2><span id="count" class="count">0</span></div>
         <p id="queue-empty" class="muted">Открытых обращений пока нет.</p>
         <nav id="queue" aria-label="Очередь обращений"></nav>
+        <section id="quote-moderation" hidden><h3>КП на проверке</h3><div id="quote-drafts"></div></section>
         <details id="archive"><summary>Закрытые обращения</summary><nav id="resolved" aria-label="Закрытые обращения"></nav></details>
       </aside>
       <section class="panel detail">
@@ -34,6 +35,12 @@
           <div id="products"></div>
           <h3>История диалога</h3>
           <ol id="history" tabindex="0" aria-label="История диалога"></ol>
+          <form id="approve-price" hidden>
+            <label>Согласованная цена за упаковку, ₽ <input id="line-price" type="text" inputmode="decimal"
+              required pattern="[0-9]{1,12}([.,][0-9]{1,2})?"></label>
+            <button class="primary">Подтвердить цену строки</button>
+            <p id="price-status" role="status"></p>
+          </form>
           <form id="compose">
             <label for="reply">Ответ клиенту</label>
             <textarea id="reply" required maxlength="8000" rows="3" placeholder="Напишите сообщение…"></textarea>

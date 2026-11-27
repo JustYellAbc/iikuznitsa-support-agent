@@ -131,7 +131,7 @@ for (const toOperator of [true, false]) {
           return route.fulfill({ json: { events: batch, nextAfter: batch.at(-1)?.seq ?? after, hasMore: false } });
         }
         const asset = url.pathname.split("/").pop() || "index.html";
-        if (!["index.html", "chat.css", "chat.js", "render.js"].includes(asset)) return route.abort();
+        if (!["index.html", "chat.css", "chat.js", "render.js", "quote.js"].includes(asset)) return route.abort();
         return route.fulfill({ path: path.join(__dirname, "../chat", asset) });
       });
       await page.goto("http://127.0.0.1/chat/");

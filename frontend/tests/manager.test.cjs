@@ -36,7 +36,10 @@ test("Менеджер уточняет и закрывает обращение
     stdio: ["ignore", "pipe", "inherit"]
   });
   const stopped = once(server, "exit");
+  let browser;
   t.after(async () => {
+    // Close the buyer's event stream before asking uvicorn to drain its connections.
+    await browser?.close();
     server.kill();
     await stopped;
     await rm(dataDir, { recursive: true, force: true });
@@ -46,8 +49,7 @@ test("Менеджер уточняет и закрывает обращение
     stopped.then(() => { throw new Error("Локальный сервер завершился при запуске"); })
   ]);
   const baseURL = "http://127.0.0.1:" + port;
-  const browser = await chromium.launch({ channel: process.env.T13_BROWSER_CHANNEL || undefined });
-  t.after(() => browser.close());
+  browser = await chromium.launch({ channel: process.env.T13_BROWSER_CHANNEL || undefined });
   const customer = await browser.newContext({ baseURL });
   const manager = await browser.newContext({ baseURL });
   await manager.addInitScript(() => Object.defineProperty(crypto, "randomUUID", { value: undefined }));
@@ -64,6 +66,9 @@ test("Менеджер уточняет и закрывает обращение
   await message.fill("Закупка тендерная, нужны документы");
   await sendMessage.click();
   await chatHistory.getByText("Обращение передано оператору", { exact: true }).waitFor();
+  const recipient = chat.getByRole("combobox", { name: "Кому отправить сообщение" });
+  assert.equal(await recipient.isVisible(), true);
+  assert.match(await recipient.locator("option:checked").innerText(), /^Менеджеру/);
   await page.goto("/manager");
   assert.equal(new URL(page.url()).pathname, "/manager");
   assert.equal(await page.locator('link[rel="stylesheet"]').evaluate(link => Boolean(link.sheet)), true);
