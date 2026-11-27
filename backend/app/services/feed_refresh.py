@@ -7,14 +7,16 @@
 """
 
 import fcntl
+import gzip
 import hashlib
 import os
 import re
 import shutil
 import sqlite3
 import tempfile
+import zlib
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,19 +62,19 @@ def _snapshot_feed_file(feed: Path, directory: Path) -> tuple[Path, str, int]:
         raise FeedRejected(f"Фид пуст или не найден: {feed}")
     digest = hashlib.sha256()
     size = 0
-    header = b""
     fd, raw_name = tempfile.mkstemp(dir=directory, prefix=".feed-import-", suffix=".xml")
     copy_path = Path(raw_name)
     try:
-        with os.fdopen(fd, "wb") as out, feed.open("rb") as stream:
-            while chunk := stream.read(1 << 20):
-                if len(header) < 2:
-                    header += chunk[: 2 - len(header)]
-                    if header == b"\x1f\x8b":
-                        raise FeedRejected("Фид сжат gzip: распакуйте его в XML")
-                digest.update(chunk)
-                out.write(chunk)
-                size += len(chunk)
+        with os.fdopen(fd, "wb") as out, feed.open("rb") as raw:
+            compressed = raw.peek(2)[:2] == b"\x1f\x8b"
+            try:
+                with gzip.GzipFile(fileobj=raw) if compressed else nullcontext(raw) as stream:
+                    while chunk := stream.read(1 << 20):
+                        digest.update(chunk)
+                        out.write(chunk)
+                        size += len(chunk)
+            except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+                raise FeedRejected("Повреждён gzip-архив фида") from exc
         if size == 0:
             raise FeedRejected(f"Фид пуст или не найден: {feed}")
     except BaseException:
@@ -233,10 +235,13 @@ def _copy_atomic(source: Path, destination: Path) -> None:
     temporary = destination.with_name(destination.name + ".tmp")
     temporary.unlink(missing_ok=True)
     try:
-        os.link(source, temporary)
-    except OSError:
-        shutil.copy2(source, temporary)
-    os.replace(temporary, destination)
+        try:
+            os.link(source, temporary)
+        except OSError:
+            shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def refresh(
@@ -264,7 +269,6 @@ def refresh(
         had_index = index.is_file()
         # Неизменяемая копия XML для хеша и build(): конкурентная запись не рассогласует SHA-256 и БД.
         feed_copy, sha256, size = _snapshot_feed_file(feed, index.parent)
-        rollback_source: Path | None = None
         try:
             try:
                 catalog_index.build(feed_copy, staging, knowledge)
@@ -297,23 +301,24 @@ def refresh(
             os.chmod(staging, 0o644)  # mkstemp в T06 даёт 0600: бэкенд может работать под другим uid
             same_snapshot = bool(current and current.get("feed_sha256") and current.get("feed_sha256") == sha256)
             if had_index:
-                if same_snapshot:
-                    # Повтор идентичного снимка не должен затирать предыдущую отличную версию в catalog.prev.sqlite3
-                    _copy_atomic(index, rollback_backup)
-                    rollback_source = rollback_backup
+                _copy_atomic(index, rollback_backup)
+            try:
+                os.replace(staging, index)
+            except OSError:
+                rollback_backup.unlink(missing_ok=True)
+                raise
+            try:
+                report = self_check(index, snapshot)
+                if had_index and current and not same_snapshot:
+                    os.replace(rollback_backup, previous)
+            except BaseException:
+                if had_index:
+                    os.replace(rollback_backup, index)
                 else:
-                    _copy_atomic(index, previous)
-                    rollback_source = previous
-            os.replace(staging, index)
+                    index.unlink()
+                raise
+            rollback_backup.unlink(missing_ok=True)
         finally:
             staging.unlink(missing_ok=True)
             feed_copy.unlink(missing_ok=True)
-        try:
-            report = self_check(index, snapshot)
-        except Exception:
-            if rollback_source is not None and rollback_source.is_file():
-                _copy_atomic(rollback_source, index)
-            raise
-        finally:
-            rollback_backup.unlink(missing_ok=True)
     return {"snapshot": snapshot, "previous": current, **report}

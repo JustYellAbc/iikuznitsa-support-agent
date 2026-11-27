@@ -171,7 +171,14 @@ async def run_turn(
         hit = await asyncio.to_thread(answer_facts, index, fact_question, topics, products)
         if len(products) == 1 and index.is_file():
             products = hit.products
-        policy = route_action(history, fact_question, products, action_type=action_type, finding=finding)
+        policy = route_action(
+            history,
+            fact_question,
+            products,
+            action_type=action_type,
+            finding=finding,
+            product_reason=hit.handoff_reason,
+        )
         if policy and not policy.offer_help:
             route = policy
         steps.append(

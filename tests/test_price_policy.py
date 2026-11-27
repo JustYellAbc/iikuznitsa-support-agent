@@ -371,3 +371,30 @@ def test_buyer_views_hide_price_when_policy_disables_it(tmp_path):
                 assert all(p["unitPriceKopecks"] is None for p in ev["products"])
             elif ev["type"] == "handoff":
                 assert all(p["unitPriceKopecks"] is None for p in ev["handoff"]["products"])
+
+
+@pytest.mark.parametrize("show_price", [True, False])
+@pytest.mark.parametrize("question", ["Есть ли в наличии?", "Какая цена и есть ли в наличии?"])
+def test_availability_handoff_keeps_question_sku_and_current_visibility(api, tmp_path, show_price, question):
+    from tests.test_feed_refresh import LIMITS, write_feed
+
+    data = json.loads(price_policy.POLICY_PATH.read_text(encoding="utf-8"))
+    data["availability_check"]["show_snapshot_price_with_caveat"] = show_price
+    write_override(tmp_path, json.dumps(data))
+    price_policy.activate(tmp_path)
+    refresh(
+        write_feed(tmp_path / "stock.xml", "2026-11-25 10:00"), tmp_path / "private/catalog.sqlite3", KNOWLEDGE, LIMITS
+    )
+    cid = api.new_conversation()
+    api.login()
+    for message in ("Артикул t3", question):
+        assert api.say(cid, message).status_code == 202
+        api.idle()
+    [card] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+    assert (card["question"], card["reason"]) == (question, "availability")
+    [product] = card["products"]
+    assert product["offerId"] == "t3" and product["unitPriceKopecks"] == (250050 if show_price else None)
+    assert product["available"] is False
+    if not show_price:
+        events = json.dumps(api.events(cid), ensure_ascii=False)
+        assert "250050" not in events and "2 500" not in events

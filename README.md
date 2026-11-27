@@ -98,11 +98,12 @@ python catalog/index.py search data/private/catalog.sqlite3 "восстанов�
 
 ## T14 · Обновление фида и состояние цены
 
-`scripts/refresh_feed.py` пересобирает индекс T06 из нового фида без остановки бэкенда. Порядок такой: проверка XML, сборка рядом с рабочим индексом, проверка инвариантов, запись метаданных снимка, self-check и атомарная подмена `$DATA_DIR/private/catalog.sqlite3`. Если фид битый, пустой, сжатый, без даты выгрузки, содержит меньше `--min-offers` (по умолчанию 1000) офферов, старше текущего снимка или меньше его по числу SKU более чем на `--max-drop` (по умолчанию 50%), скрипт завершается с кодом 1, а рабочий каталог не меняется. Прежний снимок лежит рядом в `catalog.prev.sqlite3`. Для ручного отката: `mv data/private/catalog.prev.sqlite3 data/private/catalog.sqlite3`.
+`scripts/refresh_feed.py` принимает обычный XML и gzip по пути или URL. Формат определяется по содержимому. SHA-256 и размер в метаданных относятся к распакованному XML. Скрипт собирает индекс рядом с рабочим, проверяет его, атомарно переключает `$DATA_DIR/private/catalog.sqlite3` и проверяет результат по рабочему пути. После успешного переключения предыдущая отличная версия сохраняется в `catalog.prev.sqlite3`. Битый архив, пустая выгрузка, пропущенная дата, недостаток пригодных позиций или сбой проверки сохраняют рабочий и резервный снимки. По умолчанию нужны не менее 1000 позиций, допускается сокращение числа SKU до 50%.
 
 ```bash
 # локально (DATA_DIR из .env, по умолчанию ./data)
 python scripts/refresh_feed.py data/raw/Mindbox.yml.gz.xml
+python scripts/refresh_feed.py https://store.softline.ru/feeds/Mindbox.yml.gz
 # на стенде: положить фид в /opt/stand/data/raw/ и запустить внутри контейнера
 docker compose exec backend python scripts/refresh_feed.py data/raw/Mindbox.yml.gz.xml
 ```

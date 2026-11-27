@@ -107,6 +107,7 @@ def route_action(
     *,
     action_type: ActionType = "message",
     finding: SearchFinding | None = None,
+    product_reason: HandoffReason | None = None,
 ) -> Routing | None:
     """Route a T04 action using the server's selected products and verified search outcome."""
     body = " ".join(text.casefold().split())
@@ -128,11 +129,14 @@ def route_action(
         return Routing("outside_catalog", text)
     if len(products) == 1:
         p = products[0]
+        asks_availability = re.search(
+            r"наличи|доступн|купить|поставк|достав|получить .*?ключ|получить ключ|электронн\w* ключ|прид[её]т", body
+        )
+        if asks_availability and (product_reason == "availability" or p.priceState == "availability_check"):
+            return Routing("availability", text)
         if PRICE.search(body) and p.priceState == "on_request":
             return Routing("price_request", text)
-        if p.priceState == "availability_check" and re.search(
-            r"наличи|доступн|купить|поставк|достав|получить .*?ключ|получить ключ|электронн\w* ключ|прид[её]т", body
-        ):
+        if asks_availability and not p.available:
             return Routing("availability", text)
         if TERM.search(body) and p.licenseTerm is None:
             finding = "insufficient_evidence"

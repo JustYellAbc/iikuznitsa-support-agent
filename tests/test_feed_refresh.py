@@ -1,11 +1,14 @@
 """T14: атомарное обновление фида, метаданные снимка, откат при битом фиде и статус в API."""
 
+import gzip
 import hashlib
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from threading import Thread
 
 import pytest
 from catalog.index import KNOWLEDGE
@@ -277,6 +280,86 @@ def test_cli_reports_and_exit_codes(tmp_path):
     assert bad.returncode == 1
     assert "Каталог не изменён" in bad.stderr
     assert read_snapshot(index)["offers_count"] == 4
+
+
+def test_cli_accepts_gzip_or_xml_and_keeps_last_good_download_on_corruption(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    index = tmp_path / "catalog.sqlite3"
+    xml = write_feed(tmp_path / "feed.xml", "2026-11-25 10:00").read_bytes()
+    payload = xml
+
+    class Feed(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/xml")
+            if payload.startswith(b"\x1f\x8b"):
+                self.send_header("Content-Encoding", "gzip")
+            self.end_headers()
+            self.wfile.write(payload)
+
+    with HTTPServer(("127.0.0.1", 0), Feed) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/Mindbox.yml.gz"
+        cmd = [sys.executable, str(ROOT / "scripts/refresh_feed.py"), url, "--index", str(index), "--min-offers", "3"]
+        archive = tmp_path / "data/raw/Mindbox.yml.gz"
+        try:
+            for payload in (xml, gzip.compress(xml)):
+                run = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True)
+                assert run.returncode == 0, run.stderr
+                assert read_snapshot(index)["feed_sha256"] == hashlib.sha256(xml).hexdigest()
+                assert read_snapshot(index)["feed_bytes"] == len(xml)
+                assert archive.read_bytes() == payload
+            good_archive = payload
+            before = digest(index)
+            payload = good_archive[:-5]
+            bad = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True)
+            assert bad.returncode == 1 and "gzip" in bad.stderr
+            assert digest(index) == before and archive.read_bytes() == good_archive
+            assert not list(archive.parent.glob("*.part"))
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+@pytest.mark.parametrize("existing", [0, 1, 2])
+def test_failed_published_check_restores_live_and_preserves_previous(tmp_path, monkeypatch, existing):
+    from app.services import feed_refresh
+
+    index = tmp_path / "catalog.sqlite3"
+    prev = tmp_path / "catalog.prev.sqlite3"
+    for day in range(1, existing + 1):
+        refresh(write_feed(tmp_path / "feed.xml", f"2026-11-{day:02} 10:00"), index, KNOWLEDGE, LIMITS)
+    live_before = digest(index) if index.exists() else None
+    prev_before = digest(prev) if prev.exists() else None
+    original = feed_refresh.self_check
+
+    def fail_on_live(path, snapshot):
+        if path == index:
+            raise FeedRejected("final check failed")
+        return original(path, snapshot)
+
+    monkeypatch.setattr(feed_refresh, "self_check", fail_on_live)
+    with pytest.raises(FeedRejected, match="final check failed"):
+        refresh(write_feed(tmp_path / "feed.xml", "2026-11-03 10:00"), index, KNOWLEDGE, LIMITS)
+    assert (digest(index) if index.exists() else None) == live_before
+    assert (digest(prev) if prev.exists() else None) == prev_before
+    assert not index.with_name("catalog.rollback.sqlite3").exists()
+
+
+@pytest.mark.parametrize("currency", ["rub", "rUr"])
+def test_refresh_currency_is_searchable_in_chat(tmp_path, api, currency):
+    feed = write_feed(tmp_path / "feed.xml", "2026-11-25 10:00", currency=currency)
+    refresh(feed, get_settings().catalog_index_path, KNOWLEDGE, LIMITS)
+    cid = api.new_conversation()
+    for text in ["Артикул t1", "Какая цена?"]:
+        response = api.say(cid, text)
+        assert response.status_code == 202
+        api.idle()
+        events = [e["data"] for e in api.events(cid) if e["actionId"] == response.json()["actionId"]]
+        assert "100 ₽" in events[-1]["text"] and events[-1]["sources"][0]["url"].endswith("/-t1/")
+        if text.startswith("Артикул"):
+            assert events[-2]["products"][0]["unitPriceKopecks"] == 10000
 
 
 def test_catalog_status_in_api(api: Api, client, tmp_path):

@@ -18,8 +18,10 @@ from app.agent.catalog_selection import (
 )
 from app.agent.handoff import OFFER_HELP, PRICE
 from app.contracts.t04 import Product, Source
+from app.services.price_policy import is_supported_currency
 
 TOPICS = {
+    "availability": r"в наличии|\bналичи[еяю]\b|доступ(?:ен|на|но|ны) ли",
     "term": r"\bсрок\b|срок[аи] (?:действия|лицензии|подписки)|на (?:сколько|год)|сколько (?:лет|месяц)|длительность",
     "updates": r"обновлен|что (?:точно )?входит",
     "rights": r"навсегда|бессроч|пользоваться после|после (?:окончания|истечения)|останется ли",
@@ -137,7 +139,7 @@ def current_offer(db: sqlite3.Connection, product: Product) -> dict | None:
         "SELECT id,name,params,available,price,currency,source,price_state FROM offers WHERE id=? AND source=?",
         (product.offerId, product.source.url),
     ).fetchone()
-    if row and row["currency"] in {"RUB", "RUR"}:
+    if row and is_supported_currency(row["currency"]):
         return {**row, "params": json.loads(row["params"])}
     return None
 
@@ -233,9 +235,14 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
                 facts.append(f"Цена по снимку — {money} ₽.")
         if assessment.price_state == "availability_check":
             facts.append("Наличие требует подтверждения.")
+        elif "availability" in topics:
+            facts.append("По снимку каталога позиция в наличии." if p.available else "Наличие требует подтверждения.")
         if unknown:
             # The T09/T12 offer opens the operator button. Show the sourced partial answer
             # alongside it, even when one detail requires the manager.
             label = " ".join([*facts, "Требует уточнения: " + ", ".join(unknown) + "."])
-            return result(OFFER_HELP, products=[p], sources=[Source(url=p.source.url, label=label), *refs])
-        return result(" ".join([*facts, *(ref.label for ref in refs)]), "answer", [p], sources=[p.source, *refs])
+            reply = result(OFFER_HELP, products=[p], sources=[Source(url=p.source.url, label=label), *refs])
+        else:
+            reply = result(" ".join([*facts, *(ref.label for ref in refs)]), "answer", [p], sources=[p.source, *refs])
+        reply.handoff_reason = assessment.handoff_reason
+        return reply

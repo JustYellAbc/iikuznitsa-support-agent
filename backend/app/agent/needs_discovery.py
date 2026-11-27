@@ -7,6 +7,7 @@ import sqlite3
 from app.agent.catalog_selection import result
 from app.agent.handoff import OFFER_HELP
 from app.contracts.t04 import Product
+from app.services.price_policy import is_supported_currency
 
 
 def compare_catalog(db: sqlite3.Connection, brief, choice, money):
@@ -16,15 +17,17 @@ def compare_catalog(db: sqlite3.Connection, brief, choice, money):
     }[brief.task]
     # Only claim the category and platform. Licensing units and full project cost may differ by vendor.
     rows = db.execute(
-        """SELECT o.name,o.id,o.vendor,o.params,o.source,o.price,o.details FROM products JOIN offers o
+        """SELECT o.name,o.id,o.vendor,o.params,o.source,o.price,o.details,o.currency FROM products JOIN offers o
            ON o.rowid=products.rowid WHERE products MATCH ? AND o.available=1
-           AND o.currency IN ('RUB','RUR') AND o.price_state='priced_available'
+           AND o.price_state='priced_available'
            ORDER BY CAST(o.price AS REAL),o.id""",
         (query,),
     )
     selected = []
     vendors = set()
     for row in rows:
+        if not is_supported_currency(row["currency"]):
+            continue
         params, details = json.loads(row["params"]), json.loads(row["details"])
         if not row["source"].startswith("https://") or row["vendor"] in vendors or (choice and choice != row["id"]):
             continue

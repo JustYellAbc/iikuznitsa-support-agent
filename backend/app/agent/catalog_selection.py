@@ -10,8 +10,8 @@ from pathlib import Path
 
 from app.agent.handoff import AFFIRMATIVE, OFFER_HELP
 from app.contracts.schemas import ToolResult
-from app.contracts.t04 import Product, Source
-from app.services.price_policy import OfferAssessment, assess, snapshot_from_row
+from app.contracts.t04 import HandoffReason, Product, Source
+from app.services.price_policy import OfferAssessment, assess, is_supported_currency, snapshot_from_row
 
 WORD = re.compile(r"[^\W_]+")
 MDAEMON = re.compile(r"\b(?:mda?e?mo?n|mdeamon|мд[еэ]й?мон|мдаймон|эмдеймон)\b", re.I)
@@ -216,6 +216,7 @@ class Result:
     evidence: ToolResult
     suggestion: str = ""
     followup: Selection | None = None
+    handoff_reason: HandoffReason | None = None
 
 
 def result(text: str, purpose: str = "clarification", products=(), *, sources=()) -> Result:
@@ -319,7 +320,7 @@ def select(index: Path, selection: Selection) -> Result:
     rows = []
     for record in records:
         row = dict(record)
-        if row["source"].startswith("https://") and row["currency"] in ("RUB", "RUR"):
+        if row["source"].startswith("https://") and is_supported_currency(row["currency"]):
             row["params"] = json.loads(row["params"])
             rows.append(row)
     if not rows:

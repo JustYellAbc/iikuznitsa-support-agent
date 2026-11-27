@@ -33,7 +33,7 @@ def download(url: str, directory: Path) -> tuple[Path, str]:
     fd, raw_path = tempfile.mkstemp(dir=directory, prefix=f".{name}.", suffix=".part")
     partial = Path(raw_path)
     try:
-        with urlopen(url, timeout=60) as response, os.fdopen(fd, "wb") as out:
+        with os.fdopen(fd, "wb") as out, urlopen(url, timeout=60) as response:
             while chunk := response.read(1 << 20):
                 out.write(chunk)
     except BaseException:
