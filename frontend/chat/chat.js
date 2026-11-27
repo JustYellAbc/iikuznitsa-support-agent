@@ -3,7 +3,8 @@ import { quoteEvent, resetQuotes, setupQuotes } from "./quote.js";
 
 const byId = id => document.getElementById(id);
 const panel = byId("chat"), launch = byId("launch"), message = byId("message");
-const log = byId("log"), retry = byId("retry"), operator = byId("operator"), target = byId("target");
+const log = byId("log"), retry = byId("retry"), operator = byId("operator");
+const recipient = byId("recipient"), recipientSummary = byId("recipient-summary");
 const storageKey = "softline.t09.conversation.v1";
 const base = "/api/v1/conversations";
 const newKey = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
@@ -11,6 +12,7 @@ let state;
 try { state = JSON.parse(sessionStorage.getItem(storageKey)) || {}; } catch { state = {}; }
 function save() { sessionStorage.setItem(storageKey, JSON.stringify(state)); }
 const openHandoffs = new Map();
+let recipientId = "";
 const completedActions = new Set();
 // T12's OFFER_HELP is delivered as a clarification in the current T04 wire format.
 const operatorQuestion = "Подключить оператора, чтобы он уточнил ваш вопрос?";
@@ -57,21 +59,43 @@ function sync() {
   byId("feedback").textContent = actionError || historyError || (posting ? "Отправляем…" : state.receipt ? "Ожидаем ответ…" : "");
 }
 
+function updateRecipientSummary() {
+  const current = openHandoffs.get(recipientId);
+  recipientSummary.textContent = current ? "Сообщение оператору" : "Сообщение ассистенту";
+  if (current && openHandoffs.size > 1) recipientSummary.textContent += " · " + current.question;
+}
+
+function renderRecipients() {
+  recipient.hidden = !openHandoffs.size;
+  updateRecipientSummary();
+  const fields = byId("recipients");
+  fields.querySelectorAll("label").forEach(label => label.remove());
+  const options = [...openHandoffs].map(([id, item]) =>
+    [id, openHandoffs.size > 1 ? "Оператор · " + item.question : "Оператор"]);
+  options.push(["", "Ассистент"]);
+  for (const [id, title] of options) {
+    const label = document.createElement("label"), radio = document.createElement("input");
+    radio.type = "radio"; radio.name = "recipient"; radio.value = id; radio.checked = recipientId === id;
+    label.append(radio, title); fields.append(label);
+  }
+}
+
+byId("recipients").onchange = event => {
+  recipientId = event.target.value;
+  state.recipientChoice = { seq: cursor, id: recipientId }; save();
+  recipient.open = false;
+  updateRecipientSummary(); message.focus();
+};
+
 function updateHandoffs(handoff) {
-  const selected = target.value;
   const hadRecipient = openHandoffs.size > 0;
   if (handoff.status === "open") openHandoffs.set(handoff.handoffId, handoff);
   else openHandoffs.delete(handoff.handoffId);
-  target.replaceChildren();
-  for (const [id, item] of openHandoffs) target.add(new Option("Менеджеру — " + item.question, id));
-  target.add(new Option("Агенту поддержки", ""));
-  if (openHandoffs.has(selected) || (hadRecipient && !selected)) target.value = selected;
-  byId("target-label").hidden = openHandoffs.size === 0;
-  if ([...openHandoffs.values()].some(item => item.quoteLine)) {
-    byId("quote-open").textContent = "Изменить количество в КП";
-  } else if (handoff.quoteLine) {
-    byId("quote-open").textContent = "Изменить КП";
+  if (!hadRecipient || (recipientId && !openHandoffs.has(recipientId))) {
+    recipientId = openHandoffs.keys().next().value || "";
   }
+  if (!openHandoffs.size) recipient.open = false;
+  renderRecipients();
 }
 
 function showError(error, isAction) {
@@ -82,7 +106,7 @@ function showError(error, isAction) {
     closeStream();
     text = "Доступ к этому диалогу закончился. Вы можете начать новый.";
     state = {}; save();
-    log.replaceChildren(); openHandoffs.clear(); resetQuotes(); target.replaceChildren(); byId("target-label").hidden = true;
+    log.replaceChildren(); openHandoffs.clear(); resetQuotes(); recipientId = ""; recipient.open = false; renderRecipients();
     byId("welcome").hidden = false; message.value = "";
   }
   if (error.retryAfter > 0) {
@@ -107,11 +131,16 @@ function display(event) {
         updateHandoffs({...item,status:"resolved"});
     }
   }
-  log.append(renderEvent(event, state.id, submit));
-  quoteEvent(event.data);
+  const row = renderEvent(event, state.id, submit);
+  log.append(row);
+  quoteEvent(event.data, row);
   byId("welcome").hidden = true;
   cursor = event.seq;
   if (event.data.type === "handoff") updateHandoffs(event.data.handoff);
+  if (state.recipientChoice?.seq === cursor && (!state.recipientChoice.id || openHandoffs.has(state.recipientChoice.id))) {
+    recipientId = state.recipientChoice.id;
+    renderRecipients();
+  }
   const { type, author, purpose, handoffId } = event.data;
   if (type === "message") {
     operatorOffered = author === "agent" && purpose === "clarification" &&
@@ -230,7 +259,7 @@ function sendText() {
   const text = message.value.trim();
   if (!text || byId("send").disabled) return;
   const body = { type: "message", text };
-  if (target.value) body.handoffId = target.value;
+  if (recipientId) body.handoffId = recipientId;
   submit(body);
 }
 
@@ -245,7 +274,11 @@ function close() {
   clearTimeout(timer); launch.focus();
 }
 byId("close").onclick = close;
-panel.onkeydown = event => { if (event.key === "Escape") close(); };
+panel.onkeydown = event => {
+  if (event.key !== "Escape") return;
+  if (recipient.open) { recipient.open = false; recipientSummary.focus(); }
+  else close();
+};
 byId("compose").onsubmit = event => { event.preventDefault(); sendText(); };
 message.oninput = () => {
   if (state.pending?.body.type === "message" && !state.pending.uncertain && message.value.trim() !== state.pending.body.text) {

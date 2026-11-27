@@ -66,9 +66,10 @@ test("Менеджер уточняет и закрывает обращение
   await message.fill("Закупка тендерная, нужны документы");
   await sendMessage.click();
   await chatHistory.getByText("Обращение передано оператору", { exact: true }).waitFor();
-  const recipient = chat.getByRole("combobox", { name: "Кому отправить сообщение" });
-  assert.equal(await recipient.isVisible(), true);
-  assert.match(await recipient.locator("option:checked").innerText(), /^Менеджеру/);
+  const recipient = chat.getByText("Сообщение оператору", { exact: true });
+  await recipient.click();
+  assert.equal(await chat.getByRole("radio", { name: "Оператор", exact: true }).isChecked(), true);
+  await recipient.click();
   await page.goto("/manager");
   assert.equal(new URL(page.url()).pathname, "/manager");
   assert.equal(await page.locator('link[rel="stylesheet"]').evaluate(link => Boolean(link.sheet)), true);

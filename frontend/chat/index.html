@@ -10,7 +10,7 @@
 </head>
 <body>
   <header class="storebar"><div class="frame">
-    <a class="brand" href="https://store.softline.ru/" aria-label="Магазин Softline">softline<span>store</span></a>
+    <a class="brand" href="https://store.softline.ru/" aria-label="Магазин Softline"><img src="softline.png" alt="Софтлайн Решения"></a>
     <nav aria-label="Магазин"><a href="https://store.softline.ru/catalog/">Каталог</a><a href="https://store.softline.ru/delivery_info/">Оплата и доставка</a></nav>
   </div></header>
   <main class="frame">
@@ -25,16 +25,18 @@
   </main>
   <button class="launcher" id="launch" aria-controls="chat" aria-expanded="false"><span aria-hidden="true">◌</span> Чат с поддержкой</button>
   <section id="chat" aria-labelledby="chat-title" hidden>
-    <header class="chatbar"><div><span class="wordmark">softline</span><h2 id="chat-title">Поддержка магазина</h2></div>
+    <header class="chatbar"><div><img class="wordmark" src="softline-white.png" alt="Софтлайн Решения"><h2 id="chat-title">Поддержка магазина</h2></div>
       <button id="close" class="icon" aria-label="Свернуть чат">−</button></header>
     <div class="scroller" id="scroller">
       <div id="welcome"><h3>Какой продукт ищете или что хотите решить?</h3></div>
       <div id="log" role="log" aria-label="История диалога" aria-live="polite" aria-relevant="additions"></div>
     </div>
     <footer>
-      <div class="actions"><button id="operator" type="button" hidden>Позвать оператора</button>
-        <button id="quote-open" type="button" hidden>Подготовить КП</button></div>
-      <label id="target-label" hidden>Кому отправить сообщение <select id="target"></select></label>
+      <div class="actions"><button id="operator" type="button" hidden>Позвать оператора</button></div>
+      <details id="recipient" hidden>
+        <summary id="recipient-summary"></summary>
+        <fieldset id="recipients"><legend>Кому написать</legend></fieldset>
+      </details>
       <form id="compose"><textarea id="message" rows="1" maxlength="8000" aria-label="Ваше сообщение" placeholder="Ваше сообщение"></textarea><button id="send" class="icon" aria-label="Отправить сообщение">↑</button></form>
       <div id="feedback" role="status"></div><button id="retry" hidden>Повторить</button>
     </footer>
