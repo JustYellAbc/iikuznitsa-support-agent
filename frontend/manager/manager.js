@@ -10,7 +10,7 @@ const reasons = {
   availability: "Проверка доступности", outside_catalog: "Вне каталога", special_terms: "Особые условия",
   technical: "Технический вопрос", insufficient_evidence: "Недостаточно сведений"
 };
-const authors = { customer: "Клиент", agent: "ИИ-агент", manager: "Менеджер" };
+const authors = { customer: "Покупатель", agent: "Ассистент", manager: "Оператор", system: "Система" };
 const currency = new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB" });
 const clock = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" });
 const drafts = new Map();
@@ -62,8 +62,13 @@ function productList(products) {
 
 function eventRow(event) {
   const d = event.data, row = document.createElement("li");
-  const stamp = element("span", (authors[d.author] || "Система") + " · " + clock.format(new Date(event.at)));
+  const role = d.type === "message" ? d.author : "system";
+  row.dataset.role = role;
+  const stamp = document.createElement("div");
   stamp.className = "stamp";
+  const time = element("time", clock.format(new Date(event.at)));
+  time.dateTime = event.at;
+  stamp.append(element("strong", authors[role]), time);
   row.append(stamp);
   switch (d.type) {
     case "message":
@@ -333,6 +338,7 @@ async function refreshQuoteDrafts() {
       try { await request("/manager/drafts/" + encodeURIComponent(d.id) + "/send", {}, newKey()); await refresh(); }
       catch (error) { $("result").textContent = error.message; send.disabled=false; }
     };
+    row.className = "actions";
     row.append(link,send); return row;
   });
   $("quote-drafts").replaceChildren(...rows);

@@ -24,6 +24,7 @@ app.mount("/manager", StaticFiles(directory="frontend/manager", html=True))
 app.mount("/chat", StaticFiles(directory="frontend/chat", html=True))
 sock = socket.socket()
 sock.bind(("127.0.0.1", 0))
+sock.listen()
 print(sock.getsockname()[1], flush=True)
 uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=[sock])
 `;
@@ -104,6 +105,28 @@ test("Менеджер уточняет и закрывает обращение
   await message.fill("Десять пользователей");
   await sendMessage.click();
   await page.locator("#history").getByText("Десять пользователей").waitFor();
+  const history = page.locator("#history");
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    const logo = page.getByRole("img", { name: "Софтлайн Решения" });
+    assert.equal(await logo.getAttribute("src"), "/chat/softline.png");
+    assert.ok(await logo.evaluate(img => img.complete && img.naturalWidth > 0));
+    for (const [text, role] of [
+      ["Десять пользователей", "Покупатель"],
+      ["Сколько пользователей?", "Оператор"],
+      ["Передано менеджеру", "Система"],
+    ]) {
+      const row = history.getByRole("listitem").filter({ hasText: text });
+      await row.getByText(role, { exact: true }).waitFor();
+    }
+    await history.getByText("Ассистент", { exact: true }).first().waitFor();
+    assert.ok(await send.isDisabled());
+    for (const action of await page.locator("#compose button").all()) {
+      const bounds = await action.boundingBox();
+      assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width && bounds.height >= 44);
+    }
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  }
   await answer.fill("Подбор для десяти пользователей согласован.");
   await page.getByRole("button", { name: "Ответить и закрыть" }).click();
   await page.getByText("Открытых обращений пока нет.").waitFor();
