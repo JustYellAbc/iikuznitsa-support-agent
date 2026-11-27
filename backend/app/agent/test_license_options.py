@@ -1,8 +1,12 @@
+from types import SimpleNamespace
+
 import pytest
 
 from app.agent.license_options import (
     alternate_proposals,
     followup_capacities,
+    kind_before_name,
+    license_dialog_context,
     license_selection,
     quote_preview,
     resolve_options,
@@ -26,6 +30,28 @@ def test_unmentioned_product_or_capacity_cannot_be_substituted():
         license_selection("Northwind Pro", 15, turns)
     with pytest.raises(ValueError, match="Вместимость"):
         license_selection("Northwind Editor", 150, turns)
+
+
+def test_identifying_a_renewal_and_answering_its_seat_question_preserves_both_fields(index):  # noqa: F811
+    history = [
+        SimpleNamespace(role=role, text=body)
+        for role, body in [
+            ("client", "Давайте одну продлим"),
+            ("agent", "Какой артикул или название продлеваемой лицензии?"),
+            ("client", "MDaemon Messaging Server"),
+            ("agent", "На сколько пользователей нужна лицензия?"),
+        ]
+    ]
+    variants = [LicenseVariant(name="MDaemon Messaging Server", seats=20)]
+    turns = license_dialog_context(history, "на 20")
+    kind = kind_before_name(history, turns, variants)
+    assert kind == "Продление"
+    [hit] = resolve_options(index, variants, turns, prior_kind=kind)
+    assert "ещё действует или уже истекла" in hit.text
+    history[-1].text = "На сколько месяцев нужна лицензия?"
+    assert license_dialog_context(history, "на 20")[-1] == "на 20"
+    history[1].text = "Какой продукт теперь нужен?"
+    assert not kind_before_name(history, turns, variants)
 
 
 def test_quote_preview_uses_new_catalog_products_and_policy(index):  # noqa: F811

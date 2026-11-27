@@ -14,7 +14,13 @@ from urllib.parse import urlsplit
 from catalog import tools as t31
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.agent.catalog_selection import CANDIDATE_QUESTION, Selection, confirmed_candidate
+from app.agent.catalog_selection import (
+    CANDIDATE_QUESTION,
+    Selection,
+    confirmed_candidate,
+    renewal_review,
+    renewal_type_conflict,
+)
 from app.agent.handoff import (
     ASK_DETAIL,
     ASK_PRODUCT,
@@ -31,6 +37,8 @@ from app.agent.license_options import (
     SelectionInputError,
     alternate_proposals,
     followup_capacities,
+    kind_before_name,
+    license_dialog_context,
     quote_preview,
     resolve_options,
 )
@@ -224,7 +232,7 @@ class Evidence:
                 ref = f"r{len(self.rows) + 1}"
             if "body" in row:
                 row = {**row, "body": scrub_pii(row["body"])[:1800]}
-            complete_offer = tool == "get_offer" or detailed_search
+            complete_offer = tool in {"get_offer", "recalled_offers"} or detailed_search
             if ref not in self.detailed or complete_offer:
                 self.rows[ref] = row
             if complete_offer:
@@ -428,11 +436,17 @@ def checked_answer(answer, evidence, history, text, previous):
             for kind in item.get("licenseType") or []
         }
         scoped = Selection("")
-        for buyer_turn in discovery_context(history, text):
+        for buyer_turn in license_dialog_context(history, text):
             scoped = scoped.qualifiers(buyer_turn, followup=True)
         direct = re.search(r"(?<!\w)" + re.escape(row["offerId"]) + r"(?!\w)", text)
+        if scoped.kind == "Продление" and renewal_type_conflict(row["name"], row.get("licenseType")):
+            sources = [Source(url=row["source"], label=row["name"])]
+            return renewal_review(sources), "clarification", [], sources, None
         if not scoped.kind and not direct and {"Полная версия", "Продление"} <= other_kinds:
             return "Покупаете новую лицензию или продлеваете действующую?", "clarification", [], [], None
+        if scoped.kind and not direct and {"Полная версия", "Продление"} <= other_kinds:
+            if scoped.kind not in (row.get("licenseType") or []):
+                raise ValueError(f"Покупатель уже указал тип «{scoped.kind}». Выбери соответствующую карточку.")
     seats = conditions.seats or answer.required_seats
     for row in rows:
         if seats and row.get("seatLimit") and str(seats) not in row["seatLimit"]:
@@ -548,9 +562,12 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
     evidence = Evidence()
     searches = {}
     index = settings.catalog_index_path
+    # Include the exchange before a chain of follow-up questions, where the product was last shown.
+    discovery = discovery_context(history, text, max_turns=8)
+    window = max(8, 2 * len(discovery))
     context = [
         {"role": "user" if m.role == "client" else "assistant", "content": scrub_pii(m.text)[:600]}
-        for m in history[-8:]
+        for m in history[-window:]
         if m.role in {"client", "agent"}
     ]
     messages = [
@@ -626,13 +643,14 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         return data
 
     async def select_licenses(args):
-        buyer_turns = discovery_context(history, text)
+        buyer_turns = license_dialog_context(history, text)
+        prior_kind = kind_before_name(history, buyer_turns, args.variants)
         if previous and len(buyer_turns) == 1 and re.search(r"пересчит|тот же|этот же", text, re.I):
             prior = next((m.text for m in reversed(history) if m.role == "client"), None)
             if prior:
                 buyer_turns = [prior, text]
         start = time.monotonic()
-        hits = await asyncio.to_thread(resolve_options, index, args.variants, buyer_turns)
+        hits = await asyncio.to_thread(resolve_options, index, args.variants, buyer_turns, prior_kind=prior_kind)
         trace_args = {"variants": len(hits)}
         if len(hits) == 1 and hits[0].awaiting_fields:
             trace_args["pending_name"] = args.variants[0].name
@@ -740,6 +758,21 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
             )
         if ABOUT_ASSISTANT.fullmatch(" ".join(text.casefold().strip(" .!?").split())):
             return CAPABILITIES, "answer", [], [], None
+        if len(discovery) > 1 and not previous and kb_retry is None and index.is_file():
+            sources = next(
+                (m.sources for m in reversed(history[-2 * len(discovery) :]) if m.role == "agent" and m.sources), []
+            )
+            if sources:
+                recent = await read("recalled_offers", {}, t31.recalled_offers, index, sources)
+                if recent["results"]:
+                    messages[-1]["content"] += "\n" + serialize(
+                        {
+                            "previously_discussed_candidates": recent["results"],
+                            "usage": "Это карточки из предыдущего ответа. Если покупатель продолжает этот подбор, "
+                            "используй refs и актуальные условия. При смене товара начни новый подбор. "
+                            "Упоминание карточки не означает согласия на покупку.",
+                        }
+                    )
         turns = discovery_context(history, text)
         capacities = followup_capacities(text) if len(turns) > 1 and kb_retry is None else None
         if capacities is not None and history[-1].sources:

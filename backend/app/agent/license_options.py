@@ -4,6 +4,7 @@ import re
 import sqlite3
 
 from app.agent.catalog_selection import MDAEMON, SEATS, Selection, named_request, select
+from app.agent.handoff import discovery_context
 from app.agent.needs_catalog import money
 from app.agent.quote_calculation import Item, catalog_lines
 from app.core.errors import ApiError
@@ -52,6 +53,36 @@ class SelectionInputError(ValueError):
 
 def name_pattern(name):
     return re.compile(r"(?<!\w)" + re.escape(name) + r"(?!\w)", re.I)
+
+
+def license_dialog_context(history, text):
+    """Resolve a short numeric answer against the unit in the question that elicited it."""
+    turns = discovery_context(history, text)
+    exchanges = history[len(history) - 2 * (len(turns) - 1) :]
+    for i, question in enumerate(exchanges[1::2], 1):
+        count = re.fullmatch(r"(?:на\s+)?([1-9]\d{0,5})[.!]?", turns[i].strip(), re.I)
+        if count and re.search(r"(?:на\s+)?сколько\s+(?:пользовател|рабочих мест|мест\b)", question.text, re.I):
+            if question.text.count("?") == 1 and " или " not in question.text.casefold():
+                turns[i] = count[1] + " пользователей"
+    return turns
+
+
+def kind_before_name(history, turns, variants):
+    """Carry a buyer's operation into their answer to a request to identify that license."""
+    if len(variants) != 1:
+        return ""
+    label = name_pattern(variants[0].name)
+    exchanges = history[len(history) - 2 * (len(turns) - 1) :]
+    for i, agent in enumerate(exchanges[1::2], 1):
+        if not label.search(turns[i]):
+            continue
+        question = agent.text.casefold()
+        if "назван" in question or "артикул" in question:
+            kind = Selection("").qualifiers(turns[i - 1], followup=True).kind
+            if kind and Selection("").qualifiers(question, followup=True).kind == kind:
+                return kind
+        break
+    return ""
 
 
 def scoped_turns(name, variants, turns):
@@ -162,10 +193,12 @@ def license_selection(name, seats, turns):
     return selection
 
 
-def resolve_options(index, variants, turns):
+def resolve_options(index, variants, turns, *, prior_kind=""):
     selections = [
         license_selection(item.name, item.seats, scoped_turns(item.name, variants, turns)) for item in variants
     ]
+    if prior_kind and len(selections) == 1 and not selections[0].kind:
+        selections[0].kind = prior_kind
     if len({(s.name.casefold(), s.seats) for s in selections}) != len(selections):
         raise SelectionInputError(
             "duplicate",

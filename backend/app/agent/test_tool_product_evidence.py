@@ -133,6 +133,18 @@ def test_selected_offer_with_sparse_attributes_can_be_presented_for_purchase():
     assert not offers_operator(body)
 
 
+def test_conflicting_renewal_metadata_is_explained_instead_of_selecting_or_reasking():
+    row = offer("renew", "Northwind Studio, стандартное продление на год", licenseType=["Upg"])
+    history = [
+        SimpleNamespace(role="client", text="Давайте одну продлим"),
+        SimpleNamespace(role="agent", text="На сколько пользователей нужна лицензия?"),
+    ]
+    body, purpose, cards, sources, case = reply([row], history=history, text="на 1", field="summary")
+    assert "Тип лицензии" in body and row["name"] in body
+    assert purpose == "clarification" and offers_operator(body) and not cards and case is None
+    assert sources[0].url == row["source"]
+
+
 @pytest.mark.parametrize("family", ["Renga Professional", "Design Suite"])
 def test_single_unrated_offer_cannot_confirm_a_many_seat_purchase(family):
     row = offer("one", f"{family} для 1 рабочего места", seatLimit=None)

@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from difflib import get_close_matches
 from pathlib import Path
 
-from app.agent.handoff import AFFIRMATIVE, OFFER_HELP
+from app.agent.handoff import AFFIRMATIVE, OFFER_HELP, OPERATOR_QUESTION
 from app.contracts.schemas import ToolResult
 from app.contracts.t04 import HandoffReason, Product, Source
 from app.services.price_policy import OfferAssessment, assess, is_supported_currency, snapshot_from_row
@@ -99,7 +99,7 @@ class Selection:
             updated.months = 12
         if re.search(r"впервые|в первый раз|нов(?:ая|ую) (?:покупк|лицензи)|полная версия|перв(?:ая|ую) покупк", s):
             updated.kind = "Полная версия"
-        elif re.search(r"продл(?:ить|ить бы|ев|ен|ён|ять)|продле", s):
+        elif re.search(r"продл(?:ить|ев|ен|ён|ять)|(?<!не )\bпродл(?:им|ю|и|ите)\b|продле", s):
             updated.kind = "Продление"
         elif followup and re.fullmatch(r"(?:новая|новую|первичная|первый раз)[.! ]*", s):
             updated.kind = "Полная версия"
@@ -304,6 +304,18 @@ def offer_product(row) -> Product:
     return offer_assessment(row).to_product()
 
 
+def renewal_type_conflict(name, types):
+    return types and "Продление" not in types and re.search(r"\bпродление\b", name, re.I)
+
+
+def renewal_review(sources):
+    titles = "; ".join(f"«{s.label}»" for s in sources)
+    return (
+        f"Для продления нашёл {titles}. В названии указано продление, а в поле «Тип лицензии» — другой тип. "
+        "Нужно проверить, подойдёт ли этот вариант для вашей лицензии.\n\n" + OPERATOR_QUESTION
+    )
+
+
 def _followup_from_sku(selection: Selection, row: dict) -> Selection:
     """A direct article identifies both today's offer and the feed family for a later change of terms."""
     params = row["params"]
@@ -368,6 +380,14 @@ def select(index: Path, selection: Selection) -> Result:
             source = Source(url=source.url, label="В карточках указан тип покупателя: " + ", ".join(sorted(buyers)))
         rows = [r for r in rows if selection.buyer in r["params"].get(BUYER, [])]
     if selection.kind:
+        if selection.kind == "Продление" and not correction and selection.kind not in values(KIND):
+            conflicts = [
+                Source(url=r["source"], label=r["name"])
+                for r in rows
+                if renewal_type_conflict(r["name"], r["params"].get(KIND))
+            ][:2]
+            if conflicts:
+                return result(renewal_review(conflicts), sources=conflicts)
         rows = [r for r in rows if selection.kind in r["params"].get(KIND, [])]
     if selection.organization:
         rows = [r for r in rows if selection.organization in r["params"].get("Тип организации", [])]
