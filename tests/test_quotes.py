@@ -13,6 +13,58 @@ from tests.test_feed_refresh import BASE, LIMITS, write_feed
 COMPANY = {"company": "ООО «Проверка»", "inn": "7700000001", "kpp": "770001001"}
 
 
+def test_customer_requests_whole_quote_terms_and_manager_completes_pdf(api, tmp_path):
+    cid = setup_quote(api, tmp_path, ["t1", "t4"])
+    assert request(api, cid, [("t1", 1), ("t4", 2)]).status_code == 202
+    first = last_quote(api, cid)
+    path = f"/api/v1/conversations/{cid}/quotes/{first['quoteId']}/1/terms-review"
+    assert api.call("customer", "GET", path).json()["state"] == "available"
+    accepted = api.call("customer", "POST", path, key="send")
+    assert accepted.status_code == 202, accepted.text
+    assert api.call("customer", "POST", path, key="retry-with-new-key").json() == accepted.json()
+    assert api.call("customer", "GET", path).json()["state"] == "sent"
+    api.login()
+    cases = [e["data"]["handoff"] for e in api.events(cid) if e["data"]["type"] == "handoff"]
+    assert len(cases) == 1 and len(cases[0]["products"]) == 2
+    manager = f"/api/v1/manager/handoffs/{cases[0]['handoffId']}/terms-review"
+    assert api.call("customer", "GET", manager).status_code == 403
+    assert len(api.call("manager", "GET", manager).json()["lines"]) == 2
+    body = {
+        "revision": 1,
+        "payment": "Предоплата",
+        "delivery": "Электронная поставка",
+        "validUntil": (date.today() + timedelta(days=7)).isoformat(),
+        "lines": {sku: {"article": sku, "vatRate": "0"} for sku in ("t1", "t4")},
+    }
+    assert api.call("manager", "POST", manager, json={**body, "lines": {"t1": body["lines"]["t1"]}}).status_code == 422
+    assert api.call("customer", "POST", manager, json=body).status_code == 403
+    done = api.call("manager", "POST", manager, json=body, key="approve")
+    assert done.status_code == 202, done.text
+    assert api.call("manager", "POST", manager, json=body, key="approve").json() == done.json()
+    assert api.call("manager", "POST", manager, json=body).status_code == 409
+    ready = last_quote(api, cid)
+    assert ready["state"] == "ready" and ready["revision"] == 2 and ready["totalKopecks"] == 208000
+    assert command(api, cid, ready, "request_document", kind="quote_pdf").status_code == 202
+    document = api.events(cid)[-1]["data"]["document"]
+    assert api.call("customer", "GET", document["url"]).content.startswith(b"%PDF")
+
+
+def test_new_quote_revision_retires_the_old_terms_review(api, tmp_path):
+    cid = setup_quote(api, tmp_path, ["t1"])
+    assert request(api, cid, [("t1", 1)]).status_code == 202
+    old = last_quote(api, cid)
+    first = f"/api/v1/conversations/{cid}/quotes/{old['quoteId']}/1/terms-review"
+    assert api.call("customer", "POST", first).status_code == 202
+    assert request(api, cid, [("t1", 3)], revision=1).status_code == 202
+    assert api.call("customer", "GET", first).json()["state"] == "inactive"
+    assert api.call("customer", "POST", first).status_code == 409
+    changes = [e["data"]["handoff"] for e in api.events(cid) if e["data"]["type"] == "handoff"]
+    assert [c["status"] for c in changes] == ["open", "resolved"]
+    assert changes[0]["handoffId"] == changes[1]["handoffId"]
+    api.login()
+    assert api.call("manager", "GET", f"/api/v1/manager/handoffs/{changes[0]['handoffId']}/terms-review").json() is None
+
+
 def test_chat_builds_and_recalculates_single_sku(api, tmp_path):
     cid = setup_quote(api, tmp_path, ["t1"])
     for text, revision, packs in [
@@ -73,12 +125,12 @@ def last_quote(api, cid):
     return [e["data"]["quote"] for e in api.events(cid) if e["data"]["type"] == "quote"][-1]
 
 
-def command(api, cid, q, kind, **kwargs):
+def command(api, cid, q, action_type, **kwargs):
     return api.call(
         "customer",
         "POST",
         f"/api/v1/conversations/{cid}/actions",
-        json={"type": kind, "quoteId": q["quoteId"], "revision": q["revision"], **kwargs},
+        json={"type": action_type, "quoteId": q["quoteId"], "revision": q["revision"], **kwargs},
     )
 
 

@@ -4,7 +4,7 @@ const list = document.getElementById("quote-items");
 const status = document.getElementById("quote-status");
 let openingRevision = 0, retry = null, busy = false;
 let openForm, latestRevision = 0;
-let refreshNotes, refreshTimer;
+let refreshNotes, refreshTimer, showTermsReview;
 
 export function resetQuotes() {
   clearTimeout(refreshTimer);
@@ -41,6 +41,9 @@ export function quoteEvent(data, row) {
       if (Number(previous.dataset.revision) < revision) previous.disabled = true;
     }
     label = "Изменить КП";
+    if (data.quote.state === "needs_review" && data.quote.lines.every(line => line.unitPriceKopecks != null)) {
+      showTermsReview(row, data.quote);
+    }
   } else if (data.type === "handoff" && data.handoff.quoteLine && data.handoff.status === "open") {
     revision = data.handoff.quoteLine.revision;
     label = "Изменить количество в КП";
@@ -61,6 +64,37 @@ export function quoteEvent(data, row) {
 }
 
 export function setupQuotes(conversation, request, newKey) {
+  showTermsReview = async (row, quote) => {
+    const cid = conversation();
+    const path = "/api/v1/conversations/" + encodeURIComponent(cid) + "/quotes/" +
+      encodeURIComponent(quote.quoteId) + "/" + quote.revision + "/terms-review";
+    const action = document.createElement("button"), hint = document.createElement("small");
+    action.type = "button"; action.hidden = true; action.dataset.confirmQuote = quote.quoteId;
+    hint.setAttribute("role", "status"); row.append(action, hint);
+    const key = newKey();
+    async function load() {
+      try {
+        const result = await request(path);
+        if (conversation() !== cid || latestRevision !== quote.revision) return;
+        action.hidden = result.state !== "available";
+        action.textContent = "Отправить КП менеджеру на согласование";
+        hint.textContent = {sent:"КП отправлено менеджеру. Ответ придёт в этот чат.",
+          closed:"Менеджер ответил в этом чате."}[result.state] || "";
+        action.onclick = async () => {
+          action.disabled = true;
+          try {
+            await request(path, key);
+            action.hidden = true; hint.textContent = "КП отправлено менеджеру. Ответ придёт в этот чат.";
+          } catch (error) { hint.textContent = error.message; action.disabled = false; }
+        };
+      } catch (error) {
+        if (conversation() !== cid || latestRevision !== quote.revision) return;
+        hint.textContent = error.message; action.hidden = false;
+        action.textContent = "Проверить статус согласования"; action.onclick = load;
+      }
+    }
+    await load();
+  };
   refreshNotes = async () => {
     const cid = conversation();
     const pending = [...document.querySelectorAll("[data-note-for]")].filter(node => !node.childElementCount);

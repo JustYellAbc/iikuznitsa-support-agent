@@ -76,7 +76,7 @@ export function renderEvent({ data, at, actionId }, conversationId, submit, card
       break;
     case "quote":
       row.append(element("strong", "Расчёт · версия " + data.quote.revision),
-        element("p", data.quote.totalKopecks == null ? "Условия на согласовании" : "Итого " + money(data.quote.totalKopecks)));
+        element("p", data.quote.totalKopecks == null ? "Черновик КП: остались неподтверждённые условия" : "Итого " + money(data.quote.totalKopecks)));
       for (const line of data.quote.lines) {
         const price = line.unitPriceKopecks == null ? "Цена на согласовании" : priceLabel(line.name) + ": " + money(line.unitPriceKopecks);
         row.append(element("p", line.name + " · " + price + " · Количество: " + line.packages));

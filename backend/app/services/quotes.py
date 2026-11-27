@@ -210,6 +210,17 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None, select
         (cid, q.quoteId, q.revision, snapshot.model_dump_json(), action_id, doc_id, blob),
     )
     data = []
+    previous_reviews = await conn.execute_fetchall(
+        "SELECT h.id FROM quote_terms_reviews r JOIN handoffs h ON h.id=r.handoff_id "
+        "WHERE r.quote_id=? AND r.revision<? AND h.status='open'",
+        (q.quoteId, q.revision),
+    )
+    for review in previous_reviews:
+        if resolved and review["id"] == resolved.handoffId:
+            continue
+        old_case = (await repo.get_handoff(review["id"])).handoff
+        await repo.resolve_handoff(old_case.handoffId, conn=conn)
+        data.append(HandoffData(handoff=old_case.model_copy(update={"status": "resolved"})))
     old = await get_db().fetchall(
         "SELECT h.id FROM handoffs h JOIN quote_handoffs l ON h.id=l.handoff_id WHERE h.status='open' AND l.quote_id=?",
         (q.quoteId,),

@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS quote_handoffs (
     quote_id TEXT NOT NULL, revision INTEGER NOT NULL, offer_id TEXT NOT NULL,
     FOREIGN KEY (quote_id, revision) REFERENCES quote_revisions(quote_id, revision)
 );
+CREATE TABLE IF NOT EXISTS quote_terms_reviews (
+    handoff_id TEXT PRIMARY KEY REFERENCES handoffs(id),
+    quote_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    UNIQUE (quote_id, revision),
+    FOREIGN KEY (quote_id, revision) REFERENCES quote_revisions(quote_id, revision)
+);
 
 -- Idempotency-Key: результат принятой команды в области пользователя, метода и пути
 CREATE TABLE IF NOT EXISTS idempotency (
