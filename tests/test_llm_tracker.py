@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -148,6 +150,57 @@ async def test_client_error_is_not_logged(db):
     with pytest.raises(LLMError):
         await llm_call([{"role": "user", "content": "x"}], step="agent_loop")
     assert await repository.recent_llm_calls() == []
+
+
+async def test_cancelled_provider_wait_reports_phase_without_replaying_or_logging_content(db, caplog):
+    waiting = asyncio.Event()
+
+    async def hang(request):
+        trace = request.extensions["trace"]
+        await trace("http11.send_request_body.complete", {"body": "private-prompt"})
+        await trace("http11.receive_response_headers.started", {"headers": "private-headers"})
+        waiting.set()
+        await asyncio.Future()
+
+    provider(hang)
+    caplog.set_level(logging.INFO, logger=llm.__name__)
+    task = asyncio.create_task(
+        llm_call([{"role": "user", "content": "private-prompt"}], step="support_tools", session_id="c_test")
+    )
+    await asyncio.wait_for(waiting.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    logs = [record.getMessage() for record in caplog.records if record.name == llm.__name__]
+    assert len(logs) == 1
+    assert all(
+        token in logs[0]
+        for token in (
+            "session=c_test",
+            "step=support_tools",
+            "attempt=1",
+            "outcome=cancelled",
+            "phase=receive_response_headers",
+            "send_request_body.complete",
+        )
+    )
+    assert not any(token in logs[0] for token in ("private-prompt", "private-headers", "sk-test"))
+    assert await repository.recent_llm_calls() == []
+
+
+async def test_no_second_inference_after_read_timeout(db, caplog):
+    calls = []
+
+    def fail(request):
+        calls.append(request)
+        raise httpx.ReadTimeout("read timed out")
+
+    provider(fail)
+    caplog.set_level(logging.INFO, logger=llm.__name__)
+    with pytest.raises(LLMError):
+        await llm_call([], step="support_tools")
+    assert len(calls) == 1
+    assert "outcome=ReadTimeout" in caplog.text
 
 
 async def test_mock_mode_logs_without_network(db):
