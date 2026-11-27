@@ -32,6 +32,7 @@ from app.agent.handoff import (
     CONFIRMED,
     HUMAN_REQUEST,
     OFFER_HELP,
+    OPERATOR_QUESTION,
     ActionType,
     SearchFinding,
     bare_request,
@@ -224,7 +225,7 @@ async def run_turn(
             reply_text = route.clarification or CONFIRMED
             if escalate and hit and topics:
                 if route.reason == "availability":
-                    detail = hit.sources[0].label if hit.text == OFFER_HELP and hit.sources else hit.text
+                    detail = hit.text.removesuffix("\n\n" + OPERATOR_QUESTION)
                     reply_text = f"{detail} {CONFIRMED}"
                 elif route.reason == "price_request":
                     reply_text = f"Цена по запросу. {CONFIRMED}"

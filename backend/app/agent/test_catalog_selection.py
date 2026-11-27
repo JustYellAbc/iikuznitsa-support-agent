@@ -10,7 +10,7 @@ from tests.conftest import client as client
 from tests.conftest import env as env
 
 from app.agent.catalog_selection import Selection, select, selection_for
-from app.agent.handoff import OFFER_HELP
+from app.agent.handoff import OFFER_HELP, offers_operator
 from app.config import get_settings
 
 
@@ -74,9 +74,9 @@ def test_selection_survives_multiple_turns_and_reaches_manager(stand_api, index)
     _, cards, answer = say(api, cid, "Покупаем впервые")
     [p] = cards["products"]
     assert (p["offerId"], p["unitPriceKopecks"], p["licenseTerm"]) == ("new20", 123456, "12 мес.")
-    assert answer["text"] == OFFER_HELP
+    assert offers_operator(answer["text"])
     [ref] = answer["sources"]
-    assert ref["url"] == p["source"]["url"] and "12 мес" in ref["label"] and "право использования" in ref["label"]
+    assert ref["url"] == p["source"]["url"] and "12 мес" in answer["text"] and "право использования" in answer["text"]
     say(api, cid, "Закупка тендерная, нужны документы")
     api.login()
     [handoff] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
@@ -170,6 +170,20 @@ def test_standard_and_unsupported_constraints(index):
         answer = select(index, first.qualifiers(text, followup=True))
         assert answer.text == OFFER_HELP and not answer.products
     assert select(Path(index).with_suffix(".missing"), first).text == OFFER_HELP
+
+
+@pytest.mark.parametrize(
+    "text,months,expired",
+    [
+        ("Сколько стоит лицензия на год?", 12, None),
+        ("Покупаем на 24 месяца. На какой срок она действует?", 24, None),
+        ("На какой срок лицензия действует — на 12 месяцев или бессрочно?", None, None),
+        ("Подписка действует. Для продления варианты на год или бессрочно?", None, False),
+    ],
+)
+def test_stated_conditions_survive_questions_about_alternatives(text, months, expired):
+    selection = Selection("example").qualifiers(text, followup=True)
+    assert (selection.months, selection.expired) == (months, expired)
 
 
 def test_need_and_named_request_stay_distinct():

@@ -12,7 +12,8 @@ function save() { sessionStorage.setItem(storageKey, JSON.stringify(state)); }
 const openHandoffs = new Map();
 const completedActions = new Set();
 // T12's OFFER_HELP is delivered as a clarification in the current T04 wire format.
-const operatorOffer = "В источнике нет подтверждённых сведений. Подключить оператора, чтобы он уточнил ваш вопрос?";
+const operatorQuestion = "Подключить оператора, чтобы он уточнил ваш вопрос?";
+const operatorOffer = "В источнике нет подтверждённых сведений. " + operatorQuestion;
 let operatorOffered = false;
 let cursor = 0, posting = false, polling = false, denied = false, waitUntil = 0;
 let timer, wake, actionError = "", historyError = "";
@@ -95,7 +96,8 @@ function display(event) {
   if (event.data.type === "handoff") updateHandoffs(event.data.handoff);
   const { type, author, purpose, handoffId } = event.data;
   if (type === "message") {
-    operatorOffered = author === "agent" && purpose === "clarification" && event.data.text === operatorOffer;
+    operatorOffered = author === "agent" && purpose === "clarification" &&
+      (event.data.text === operatorOffer || event.data.text.endsWith("\n\n" + operatorQuestion));
   } else if (type === "handoff" || type === "products") {
     operatorOffered = false;
   }

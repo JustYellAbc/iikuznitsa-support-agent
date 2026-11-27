@@ -9,7 +9,8 @@ from app.contracts.t04 import HandoffReason, Product
 
 ActionType = Literal["message", "request_operator"]
 SearchFinding = Literal["partner_required", "insufficient_evidence"]
-OFFER_HELP = "В источнике нет подтверждённых сведений. Подключить оператора, чтобы он уточнил ваш вопрос?"
+OPERATOR_QUESTION = "Подключить оператора, чтобы он уточнил ваш вопрос?"
+OFFER_HELP = f"В источнике нет подтверждённых сведений. {OPERATOR_QUESTION}"
 ASK_TOPIC = "Подскажите, с каким вопросом нужна помощь?"
 CONFIRMED = "Передал вопрос оператору. Он увидит переписку и ответит в этом чате."
 
@@ -54,6 +55,10 @@ PARTNER = re.compile(
 SPECIAL = re.compile(
     r"(?:нуж\w*|просим|хотим|предостав\w*|оформ\w*|можно|по)\s+(?:(?:нам|ли|согласовать)\s+){0,2}(?:отсрочк\w*|постоплат\w*|индивидуальн\w*\s+скидк\w*)"
 )
+
+
+def offers_operator(text: str) -> bool:
+    return text == OFFER_HELP or text.endswith("\n\n" + OPERATOR_QUESTION)
 
 
 def asks_for_operator(text: str) -> bool:
@@ -132,7 +137,7 @@ def route_action(
         return Routing(reason, open_question(history, text, True))
     if reason:
         return Routing(reason, text)
-    if history and history[-1].role == "agent" and history[-1].text == OFFER_HELP and AFFIRMATIVE.fullmatch(body):
+    if history and history[-1].role == "agent" and offers_operator(history[-1].text) and AFFIRMATIVE.fullmatch(body):
         return Routing("insufficient_evidence", open_question(history, text, True))
     if finding == "partner_required":
         return Routing("outside_catalog", text)
