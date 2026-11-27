@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from app.agent.quote_intent import offers_quote
 from app.contracts.schemas import Message
 from app.contracts.t04 import HandoffReason, Product
 
@@ -121,9 +122,27 @@ def handoff_reason(text: str) -> HandoffReason | None:
     return None
 
 
+def discovery_context(history, text):
+    """Keep the buyer's consecutive answers to discovery questions together."""
+    turns = [text]
+    end = len(history)
+    while end >= 2 and len(turns) < 4:
+        buyer, agent = history[end - 2 : end]
+        if buyer.role != "client" or agent.role != "agent" or not agent.text.rstrip().endswith("?"):
+            break
+        if re.search(r"\b(?:другой вопрос|новая тема|другая тема|вместо этого)\b", turns[0], re.I):
+            break
+        if agent.text in {ASK_PRODUCT, OFFER_HELP} or offers_quote(agent.text) or offers_operator(agent.text):
+            break
+        turns.insert(0, buyer.text)
+        end -= 2
+    return turns
+
+
 def open_question(history: list[Message], text: str, generic: bool) -> str:
     if generic:
-        for m in reversed(history):
+        for i in reversed(range(len(history))):
+            m = history[i]
             if m.role == "operator":
                 break
             if (
@@ -131,6 +150,9 @@ def open_question(history: list[Message], text: str, generic: bool) -> str:
                 and not bare_request(m.text.casefold())
                 and not opening_chatter(m.text.strip().casefold())
             ):
+                turns = discovery_context(history[:i], m.text)
+                if len(turns) > 1 and re.search(r"\d+\s*(?:человек|сотрудник|мест|пользовател)", turns[0], re.I):
+                    return " → ".join(turns)
                 return m.text
     return text
 

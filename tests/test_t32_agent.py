@@ -11,6 +11,7 @@ from app.agent.test_catalog_selection import say
 from app.agent.test_knowledge import ANSWER, PATCHES, QUESTION, propose, source_case
 from app.config import get_settings
 from app.core import llm
+from app.db.repository import list_turns
 
 
 def tool(name, **arguments):
@@ -23,6 +24,30 @@ def tool(name, **arguments):
             }
         ]
     }
+
+
+@pytest.mark.usefixtures("index")
+def test_compare_reads_named_alternatives_and_leaves_purchase_selection_empty(api, provider):
+    answers, requests = provider
+    answers.append(tool("compare_catalog", first="PaperDesk Pro", second="PaperDesk Extra"))
+    cid = api.new_conversation()
+    events = say(api, cid, "Сравните PaperDesk Pro и PaperDesk Extra")
+    reply = events[-1]
+    assert len(requests) == 1 and reply["purpose"] == "clarification"
+    assert "790 ₽" in reply["text"] and "PaperDesk Extra — точного совпадения" in reply["text"]
+    assert len(reply["sources"]) == 1 and all(e["type"] not in {"products", "handoff"} for e in events)
+
+
+@pytest.mark.usefixtures("index")
+def test_repeated_search_without_new_offers_stops_and_clarifies(api, provider):
+    answers, requests = provider
+    answers.extend(tool("search_catalog", query="PaperDesk Pro") for _ in range(3))
+    cid = api.new_conversation()
+    events = say(api, cid, "Подберите PaperDesk Pro для покупки")
+    assert len(requests) == 3 and "те же позиции" in events[-1]["text"]
+    trace = api.client.portal.call(list_turns, cid)[-1].steps
+    assert sum(step.tool == "search_catalog" for step in trace) == 1
+    assert any(step.tool == "catalog_repeated_results" for step in trace)
 
 
 @pytest.fixture
