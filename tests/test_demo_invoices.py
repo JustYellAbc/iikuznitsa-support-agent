@@ -1,4 +1,7 @@
 import asyncio
+import shutil
+import sqlite3
+import subprocess
 from threading import Event
 
 import pytest
@@ -65,6 +68,12 @@ def test_invoice_requires_accepted_current_terms_and_preserves_prior_download(ap
     assert (repeat.status_code, repeat.json()) == (200, doc)
     pdf = api.call("customer", "GET", doc["url"])
     assert pdf.content.startswith(b"%PDF") and "demo-invoice" in pdf.headers["Content-Disposition"]
+    if extractor := shutil.which("pdftotext"):
+        content = subprocess.run(
+            [extractor, "-layout", "-enc", "UTF-8", "-", "-"], input=pdf.content, capture_output=True, check=True
+        ).stdout.decode("utf-8")
+        for expected in ("Демо-счёт", "версия 2", "ID t1", "ID x", "100,00", "200,00", "120,15", "320,15"):
+            assert expected in content
     assert api.call("manager", "GET", doc["url"]).content == pdf.content
     api.new_conversation("other")
     assert api.call("other", "GET", doc["url"]).status_code == 404
@@ -133,7 +142,13 @@ def test_reserved_invoice_resumes_after_restart(api, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "wording,changes_all", [("Теперь 3 упаковки", False), ("Теперь 3 упаковки для каждой позиции", True)]
+    "wording,changes_all",
+    [
+        ("Теперь 3 упаковки", False),
+        ("Поменяем количество: по три упаковки.", False),
+        ("Теперь 3 упаковки для каждой позиции", True),
+        ("Теперь по 3 упаковки каждой позиции", True),
+    ],
 )
 def test_pack_change_on_multiple_lines_requires_new_consent(api, tmp_path, wording, changes_all):
     cid = setup_quote(api, tmp_path, ["t1", "x"], rules=True)
@@ -176,6 +191,25 @@ def test_returning_to_previous_sku_requires_fresh_consent(api, tmp_path, monkeyp
     fresh = last_quote(api, cid)
     assert fresh["revision"] == q["revision"] + 1
     assert bill(api, cid, fresh).json()["code"] == "confirmation_required"
+
+
+def test_rejected_pack_tier_retires_accepted_revision(api, tmp_path):
+    cid = setup_quote(api, tmp_path, ["t1"], rules=True)
+    with sqlite3.connect(get_settings().catalog_index_path) as db:
+        db.execute(
+            "UPDATE offers SET details=json_set(details,'$.sales_notes',?) WHERE id='t1'", ("Кол-во от 1 до 9 шт.",)
+        )
+    assert request(api, cid, [("t1", 1)]).status_code == 202
+    quote = last_quote(api, cid)
+    assert command(api, cid, quote, "confirm_quote").status_code == 202
+    assert api.say(cid, "Теперь 10 упаковок для каждой позиции").status_code == 202
+    assert "от 1 до 9" in api.events(cid)[-1]["data"]["text"]
+    assert bill(api, cid, quote).json()["code"] == "stale_revision"
+    assert not issued(api, cid)
+    assert request(api, cid, [("t1", 8)], quote["revision"]).status_code == 202
+    next_quote = last_quote(api, cid)
+    assert next_quote["revision"] == quote["revision"] + 1 and next_quote["lines"][0]["packages"] == 8
+    assert bill(api, cid, next_quote).json()["code"] == "confirmation_required"
 
 
 def test_rolled_back_invoice_is_never_visible_to_polling(api, tmp_path, monkeypatch):

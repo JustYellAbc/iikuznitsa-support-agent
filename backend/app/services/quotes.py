@@ -41,6 +41,11 @@ BUYER_FIELDS = (
     r"\s*[,;]\s*ИНН\s*[: ]\s*([0-9]{10})\s*[,; ]+\s*КПП\s*[: ]\s*([0-9]{4}[0-9A-Z]{2}[0-9]{3})"
 )
 CHANGE_QUOTE = r"(?:измените|поменяйте|пересчитайте|обновите|переделайте)\s+(?:наше\s+)?(?:кп|коммерческое предложение)"
+QUANTITY_EDIT = re.compile(
+    r"\b(?:вместо|изменим|поменяем|замените|пересчитайте|измените|поменяйте|бер[её]м|возьм[её]м)\b"
+    r"|\b(?:теперь|нужно|надо)\s+(?:по\s+|нуж\w*\s+|\d|одн|дв[аеу]|тр[иеё]|четыр|пят|шес|сем|вос|дев|десят)",
+    re.I,
+)
 
 
 async def latest(cid):
@@ -252,21 +257,27 @@ async def invalidate_changed_selection(conn, cid):
             await invalidate_revision(conn, cid, row["revision"])
 
 
-async def clarify_packages(cid, revision, text):
+async def clarification(conn, cid, text, reply):
+    action_id = repo.new_id("a")
+    messages = [
+        MessageData(author="customer", purpose="input", text=text, sources=[]),
+        MessageData(author="agent", purpose="clarification", text=reply, sources=[]),
+    ]
+    written = await repo.append_events(cid, action_id, [m.model_dump(mode="json") for m in messages], conn=conn)
+    result = await repo.record_quote_response(conn, 202, {"conversationId": cid, "actionId": action_id})
+    return result, written
+
+
+async def clarify_quantity(cid, current, text):
     async with get_db().tx() as conn:
-        await invalidate_revision(conn, cid, revision)
-        action_id = repo.new_id("a")
-        messages = [
-            MessageData(author="customer", purpose="input", text=text, sources=[]),
-            MessageData(
-                author="agent",
-                purpose="clarification",
-                text="В КП несколько позиций. Откройте «Изменить КП» и укажите число упаковок для нужных строк.",
-                sources=[],
-            ),
-        ]
-        written = await repo.append_events(cid, action_id, [m.model_dump(mode="json") for m in messages], conn=conn)
-        result = await repo.record_quote_response(conn, 202, {"conversationId": cid, "actionId": action_id})
+        await require_published(current)
+        await invalidate_revision(conn, cid, current["revision"])
+        result, written = await clarification(
+            conn,
+            cid,
+            text,
+            "Уточните новые позиции и количество. Откройте «Изменить КП», выберите строки и укажите число упаковок.",
+        )
     events.publish(cid, written)
     return result
 
@@ -290,7 +301,7 @@ async def from_message(cid: str, text: str):
         return await prepare(cid, req, customer_message=text, seats=int(seats[1]))
     quantity = re.fullmatch(
         r"(?:теперь\s+|(?:измените|поменяйте)\s+(?:количество\s+)?на\s+)?"
-        r"([1-9]\d{0,4})\s+упаков(?:ка|ки|ок|ку)"
+        r"(?:по\s+)?([1-9]\d{0,5})\s+упаков(?:ка|ки|ок|ку)"
         r"(?:\s+(?:для\s+)?(кажд(?:ой|ого)|обеих|обоих|всех)"
         r"(?:\s+(?:позиций|позиции|товаров|товара|строк|строки))?)?[.! ]*",
         text.strip(),
@@ -309,6 +320,12 @@ async def from_message(cid: str, text: str):
             async with get_db().tx() as conn:
                 if current := await latest(cid):
                     await reset_selection(conn, cid, current["revision"])
+        elif (
+            QUANTITY_EDIT.search(text)
+            and re.search(r"\b(?:упаков\w*|пач\w*|количеств\w*|мест[ао]?|пользовател\w*|штук\w*|шт)\b", text, re.I)
+            and (current := await latest(cid))
+        ):
+            return await clarify_quantity(cid, current, text)
         return None
     products = await repo.last_products(cid)
     current = await latest(cid)
@@ -322,11 +339,14 @@ async def from_message(cid: str, text: str):
         if not current:
             return None
         old = read(current)
-        if current["reselect"] or {d.product.offerId for d in old.details} != {p["offerId"] for p in products}:
-            return None
-        if len(old.details) > 1 and not quantity[2]:
-            await require_published(current)
-            return await clarify_packages(cid, old.quote.revision, text)
+        if (
+            current["reselect"]
+            or {d.product.offerId for d in old.details} != {p["offerId"] for p in products}
+            or len(old.details) > 1
+            and not quantity[2]
+            or int(quantity[1]) > 100000
+        ):
+            return await clarify_quantity(cid, current, text)
         return await prepare(
             cid,
             ProposalRequest(
@@ -376,26 +396,20 @@ async def prepare_revision(conn, cid, request, customer_message, seats):
         )
     except NoSeatVariant:
         await reset_selection(conn, cid, revision)
-        action_id = repo.new_id("a")
-        written = await repo.append_events(
+        return await clarification(
+            conn,
             cid,
-            action_id,
-            [
-                MessageData(author="customer", purpose="input", text=customer_message, sources=[]).model_dump(
-                    mode="json"
-                ),
-                MessageData(
-                    author="agent",
-                    purpose="clarification",
-                    text=f"На {seats} мест нужно заново подобрать варианты. "
-                    "Уточните товар, затем подтвердите новые позиции в форме КП.",
-                    sources=[],
-                ).model_dump(mode="json"),
-            ],
-            conn=conn,
+            customer_message,
+            f"На {seats} мест нужно заново подобрать варианты. "
+            "Уточните товар, затем подтвердите новые позиции в форме КП.",
         )
-        result = await repo.record_quote_response(conn, 202, {"conversationId": cid, "actionId": action_id})
-        return result, written
+    except ApiError as exc:
+        if not customer_message or not current or exc.code != "invalid_input":
+            raise
+        await invalidate_revision(conn, cid, revision)
+        return await clarification(
+            conn, cid, customer_message, f"{exc.message} Пересмотрите позиции в форме «Изменить КП»."
+        )
     await apply_deal_conditions(cid, request.customer, details)
     old = read(current) if current else None
     if old:
