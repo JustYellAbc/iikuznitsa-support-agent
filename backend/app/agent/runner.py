@@ -70,8 +70,34 @@ async def run_turn(
     products: list[Product] | None = None,
     finding: SearchFinding | None = None,
 ) -> AgentReply:
+    intake_started = time.perf_counter()
     if products is None:
         products = [Product.model_validate(p) for p in await last_products(session.id)]
+    if action_type == "message" and re.fullmatch(
+        r"(?:да[, ]+)?(?:бер[её]м|подходит|(?:пришлите|сформируйте|оформите|подготовьте|можно|нужно|хочу)?\s*"
+        r"(?:кп|коммерческое предложение))(?:[, ]+(?:пришлите |оформите )?кп)?[.!? ]*",
+        user_text.strip(),
+        re.I,
+    ):
+        text = (
+            "Выберите позиции и количество упаковок в форме «Подготовить КП», затем укажите организацию, ИНН и КПП."
+            if products
+            else "Для какого товара подготовить КП? Напишите его название или артикул."
+        )
+        step = StepTrace(tool="quote_intake", args={}, result_summary=text)
+        await emit_step(step)
+        return AgentReply(
+            turn=AgentTurn(
+                turn_id=new_id("turn"),
+                session_id=session.id,
+                steps=[step],
+                decision="answer",
+                total_cost_rub=0,
+                total_latency_ms=int((time.perf_counter() - intake_started) * 1000),
+            ),
+            text=text,
+            purpose="clarification",
+        )
     # Approved procedures can interrupt an active selection. Commercial facts and
     # mandatory handoffs always keep their own source, regardless of punctuation.
     if (

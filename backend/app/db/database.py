@@ -55,6 +55,19 @@ CREATE TABLE IF NOT EXISTS handoffs (
 CREATE INDEX IF NOT EXISTS ix_handoffs_status ON handoffs(status, created_at);
 CREATE INDEX IF NOT EXISTS ix_handoffs_conversation ON handoffs(conversation_id);
 
+CREATE TABLE IF NOT EXISTS quote_revisions (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    quote_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    snapshot TEXT NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0,
+    action_id TEXT NOT NULL, document_id TEXT NOT NULL UNIQUE, pdf BLOB NOT NULL,
+    PRIMARY KEY (conversation_id, revision), UNIQUE (quote_id, revision)
+);
+CREATE TABLE IF NOT EXISTS quote_handoffs (
+    handoff_id TEXT PRIMARY KEY REFERENCES handoffs(id),
+    quote_id TEXT NOT NULL, revision INTEGER NOT NULL, offer_id TEXT NOT NULL,
+    FOREIGN KEY (quote_id, revision) REFERENCES quote_revisions(quote_id, revision)
+);
+
 -- Idempotency-Key: результат принятой команды в области пользователя, метода и пути
 CREATE TABLE IF NOT EXISTS idempotency (
     principal TEXT NOT NULL,

@@ -34,6 +34,12 @@
           <div id="products"></div>
           <h3>История диалога</h3>
           <ol id="history" tabindex="0" aria-label="История диалога"></ol>
+          <form id="approve-price" hidden>
+            <label>Согласованная цена за упаковку, ₽ <input id="line-price" type="text" inputmode="decimal"
+              required pattern="[0-9]{1,12}([.,][0-9]{1,2})?"></label>
+            <button class="primary">Подтвердить цену строки</button>
+            <p id="price-status" role="status"></p>
+          </form>
           <form id="compose">
             <label for="reply">Ответ клиенту</label>
             <textarea id="reply" required maxlength="8000" rows="3" placeholder="Напишите сообщение…"></textarea>

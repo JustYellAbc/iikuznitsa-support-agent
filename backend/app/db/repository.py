@@ -25,7 +25,7 @@ from app.contracts.schemas import (
     Session,
     StepStats,
 )
-from app.contracts.t04 import Handoff, HandoffReason
+from app.contracts.t04 import Handoff, HandoffReason, QuoteLineRef
 from app.core.errors import ApiError, invalid_input, not_found
 from app.db.database import get_db
 
@@ -253,6 +253,11 @@ class HandoffRow:
     action_id: str
 
 
+HANDOFF_SELECT = (
+    "SELECT h.*, l.quote_id, l.revision, l.offer_id FROM handoffs h LEFT JOIN quote_handoffs l ON h.id=l.handoff_id "
+)
+
+
 def _handoff(row: aiosqlite.Row) -> HandoffRow:
     return HandoffRow(
         Handoff(
@@ -262,6 +267,9 @@ def _handoff(row: aiosqlite.Row) -> HandoffRow:
             question=row["question"],
             products=json.loads(row["products"]),
             status=row["status"],
+            quoteLine=QuoteLineRef(quoteId=row["quote_id"], revision=row["revision"], offerId=row["offer_id"])
+            if row["quote_id"]
+            else None,
         ),
         row["action_id"],
     )
@@ -303,13 +311,13 @@ async def create_handoff(
 
 
 async def get_handoff(handoff_id: str) -> HandoffRow | None:
-    row = await get_db().fetchone("SELECT * FROM handoffs WHERE id = ?", (handoff_id,))
+    row = await get_db().fetchone(HANDOFF_SELECT + "WHERE h.id = ?", (handoff_id,))
     return _handoff(row) if row else None
 
 
 async def find_open_handoff(conversation_id: str, reason: HandoffReason) -> HandoffRow | None:
     row = await get_db().fetchone(
-        "SELECT * FROM handoffs WHERE conversation_id = ? AND reason = ? AND status = 'open' "
+        HANDOFF_SELECT + "WHERE conversation_id = ? AND reason = ? AND status = 'open' AND l.handoff_id IS NULL "
         "ORDER BY created_at DESC LIMIT 1",
         (conversation_id, reason),
     )
@@ -317,12 +325,12 @@ async def find_open_handoff(conversation_id: str, reason: HandoffReason) -> Hand
 
 
 async def list_open_handoffs() -> list[Handoff]:
-    rows = await get_db().fetchall("SELECT * FROM handoffs WHERE status = 'open' ORDER BY created_at DESC LIMIT 200")
+    rows = await get_db().fetchall(HANDOFF_SELECT + "WHERE status = 'open' ORDER BY created_at DESC LIMIT 200")
     return [_handoff(r).handoff for r in rows]
 
 
 async def list_resolved_handoffs() -> list[Handoff]:
-    rows = await get_db().fetchall("SELECT * FROM handoffs WHERE status='resolved' ORDER BY updated_at DESC")
+    rows = await get_db().fetchall(HANDOFF_SELECT + "WHERE status='resolved' ORDER BY updated_at DESC")
     return [_handoff(r).handoff for r in rows]
 
 

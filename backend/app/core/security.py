@@ -14,7 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import get_settings
 
-_ACTIONS_RE = re.compile(r"^/api/v1/conversations/([^/]+)/actions/?$")
+_ACTIONS_RE = re.compile(r"^/api/v1/conversations/([^/]+)/(?:actions|quotes)/?$")
 _LIMITED_PREFIXES = ("/api/v1/conversations", "/api/v1/documents", "/api/v1/auth")
 _WINDOW_S = 60.0
 RATE_LIMITED_MESSAGE = "Слишком много запросов. Попробуйте чуть позже."

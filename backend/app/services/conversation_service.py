@@ -32,7 +32,7 @@ from app.core.auth import Principal
 from app.core.errors import ApiError, invalid_input, not_found
 from app.db import repository
 from app.db.database import get_db
-from app.services import turn_service
+from app.services import quotes, turn_service
 
 OPERATOR_QUESTION = "Покупатель попросил подключить оператора."
 CONVERSATION_NOT_FOUND = "Диалог не найден."
@@ -123,7 +123,7 @@ async def submit_action(principal: Principal, conversation_id: str, action: Cust
     if isinstance(action, RequestOperatorAction):
         return await _request_operator(conv)
     if isinstance(action, ConfirmQuoteAction | RequestDocumentAction):
-        raise not_found("Расчёт не найден.")
+        return await quotes.quote_action(conversation_id, action)
     raise invalid_input("Неизвестная команда.")
 
 
@@ -155,6 +155,9 @@ async def _customer_message(conv: repository.Conversation, action: MessageAction
             "rate_limited",
             "Достигнут лимит сообщений в диалоге. Дождитесь ответа оператора или начните новый диалог.",
         )
+    result = await quotes.from_message(cid, text)
+    if result:
+        return result
     history = await repository.history_messages(cid)
     data = MessageData(author="customer", purpose="input", text=text, sources=[])
     await append(cid, action_id, [data.model_dump(mode="json")])
@@ -219,7 +222,7 @@ async def resolve_handoff(handoff_id: str, decision: ManagerDecision) -> Result:
     if handoff.status != "open":
         raise ApiError(409, "already_resolved", "Обращение уже закрыто.")
     if not isinstance(decision, ReplyDecision):
-        raise not_found("Строка расчёта не найдена.")
+        return await quotes.approve_price(handoff, decision)
 
     text = decision.reply.strip()
     if not text:

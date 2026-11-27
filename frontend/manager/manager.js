@@ -122,6 +122,9 @@ function openCard(item) {
   $("card").hidden = !item;
   $("no-selection").hidden = Boolean(item);
   const resolved = item?.status === "resolved";
+  $("approve-price").hidden = !(item?.quoteLine && !resolved && item.reason === "price_request");
+  $("approve-price").reset();
+  $("price-status").textContent = "";
   $("compose").hidden = Boolean(resolved);
   $("knowledge").hidden = !resolved;
   $("article-form").reset();
@@ -260,3 +263,21 @@ $("compose").onsubmit = async e => {
 };
 
 window.addEventListener("DOMContentLoaded", refresh);
+
+$("approve-price").onsubmit = async e => {
+  e.preventDefault();
+  const item = selected, button = e.currentTarget.querySelector("button");
+  if (!item?.quoteLine || button.disabled) return;
+  const [rub, cents = ""] = $("line-price").value.trim().split(/[.,]/);
+  const unitPriceKopecks = Number(rub + cents.padEnd(2, "0"));
+  if (!Number.isSafeInteger(unitPriceKopecks) || unitPriceKopecks < 1) {
+    $("price-status").textContent = "Укажите положительную цену в рублях."; return;
+  }
+  button.disabled = true;
+  try {
+    await request("/manager/handoffs/" + encodeURIComponent(item.handoffId) + "/resolution",
+      {type:"approve_line_price", ...item.quoteLine, unitPriceKopecks}, newKey());
+    await refresh();
+  } catch (error) { if (selected?.handoffId === item.handoffId) $("price-status").textContent = error.message; }
+  finally { button.disabled = false; }
+};

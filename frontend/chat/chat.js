@@ -1,4 +1,5 @@
 import { renderEvent } from "./render.js";
+import { quoteEvent, resetQuotes, setupQuotes } from "./quote.js";
 
 const byId = id => document.getElementById(id);
 const panel = byId("chat"), launch = byId("launch"), message = byId("message");
@@ -71,7 +72,7 @@ function showError(error, isAction) {
     closeStream();
     text = error.status === 401 ? "Войдите на стенд и обновите страницу." : "Диалог недоступен. Обновите страницу, чтобы начать заново.";
     state = {}; save();
-    log.replaceChildren(); openHandoffs.clear(); target.replaceChildren(); byId("target-label").hidden = true;
+    log.replaceChildren(); openHandoffs.clear(); resetQuotes(); target.replaceChildren(); byId("target-label").hidden = true;
     byId("welcome").hidden = false; message.value = "";
   }
   if (error.retryAfter > 0) {
@@ -89,7 +90,11 @@ function display(event) {
   if (event.seq !== cursor + 1) throw new Error("История пришла не полностью. Повторяем загрузку.");
   const scroller = byId("scroller");
   const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 72;
-  log.append(renderEvent(event));
+  if (event.data.type === "quote") {
+    for (const old of log.querySelectorAll("[data-confirm-quote]")) old.disabled = true;
+  }
+  log.append(renderEvent(event, state.id, submit));
+  quoteEvent(event.data);
   byId("welcome").hidden = true;
   cursor = event.seq;
   if (event.data.type === "handoff") updateHandoffs(event.data.handoff);
@@ -237,3 +242,4 @@ retry.onclick = () => {
   else poll();
 };
 if (state.pending) actionError = "Отправка не подтверждена. Можно повторить.";
+setupQuotes(() => state.id, request, newKey);
