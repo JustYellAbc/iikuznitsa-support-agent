@@ -2,6 +2,12 @@ const names = { customer: "Вы", agent: "Ассистент", manager: "Опе�
 const rubles = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
 const money = kopecks => rubles.format(kopecks / 100) + " ₽";
 
+export function buyerUrl(path) {
+  const url = new URL(path, location.origin);
+  url.searchParams.set("view", "buyer");
+  return url.pathname + url.search;
+}
+
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text != null) node.textContent = text;
@@ -65,8 +71,8 @@ export function renderEvent({ data, at }, conversationId, submit) {
       if (data.quote.state === "needs_review") {
         row.append(element("small", "Сумма известных строк: " + money(data.quote.knownSubtotalKopecks)));
         const link = element("a", "Скачать черновик КП");
-        link.href = "/api/v1/conversations/" + encodeURIComponent(conversationId) + "/quotes/" +
-          encodeURIComponent(data.quote.quoteId) + "/" + encodeURIComponent(data.quote.revision) + "/preview.pdf";
+        link.href = buyerUrl("/api/v1/conversations/" + encodeURIComponent(conversationId) + "/quotes/" +
+          encodeURIComponent(data.quote.quoteId) + "/" + encodeURIComponent(data.quote.revision) + "/preview.pdf");
         row.append(link);
       } else if (submit) {
         const get = element("button", "Получить PDF КП");
@@ -89,7 +95,7 @@ export function renderEvent({ data, at }, conversationId, submit) {
       break;
     case "document": {
       const link = element("a", data.document.kind === "quote_pdf" ? "Скачать КП" : "Скачать демо-счёт");
-      if (/^\/api\/v1\/documents\/[\w.-]+$/.test(data.document.url)) link.href = data.document.url;
+      if (/^\/api\/v1\/documents\/[\w.-]+$/.test(data.document.url)) link.href = buyerUrl(data.document.url);
       row.append(link);
       break;
     }

@@ -137,6 +137,58 @@ def test_logout_drops_session(api: Api):
     assert api.call("manager", "GET", "/api/v1/manager/telemetry").status_code == 401
 
 
+@pytest.mark.parametrize("first_role", ["manager", "buyer", "legacy_customer"])
+def test_buyer_widget_and_manager_share_browser(client, first_role):
+    conversations = "/api/v1/conversations"
+    manager_url = "/api/v1/manager/handoffs"
+    buyer = {"view": "buyer"}
+
+    def start(params):
+        response = client.post(conversations, params=params, headers={"Idempotency-Key": "open"})
+        assert response.status_code == 201
+        return response.json()["conversationId"]
+
+    if first_role != "manager":
+        cid = start(buyer if first_role == "buyer" else {})
+        assert client.get(manager_url).status_code in (401, 403)
+    assert client.post("/api/v1/auth/manager/login", json={"username": "manager", "password": "test-secret"}).is_success
+    if first_role == "manager":
+        cid = start(buyer)
+    route = f"{conversations}/{cid}"
+    assert client.get(f"{route}/events", params=buyer).is_success
+    assert (
+        client.post(
+            f"{route}/actions",
+            params=buyer,
+            headers={"Idempotency-Key": "message"},
+            json={"type": "message", "text": "Тест"},
+        ).status_code
+        == 202
+    )
+    assert client.get(manager_url).status_code == 200
+    assert client.get(manager_url, params=buyer).status_code == 403
+    assert client.post("/api/v1/auth/logout").status_code == 204
+    assert client.get(manager_url).status_code == 401
+    assert client.get(f"{route}/events", params=buyer).status_code == 200
+
+
+def test_buyer_view_cannot_borrow_manager_access_or_log_manager_out(api, client):
+    foreign = api.new_conversation()
+    api.say(foreign, "Тендерная закупка, нужны документы.")
+    api.idle()
+    api.login()
+    events_url = f"/api/v1/conversations/{foreign}/events"
+    assert client.get(events_url).status_code == 200
+    buyer = {"view": "buyer"}
+    assert client.get(events_url, params=buyer).status_code == 401
+    assert client.post("/api/v1/auth/logout", params=buyer).status_code == 204
+    assert client.post("/api/v1/conversations", params=buyer, headers={"Idempotency-Key": "open"}).status_code == 201
+    assert client.get(events_url, params=buyer).status_code == 404
+    assert client.post("/api/v1/auth/logout", params=buyer).status_code == 204
+    assert client.get(events_url, params=buyer).status_code == 401
+    assert client.get(events_url).status_code == 200
+
+
 def test_errors_use_t04_format(api: Api):
     cid = api.new_conversation()
     r = api.call(

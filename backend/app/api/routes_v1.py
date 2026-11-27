@@ -66,7 +66,8 @@ async def create_conversation(request: Request, key: IdempotencyKey) -> JSONResp
     )
     response = _json(result)
     if token is not None:
-        auth.set_session_cookie(request, response, token, "customer")
+        name = auth.BUYER_COOKIE if auth.buyer_view(request) else auth.COOKIE
+        auth.set_session_cookie(request, response, token, "customer", name=name)
     return response
 
 
@@ -286,6 +287,7 @@ async def manager_login(request: Request, body: ManagerLogin) -> JSONResponse:
         raise ApiError(401, "unauthenticated", "Неверный логин или пароль.")
     principal, token = await auth.create_session("manager", f"manager:{body.username}")
     response = JSONResponse({"role": principal.role})
+    await auth.preserve_legacy_buyer(request, response)
     auth.set_session_cookie(request, response, token, "manager")
     return response
 
