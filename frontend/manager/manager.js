@@ -203,9 +203,12 @@ async function refresh() {
       drafts.delete(id);
       $("result").textContent = "Обращение закрыто.";
     } else {
+      const current = selected && items.find(item => item.handoffId === selected.handoffId);
+      if (current && JSON.stringify(current.quoteLine) !== JSON.stringify(selected.quoteLine)) openCard(current);
       if (changed) showQueue();
       await readHistory();
     }
+    await refreshQuoteDrafts();
   } catch (error) {
     if (attempt === refreshNumber) connectionError(error);
   } finally {
@@ -263,6 +266,26 @@ $("compose").onsubmit = async e => {
 };
 
 window.addEventListener("DOMContentLoaded", refresh);
+
+async function refreshQuoteDrafts() {
+  const pending = (await request("/manager/drafts")).filter(d => d.events.some(e => e.type === "quote"));
+  if (!authenticated) return;
+  const rows = pending.map(d => {
+    const q = d.events.find(e => e.type === "quote").quote;
+    const row = element("div", ""), link = element("a", "Проверить PDF · версия " + q.revision);
+    link.href = "/api/v1/conversations/" + encodeURIComponent(d.conversation_id) + "/quotes/" +
+      encodeURIComponent(q.quoteId) + "/" + q.revision + "/preview.pdf";
+    const send = element("button", "Передать КП покупателю");
+    send.onclick = async () => {
+      send.disabled=true;
+      try { await request("/manager/drafts/" + encodeURIComponent(d.id) + "/send", {}, newKey()); await refresh(); }
+      catch (error) { $("result").textContent = error.message; send.disabled=false; }
+    };
+    row.append(link,send); return row;
+  });
+  $("quote-drafts").replaceChildren(...rows);
+  $("quote-moderation").hidden = !rows.length;
+}
 
 $("approve-price").onsubmit = async e => {
   e.preventDefault();

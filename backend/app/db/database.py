@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS quote_revisions (
     quote_id TEXT NOT NULL, revision INTEGER NOT NULL,
     snapshot TEXT NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0,
     action_id TEXT NOT NULL, document_id TEXT NOT NULL UNIQUE, pdf BLOB NOT NULL,
+    issued_action TEXT, reselect INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, revision), UNIQUE (quote_id, revision)
 );
 CREATE TABLE IF NOT EXISTS quote_handoffs (

@@ -57,13 +57,22 @@ export function renderEvent({ data, at }, conversationId, submit) {
         row.append(element("p", line.name + " · " + line.packages + " уп. × " +
           (line.unitPriceKopecks == null ? "цена на согласовании" : money(line.unitPriceKopecks))));
       }
+      for (const [field, label] of [["payment","Оплата"],["delivery","Поставка"],["taxNote","Налоги"],["validUntil","Действует до"]]) {
+        row.append(element("div", label + ": " + (data.quote.terms[field] || "требует согласования")));
+      }
       if (data.quote.state === "needs_review") {
         row.append(element("small", "Сумма известных строк: " + money(data.quote.knownSubtotalKopecks)));
         const link = element("a", "Скачать черновик КП");
         link.href = "/api/v1/conversations/" + encodeURIComponent(conversationId) + "/quotes/" +
           encodeURIComponent(data.quote.quoteId) + "/" + encodeURIComponent(data.quote.revision) + "/preview.pdf";
         row.append(link);
-      } else if (data.quote.state === "ready" && submit) {
+      } else if (submit) {
+        const get = element("button", "Получить PDF КП");
+        get.type = "button"; get.dataset.confirmQuote = data.quote.quoteId;
+        get.onclick = () => submit({type:"request_document",kind:"quote_pdf",quoteId:data.quote.quoteId,revision:data.quote.revision});
+        row.append(get);
+      }
+      if (data.quote.state === "ready" && submit) {
         const confirm = element("button", "Подтвердить условия КП");
         confirm.type = "button"; confirm.dataset.confirmQuote = data.quote.quoteId;
         confirm.onclick = () => submit({type:"confirm_quote", quoteId:data.quote.quoteId, revision:data.quote.revision});

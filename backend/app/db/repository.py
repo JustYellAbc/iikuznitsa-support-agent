@@ -8,6 +8,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -325,7 +326,11 @@ async def find_open_handoff(conversation_id: str, reason: HandoffReason) -> Hand
 
 
 async def list_open_handoffs() -> list[Handoff]:
-    rows = await get_db().fetchall(HANDOFF_SELECT + "WHERE status = 'open' ORDER BY created_at DESC LIMIT 200")
+    rows = await get_db().fetchall(
+        HANDOFF_SELECT + "WHERE status = 'open' AND (l.quote_id IS NULL OR "
+        "l.revision=(SELECT max(revision) FROM quote_revisions WHERE quote_id=l.quote_id)) "
+        "ORDER BY created_at DESC LIMIT 200"
+    )
     return [_handoff(r).handoff for r in rows]
 
 
@@ -358,8 +363,10 @@ async def get_idempotent(principal: str, method: str, path: str, key: str) -> St
     return StoredResult(row["request_hash"], row["status"], json.loads(row["body"])) if row else None
 
 
-async def save_idempotent(principal: str, method: str, path: str, key: str, result: StoredResult) -> None:
-    async with get_db().tx() as conn:
+async def save_idempotent(
+    principal: str, method: str, path: str, key: str, result: StoredResult, conn: aiosqlite.Connection | None = None
+) -> None:
+    async with _tx(conn) as conn:
         await conn.execute(
             "INSERT INTO idempotency(principal, method, path, key, request_hash, status, body, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -374,6 +381,26 @@ async def save_idempotent(principal: str, method: str, path: str, key: str, resu
                 now_iso(),
             ),
         )
+
+
+@dataclass
+class CommandReceipt:
+    identity: tuple[str, str, str, str]
+    request_hash: str
+    saved: bool = False
+
+    async def save(self, status, payload, conn=None):
+        await save_idempotent(*self.identity, StoredResult(self.request_hash, status, payload), conn=conn)
+        self.saved = True
+
+
+active_command: ContextVar[CommandReceipt | None] = ContextVar("active_command", default=None)
+
+
+async def record_quote_response(conn, status, payload):
+    if command := active_command.get():
+        await command.save(status, payload, conn)
+    return status, payload
 
 
 # --- Ходы агента ---------------------------------------------------------------------
@@ -443,7 +470,9 @@ def _draft(row: aiosqlite.Row) -> Draft:
     )
 
 
-async def create_draft(conversation_id: str, action_id: str, events: list[dict[str, Any]]) -> Draft:
+async def create_draft(
+    conversation_id: str, action_id: str, events: list[dict[str, Any]], conn: aiosqlite.Connection | None = None
+) -> Draft:
     draft = Draft(
         id=new_id("d"),
         conversation_id=conversation_id,
@@ -453,8 +482,8 @@ async def create_draft(conversation_id: str, action_id: str, events: list[dict[s
         created_at=now_iso(),
     )
     ts = to_iso(draft.created_at)
-    async with get_db().tx() as conn:
-        await conn.execute(
+    async with _tx(conn) as c:
+        await c.execute(
             "INSERT INTO drafts(id, conversation_id, action_id, events, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
             (draft.id, conversation_id, action_id, json.dumps(events, ensure_ascii=False), ts, ts),

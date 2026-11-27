@@ -1,6 +1,7 @@
 """Build a commercial proposal from one live T06 snapshot and verified commercial conditions."""
 
 import json
+import re
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -76,7 +77,41 @@ def amount_vat(line: Detail) -> int | None:
     return int((line.unit * line.packages * rate / (100 + rate)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def catalog_lines(index: Path, items: list[Item], terms_file: Path) -> list[Detail]:
+class NoSeatVariant(ValueError):
+    """The current group has no unambiguous equivalent license for the requested capacity."""
+
+
+def seat_variant(db, row, seats):
+    capacity = "К-во пользователей до"
+
+    def properties(candidate):
+        params = json.loads(candidate["params"])
+        limit = params.pop(capacity, [])
+        lower = params.pop("К-во пользователей от", [])
+        name = re.sub(r"\b\d+(?=\s+(?:пользовател|мест))", "#", candidate["name"].casefold())
+        return name, params, limit, lower
+
+    if not row["group_id"]:
+        raise NoSeatVariant
+    old_name, old_params, old_caps, _ = properties(row)
+    if not old_caps:
+        raise NoSeatVariant
+    matches = []
+    for candidate in db.execute("SELECT * FROM offers WHERE group_id=? AND vendor=?", (row["group_id"], row["vendor"])):
+        name, params, limit, lower = properties(candidate)
+        if (
+            name == old_name
+            and params == old_params
+            and limit == [str(seats)]
+            and all(v.isdecimal() and int(v) <= seats for v in lower)
+        ):
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise NoSeatVariant
+    return matches[0]
+
+
+def catalog_lines(index: Path, items: list[Item], terms_file: Path, seats: int | None = None) -> list[Detail]:
     if not index.is_file():
         raise invalid_input("Каталог временно недоступен. Попробуйте позже.")
     rules = json.loads(terms_file.read_text(encoding="utf-8")) if terms_file.is_file() else {}
@@ -85,6 +120,10 @@ def catalog_lines(index: Path, items: list[Item], terms_file: Path) -> list[Deta
         feed_date = db.execute("SELECT snapshot FROM metadata").fetchone()[0]
         for item in items:
             row = db.execute("SELECT * FROM offers WHERE id=?", (item.offerId,)).fetchone()
+            if seats is not None:
+                if row is None:
+                    raise NoSeatVariant
+                row = seat_variant(db, row, seats)
             if row is None or not row["source"].startswith("https://"):
                 raise invalid_input(f"Позиция {item.offerId} больше не доступна в каталоге. Обновите подбор.")
             sale = assess(snapshot_from_row(row, feed_date))
@@ -93,7 +132,7 @@ def catalog_lines(index: Path, items: list[Item], terms_file: Path) -> list[Deta
             notes = raw.get("sales_notes", "")
             if notes and not allowed_quantity(notes, item.packages):
                 raise invalid_input(f"Для {item.offerId} проверьте количество упаковок. Условие каталога: {notes}")
-            rule = Conditions.model_validate(rules[item.offerId]) if item.offerId in rules else None
+            rule = Conditions.model_validate(rules[row["id"]]) if row["id"] in rules else None
             if rule and rule.validUntil and rule.validUntil < date.today():
                 rule = None
             details.append(

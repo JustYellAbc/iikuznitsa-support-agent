@@ -173,7 +173,7 @@ async def resolve_handoff(
 async def download_document(documentId: PathId, principal: Principal = Depends(require_principal)) -> Response:
     row = await get_db().fetchone(
         "SELECT conversation_id, quote_id, revision FROM quote_revisions "
-        "WHERE document_id=? AND json_extract(snapshot,'$.quote.state')='ready'",
+        "WHERE document_id=? AND issued_action IS NOT NULL",
         (documentId,),
     )
     if row is None:
@@ -189,10 +189,13 @@ async def quote_preview(
     principal: Principal = Depends(require_principal),
 ) -> Response:
     await svc.conversation_for(principal, conversationId)
-    row = await get_db().fetchone(
-        "SELECT pdf FROM quote_revisions WHERE conversation_id=? AND quote_id=? AND revision=?",
-        (conversationId, quoteId, revision),
-    )
+    async with get_db().committed_read():
+        if principal.role == "customer" and not await quotes.published(conversationId, quoteId, revision):
+            raise not_found("Документ не найден.")
+        row = await get_db().fetchone(
+            "SELECT pdf FROM quote_revisions WHERE conversation_id=? AND quote_id=? AND revision=?",
+            (conversationId, quoteId, revision),
+        )
     if row is None:
         raise not_found("Документ не найден.")
     return Response(
@@ -233,6 +236,8 @@ async def quote_inputs(conversationId: PathId, principal: Principal = Depends(re
     await svc.conversation_for(principal, conversationId)
     async with get_db().committed_read():
         row = await quotes.latest(conversationId)
+        if principal.role == "customer":
+            await quotes.require_published(row)
     snapshot = quotes.read(row) if row else None
     return JSONResponse(
         {

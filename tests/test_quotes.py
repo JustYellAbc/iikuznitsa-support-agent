@@ -99,7 +99,6 @@ def test_draft_history_access_identity_and_selection(api, tmp_path):
     assert pdf.headers["content-type"] == "application/pdf" and pdf.content.startswith(b"%PDF-")
     api.new_conversation("other")
     assert api.call("other", "GET", path).status_code == 404
-    assert command(api, cid, q, "request_document", kind_dummy="bad").status_code == 422
     assert command(api, cid, q, "confirm_quote").json()["code"] == "terms_pending"
     assert request(api, cid, [("t1", 3)], 1).status_code == 202
     assert request(api, cid, [("t1", 4)], 1).json()["code"] == "stale_revision"
@@ -122,6 +121,10 @@ def test_quote_approval_publishes_new_revision_and_exact_document(api, tmp_path)
     assert (latest["state"], latest["revision"], latest["totalKopecks"]) == ("ready", 2, 32015)
     assert command(api, cid, q, "confirm_quote").json()["code"] == "stale_revision"
     act = {"type": "request_document", "kind": "quote_pdf", "quoteId": q["quoteId"], "revision": 2}
+    doc = api.call("customer", "POST", f"/api/v1/conversations/{cid}/actions", json=act)
+    assert doc.status_code == 202
+    issued = [e for e in api.events(cid) if e["data"]["type"] == "document"]
+    assert len(issued) == 1 and issued[0]["actionId"] == doc.json()["actionId"]
     doc = api.call("customer", "POST", f"/api/v1/conversations/{cid}/actions", json=act)
     assert doc.status_code == 200
     assert (

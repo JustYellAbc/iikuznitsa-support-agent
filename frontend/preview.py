@@ -101,6 +101,7 @@ FILES = {
     "chat.css": "text/css",
     "chat.js": "text/javascript",
     "render.js": "text/javascript",
+    "quote.js": "text/javascript",
 }
 
 

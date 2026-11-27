@@ -67,11 +67,15 @@ async def idempotent(
             if stored.request_hash != request_hash:
                 raise ApiError(409, "key_conflict", "Ключ уже использован для другой команды.")
             return stored.status, stored.body
-        status, payload = await handler()
-        await repository.save_idempotent(
-            principal.id, method, path, key, repository.StoredResult(request_hash, status, payload)
-        )
-        return status, payload
+        command = repository.CommandReceipt((principal.id, method, path, key), request_hash)
+        token = repository.active_command.set(command)
+        try:
+            status, payload = await handler()
+            if not command.saved:
+                await command.save(status, payload)
+            return status, payload
+        finally:
+            repository.active_command.reset(token)
 
 
 # --- Доступ ---------------------------------------------------------------------------
