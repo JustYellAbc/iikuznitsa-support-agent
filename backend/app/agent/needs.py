@@ -6,7 +6,7 @@ from dataclasses import asdict
 from time import perf_counter
 
 from app.agent.catalog_selection import CODE, LATIN, MDAEMON, result
-from app.agent.handoff import CONFIRMED, HUMAN_REQUEST, OFFER_HELP, bare_request, route_action
+from app.agent.handoff import HUMAN_REQUEST, OFFER_HELP, bare_request, handoff_notice, route_action
 from app.agent.needs_brief import Brief, initial_need, open_intake, questions, update_brief
 from app.agent.needs_catalog import recommend
 from app.config import get_settings
@@ -119,7 +119,9 @@ async def run_turn(session, history, text, emit_step, *, action_type, finding):
     steps = [step]
     escalate = bool(route and not route.clarification)
     if escalate:
-        steps.append(StepTrace(tool="handoff_policy", args={"reason": route.reason}, result_summary=CONFIRMED))
+        steps.append(
+            StepTrace(tool="handoff_policy", args={"reason": route.reason}, result_summary=handoff_notice(route.reason))
+        )
     for step in steps:
         await emit_step(step)
     return AgentReply(
@@ -132,7 +134,7 @@ async def run_turn(session, history, text, emit_step, *, action_type, finding):
             total_cost_rub=0,
             total_latency_ms=elapsed,
         ),
-        text=CONFIRMED if escalate else hit.text,
+        text=handoff_notice(route.reason) if escalate else hit.text,
         purpose="notice" if escalate else hit.purpose,
         products=hit.products,
         sources=hit.sources,
