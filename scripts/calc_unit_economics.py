@@ -131,6 +131,13 @@ class DialogMeasurement:
     category: str | None
     calls: tuple[LLMCallRecord, ...]
     escalated: bool = False
+    closed_by_agent: bool | None = None
+
+    @property
+    def needs_operator(self) -> bool | None:
+        if self.escalated:
+            return True
+        return None if self.closed_by_agent is None else not self.closed_by_agent
 
 
 @dataclass(frozen=True)
@@ -483,7 +490,7 @@ def _load_telemetry_dumps(
     paths: list[Path],
     *,
     allow_incomplete_telemetry: bool = False,
-) -> tuple[dict[str, list[LLMCallRecord]], dict[str, str | None], dict[str, bool], list[str]]:
+) -> tuple[dict[str, list[LLMCallRecord]], dict[str, str | None], dict[str, bool], dict[str, bool], list[str]]:
     """Читает один или несколько JSON-дампов /api/v1/manager/telemetry или per-dialog экспортов.
 
     Окно /manager/telemetry (recent_calls) ограничено 20 последними вызовами даже при all_time=true.
@@ -495,6 +502,9 @@ def _load_telemetry_dumps(
     escalated_by_session: dict[str, bool] = {}
     warnings: list[str] = []
     seen_call_ids: set[Any] = set()
+    snapshots: dict[str, dict] = {}
+    full_calls: dict[str, list[LLMCallRecord]] = {}
+    outcomes: dict[str, bool] = {}
 
     for path in paths:
         if not path.is_file():
@@ -515,20 +525,33 @@ def _load_telemetry_dumps(
                 raw_calls = dlg.get("calls") if "calls" in dlg else dlg.get("llm_calls")
                 if not isinstance(raw_calls, list):
                     raise InputDataError(f"{path}: dialogs[{idx}] ({sid}) без списка calls/llm_calls.")
-                calls_by_session.setdefault(sid, [])
+                # Each dialogs[] entry describes the complete session, including zero or repeated calls.
+                snapshot = {k: dlg.get(k) for k in ("category", "passed", "closed_by_agent", "escalated")}
+                snapshot["calls"] = raw_calls
+                if sid in snapshots:
+                    if snapshots[sid] != snapshot:
+                        raise InputDataError(f"{path}: несовместимые полные снимки диалога {sid}.")
+                    continue
+                snapshots[sid] = snapshot
+                full_calls[sid] = []
+                snapshot_ids = set()
                 if dlg.get("category") is not None:
                     categories_by_session[sid] = str(dlg["category"])
                 if dlg.get("escalated"):
                     escalated_by_session[sid] = True
+                if isinstance(dlg.get("closed_by_agent"), bool):
+                    outcomes[sid] = dlg["closed_by_agent"] and dlg.get("passed") is not False
+                elif dlg.get("passed") is False:
+                    outcomes[sid] = False
                 for c_idx, call in enumerate(raw_calls):
                     if not isinstance(call, dict):
                         raise InputDataError(f"{path}: dialogs[{idx}].calls[{c_idx}] должен быть объектом.")
                     call_id = call.get("id")
                     if call_id is not None:
-                        if call_id in seen_call_ids:
+                        if call_id in snapshot_ids:
                             continue
-                        seen_call_ids.add(call_id)
-                    calls_by_session[sid].append(_parse_call_dict(call, f"{path}:dialogs[{idx}].calls[{c_idx}]"))
+                        snapshot_ids.add(call_id)
+                    full_calls[sid].append(_parse_call_dict(call, f"{path}:dialogs[{idx}].calls[{c_idx}]"))
             continue
 
         is_recent_window = False
@@ -582,7 +605,9 @@ def _load_telemetry_dumps(
             if call.get("category") is not None:
                 categories_by_session[sid] = str(call["category"])
 
-    return calls_by_session, categories_by_session, escalated_by_session, warnings
+    # A full session export already includes the calls from overlapping telemetry windows.
+    calls_by_session.update(full_calls)
+    return calls_by_session, categories_by_session, escalated_by_session, outcomes, warnings
 
 
 def load_measurements(
@@ -600,7 +625,7 @@ def load_measurements(
 
     cat_map = category_map or {}
     valid_categories = set(split_summary.categories.keys())
-    telemetry_calls, telemetry_cats, telemetry_esc, tel_warnings = _load_telemetry_dumps(
+    telemetry_calls, telemetry_cats, telemetry_esc, telemetry_outcomes, tel_warnings = _load_telemetry_dumps(
         telemetry_paths, allow_incomplete_telemetry=allow_incomplete_telemetry
     )
     if warnings_out is not None:
@@ -670,8 +695,13 @@ def load_measurements(
             escalated = bool(case.get("escalated")) or bool(
                 (conv_id_str and telemetry_esc.get(conv_id_str)) or telemetry_esc.get(case_id)
             )
+            closed = case.get("closed_by_agent", telemetry_outcomes.get(dialog_id))
+            if case.get("passed") is False:
+                closed = False
             dialogs.append(
-                DialogMeasurement(dialog_id=dialog_id, category=category, calls=tuple(calls), escalated=escalated)
+                DialogMeasurement(
+                    dialog_id, category, tuple(calls), escalated, closed if isinstance(closed, bool) else None
+                )
             )
 
     # Добавляем диалоги из телеметрии, не сматченные с eval-кейсами.
@@ -689,7 +719,11 @@ def load_measurements(
         seen_dialog_ids.add(sid)
         dialogs.append(
             DialogMeasurement(
-                dialog_id=sid, category=category, calls=tuple(calls), escalated=telemetry_esc.get(sid, False)
+                dialog_id=sid,
+                category=category,
+                calls=tuple(calls),
+                escalated=telemetry_esc.get(sid, False),
+                closed_by_agent=telemetry_outcomes.get(sid),
             )
         )
 
@@ -735,12 +769,21 @@ def _call_cost_rub(call: LLMCallRecord, pricing: PricingConfig, usd_rub_rate: De
     return (cost_in + cost_out) * rate
 
 
+def _pilot_costs(manual: Decimal, technical: Decimal, labor_share: Decimal | None):
+    if labor_share is None:
+        return None, None, None, None
+    residual = manual * labor_share
+    total = technical + residual
+    saving = manual - total
+    return residual, total, saving, saving / manual * HUNDRED if manual > ZERO else ZERO
+
+
 def _compute_load_scenario(
     *,
     active_variable_cost_rub: Decimal | None,
     avg_tokens_in_per_request: Decimal | None,
     avg_tokens_out_per_request: Decimal | None,
-    escalation_rate: Decimal | None,
+    labor_share: Decimal | None,
     daily_infra_cost_rub: Decimal,
     operator_cost_per_request_rub: Decimal,
     requests_per_day: int,
@@ -791,20 +834,17 @@ def _compute_load_scenario(
     period_total_cost_rub = period_variable_cost_rub + period_infra_cost_rub
     full_cost_per_request_rub = period_total_cost_rub / req_period_dec
 
-    esc = escalation_rate if escalation_rate is not None else ZERO
-    daily_residual_operator = operator_daily_cost_rub * esc
-    period_residual_operator = operator_period_cost_rub * esc
+    daily_residual_operator, _, net_savings_daily_rub, _ = _pilot_costs(
+        operator_daily_cost_rub, daily_total_cost_rub, labor_share
+    )
+    period_residual_operator, _, net_savings_period_rub, net_savings_pct = _pilot_costs(
+        operator_period_cost_rub, period_total_cost_rub, labor_share
+    )
 
     savings_per_request_rub = operator_cost_per_request_rub - full_cost_per_request_rub
     savings_daily_rub = operator_daily_cost_rub - daily_total_cost_rub
     savings_period_rub = operator_period_cost_rub - period_total_cost_rub
     savings_pct = (savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
-    net_savings_daily_rub = operator_daily_cost_rub - (daily_total_cost_rub + daily_residual_operator)
-    net_savings_period_rub = operator_period_cost_rub - (period_total_cost_rub + period_residual_operator)
-    net_savings_pct = (
-        (net_savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
-    )
-
     return LoadScenarioEconomics(
         requests_per_day=requests_per_day,
         period_days=period_days,
@@ -878,7 +918,7 @@ def compute_unit_economics(
             active_variable_cost_rub=None,
             avg_tokens_in_per_request=None,
             avg_tokens_out_per_request=None,
-            escalation_rate=None,
+            labor_share=None,
             daily_infra_cost_rub=daily_infra_cost_rub,
             operator_cost_per_request_rub=operator_cost_per_request_rub,
             requests_per_day=load_requests_per_day,
@@ -1099,22 +1139,27 @@ def compute_unit_economics(
     period_total_cost_rub = period_variable_cost_rub + period_infra_cost_rub
     full_cost_per_request_rub = period_total_cost_rub / req_period_dec
 
-    period_residual_operator_cost_rub = operator_period_cost_rub * escalation_rate
-    period_pilot_total_cost_rub = period_total_cost_rub + period_residual_operator_cost_rub
+    labor_share = None
+    if all(d.needs_operator is not None for d in dialogs):
+        if weighting_mode == "archive_weighted":
+            labor_share = sum(
+                weight * Decimal(sum(1 for d, _ in dialogs_by_cat[c] if d.needs_operator)) / len(dialogs_by_cat[c])
+                for c, weight in norm_weights.items()
+            )
+        else:
+            labor_share = Decimal(sum(1 for d in dialogs if d.needs_operator)) / len(dialogs)
+    period_residual_operator_cost_rub, period_pilot_total_cost_rub, net_savings_period_rub, net_savings_pct = (
+        _pilot_costs(operator_period_cost_rub, period_total_cost_rub, labor_share)
+    )
 
     savings_per_request_rub = operator_cost_per_request_rub - full_cost_per_request_rub
     savings_period_rub = operator_period_cost_rub - period_total_cost_rub
     savings_pct = (savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
-    net_savings_period_rub = operator_period_cost_rub - period_pilot_total_cost_rub
-    net_savings_pct = (
-        (net_savings_period_rub / operator_period_cost_rub) * HUNDRED if operator_period_cost_rub > ZERO else ZERO
-    )
-
     load_scenario = _compute_load_scenario(
         active_variable_cost_rub=active_variable_cost_rub,
         avg_tokens_in_per_request=avg_tokens_in_per_request,
         avg_tokens_out_per_request=avg_tokens_out_per_request,
-        escalation_rate=escalation_rate,
+        labor_share=labor_share,
         daily_infra_cost_rub=daily_infra_cost_rub,
         operator_cost_per_request_rub=operator_cost_per_request_rub,
         requests_per_day=load_requests_per_day,
@@ -1641,9 +1686,9 @@ def fill_xlsx_template(
                 row_values = {
                     "step": step.step,
                     "model": step.model,
-                    "calls": float(_q(step.calls_per_request, "0.0001")),
-                    "tokens_in": float(_q(step.avg_tokens_in, "0.01")),
-                    "tokens_out": float(_q(step.avg_tokens_out, "0.01")),
+                    "calls": float(step.calls_per_request),
+                    "tokens_in": float(step.avg_tokens_in),
+                    "tokens_out": float(step.avg_tokens_out),
                     "price_in": float(step.price_in_per_1m),
                     "price_out": float(step.price_out_per_1m),
                     "currency": layout.currency_symbols.get(step.currency, step.currency),
@@ -1737,6 +1782,8 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
         "- **Единица учёта**: 1 запрос = 1 обращение = все LLM-вызовы в диалоге.",
         f"- **Замерено диалогов**: {result.measured_dialogs} (из них передано менеджеру: {result.escalated_dialogs}, "
         f"доля эскалаций: {esc_pct_cell})",
+        "- Для переданного или незавершённого обращения закладываем полный ручной разбор по ставке оператора. "
+        "При неизвестном исходе затраты труда и чистая экономия не определены. Технические расходы учтены.",
         f"- **Режим взвешивания**: `{result.weighting_mode}`",
         f"- **Покрытие долей архива**: {cov_pct_str}% ({measured_archive} из {total_archive} обращений, "
         f"{measured_cat_cnt} из {total_cat_cnt} категорий; без замеров: {uncov_pct_str}%)",

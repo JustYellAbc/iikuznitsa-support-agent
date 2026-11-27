@@ -1141,3 +1141,77 @@ def test_pilot_escalated_cases_daily_tokens_and_partial_scope_in_report(tmp_path
     md_tok = ue.render_markdown_report(res_tok, pricing)
     assert "5000.00" in md_tok and "1000.00" in md_tok
     assert "900000.00" in md_tok and "180000.00" in md_tok
+
+
+@pytest.mark.parametrize(
+    "outcome,expected_share",
+    [
+        ({}, None),
+        ({"passed": False, "closed_by_agent": False}, 1),
+        ({"passed": True, "closed_by_agent": True}, 0),
+        ({"passed": True, "closed_by_agent": False, "escalated": True}, 1),
+    ],
+)
+def test_full_cost_but_only_confirmed_labor_savings(tmp_path, outcome, expected_share):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    pricing = ue.load_pricing_config(_write_synthetic_pricing(tmp_path / "p.yml"))
+    path = tmp_path / "data.json"
+    item = {"conversation_id": "c1", "category": NINE_CATEGORIES[0], "llm_calls": [], **outcome}
+    if outcome:
+        path.write_text(json.dumps({"cases": [item]}))
+    else:
+        path.write_text(json.dumps({"dialogs": [item]}))
+    dialogs = ue.load_measurements(
+        eval_report_paths=[path] if outcome else [], telemetry_paths=[] if outcome else [path], split_summary=summary
+    )
+    res = ue.compute_unit_economics(dialogs, summary, pricing, usd_rub_rate=Decimal("100"))
+    for scenario in [res, res.load_scenario]:
+        assert scenario.period_total_cost_rub is not None
+        if expected_share is None:
+            assert scenario.net_savings_pct is None
+        else:
+            assert scenario.period_residual_operator_cost_rub == scenario.operator_period_cost_rub * expected_share
+            assert (
+                scenario.net_savings_period_rub
+                == scenario.operator_period_cost_rub * (1 - expected_share) - scenario.period_total_cost_rub
+            )
+
+
+def test_reimport_full_dialog_snapshot_keeps_identical_calls(tmp_path):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    call = {"step": "agent_loop", "model": "synth-smart", "tokens_in": 1000, "tokens_out": 0}
+    snapshot = {"conversation_id": "c1", "llm_calls": [call, call]}
+    p = tmp_path / "dump.json"
+    p.write_text(json.dumps({"dialogs": [snapshot]}))
+
+    def load(paths):
+        return ue.load_measurements(eval_report_paths=[], telemetry_paths=paths, split_summary=summary)
+
+    assert load([p]) == load([p, p])
+    assert len(load([p, p])[0].calls) == 2
+    window = tmp_path / "window.json"
+    window.write_text(json.dumps({"recent_calls": [dict(call, session_id="c1", id=10)]}))
+    assert load([p, window]) == load([window, p]) == load([p])
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"dialogs": [dict(snapshot, llm_calls=[call])]}))
+    with pytest.raises(ue.InputDataError, match="несовместимые"):
+        load([p, other])
+
+
+def test_xlsx_preserves_fractional_call_frequency(tmp_path):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    pricing = ue.load_pricing_config(_write_synthetic_pricing(tmp_path / "pricing.yml"))
+    dialogs = [
+        ue.DialogMeasurement("c1", None, (ue.LLMCallRecord("agent_loop", "synth-smart", 1000, 0),)),
+        ue.DialogMeasurement("c2", None, ()),
+        ue.DialogMeasurement("c3", None, ()),
+    ]
+    result = ue.compute_unit_economics(dialogs, summary, pricing, usd_rub_rate=Decimal("100"))
+    template, _ = _create_official_organizer_template(tmp_path / "template.xlsx", cbr_rate=100)
+    out = tmp_path / "result.xlsx"
+    ue.fill_xlsx_template(template, out, result, pricing)
+    wb = openpyxl.load_workbook(out)
+    try:
+        assert wb.active["C9"].value == pytest.approx(1 / 3, abs=1e-14)
+    finally:
+        wb.close()
