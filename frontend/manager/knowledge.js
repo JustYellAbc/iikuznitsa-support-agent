@@ -58,7 +58,11 @@ async function loadArticles(caseId) {
         const publish = element("button", "Подтвердить публикацию"), reject = element("button", "Отклонить");
         publish.onclick = () => decide(publish, "approve", replace.value);
         reject.onclick = () => decide(reject, "reject");
-        box.append(replace, publish, reject);
+        publish.className = "primary";
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        actions.append(publish, reject);
+        box.append(replace, actions);
       } else if (a.status === "approved" && !a.retired_at) {
         const link = element("a", "Открыть статью");
         link.href = "/api/v1/knowledge/" + encodeURIComponent(a.id);
@@ -68,7 +72,10 @@ async function loadArticles(caseId) {
         withdraw.onclick = () => {
           if (window.confirm("Снять эту статью с публикации?")) decide(withdraw, "withdraw");
         };
-        box.append(link, withdraw);
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        actions.append(link, withdraw);
+        box.append(actions);
       }
       list.append(box);
     }
