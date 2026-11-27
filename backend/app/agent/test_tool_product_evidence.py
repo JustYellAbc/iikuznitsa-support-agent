@@ -53,14 +53,14 @@ def test_order_tracking_reads_the_verified_guide_before_asking_for_a_product(sta
 
 
 def test_team_size_and_named_product_are_kept_before_another_model_call(stand_api, provider):  # noqa: F811
-    answers, requests = provider
-    answers.append(tool("respond", kind="clarify", question="Какое решение нужно для вашей закупки?"))
+    _, requests = provider
     cid = stand_api.new_conversation()
-    say(stand_api, cid, "Нужен полный комплект на 1000 человек")
+    first = say(stand_api, cid, "Нужен полный комплект на 1000 человек")
+    assert "редакции" in first[-1]["text"]
     reply = say(stand_api, cid, "1С Бухгалтерия")
-    assert len(requests) == 1 and "1000" in reply[-1]["text"] and reply[-1]["purpose"] == "clarification"
+    assert not requests and "1000" in reply[-1]["text"] and reply[-1]["purpose"] == "clarification"
     reply = say(stand_api, cid, "Это всего по компании")
-    assert len(requests) == 1 and "Сколько сотрудников" in reply[-1]["text"]
+    assert not requests and "Сколько сотрудников" in reply[-1]["text"]
 
 
 @pytest.mark.parametrize(
