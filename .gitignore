@@ -1,8 +1,9 @@
-# Local credentials
+# Local credentials and pricing overrides
 .env
 .env.*
 !.env.example
 !.env.*.example
+config/pricing.yaml
 *.pem
 *.key
 /secrets/
