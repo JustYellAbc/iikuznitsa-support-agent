@@ -37,6 +37,15 @@ from eval.pii import scrub_pii
 MAX_OUTPUT_TOKENS = 800
 MAX_CONTEXT_BYTES = 80_000
 Query = Annotated[str, Field(min_length=1, max_length=500)]
+CAPABILITIES = (
+    "Помогу подобрать ПО и лицензии, проверить цену и условия по каталогу, "
+    "подготовить коммерческое предложение или подключить менеджера. С чем помочь?"
+)
+ABOUT_ASSISTANT = re.compile(
+    r"(?:а )?(?:что (?:ты |вы )?(?:сам |сами )?(?:умеешь|умеете|можешь|можете)(?: делать)?|"
+    r"(?:чем|как) (?:ты |вы )?(?:сам |сами )?(?:можешь|можете) (?:мне |нам )?помочь|"
+    r"какие (?:у тебя|у вас) (?:возможности|функции))"
+)
 
 
 class Arguments(BaseModel):
@@ -58,7 +67,7 @@ class Knowledge(Arguments):
 
 
 class Answer(Arguments):
-    kind: Literal["product", "knowledge", "clarify", "handoff"]
+    kind: Literal["product", "knowledge", "clarify", "handoff", "capabilities"]
     refs: list[str] = Field(default_factory=list, max_length=3)
     field: Literal["price", "term", "availability", "delivery", "edition", "platform", "licenseType", "summary"] = (
         Field(
@@ -116,6 +125,8 @@ def instructions():
 При поиске товара по названию или задаче сначала search_catalog. Не угадывай offerId.
 Для процедур, восстановления доступа и проблем после покупки вызови search_knowledge.
 Сообщай, что проверил источник, только после его чтения. Пустая выдача относится только к запросу.
+На общий вопрос о возможностях ассистента верни capabilities без поиска и refs, даже если уже обсуждали товар.
+Если спрашивают, что умеет конкретная программа, проверь сведения именно о ней.
 При прямом совпадении используй опубликованный ответ. Проверяй, что статья отвечает именно на вопрос.
 Для нового вопроса о факте товара получи свежую карточку. Не подменяй её смежным товаром.
 Ответ на твой вопрос о выборе — продолжение покупки. Сохрани количество и тип покупателя.
@@ -296,6 +307,8 @@ def detail_reply(row, field_name, title_edition, *, compact):
 
 def checked_answer(answer, evidence, history, text, previous):
     """Derive all commercial facts, customer links and handoff products from this turn's records."""
+    if answer.kind == "capabilities":
+        return CAPABILITIES, "answer", [], [], None
     if len(set(answer.refs)) != len(answer.refs) or any(ref not in evidence.rows for ref in answer.refs):
         raise ValueError("Выбери только существующие refs из этого хода.")
     rows = [evidence.rows[ref] for ref in answer.refs]
@@ -497,6 +510,8 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                     ),
                 }
             )
+        if ABOUT_ASSISTANT.fullmatch(" ".join(text.casefold().strip(" .!?").split())):
+            return CAPABILITIES, "answer", [], [], None
         confirmed = confirmed_candidate(history, text)
         if confirmed:
             offer_id, source = confirmed
@@ -598,6 +613,8 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         )
         handoff = HandoffRequest(reason="technical", question=text, products=current)
     replaces = evidence.replaced or bool(previous and purpose == "clarification" and kb_retry is None)
+    if body == CAPABILITIES:
+        replaces = False
     if (
         body in {ASK_DETAIL, OFFER_HELP}
         and not evidence.replaced
