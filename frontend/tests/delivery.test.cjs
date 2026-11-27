@@ -39,7 +39,7 @@ test("Виджет Т09 на примерах контракта", async t => {
     const cards = page.locator("#log .result");
     await cards.nth(2).waitFor();
     const card = id => cards.filter({ has: page.locator('a[href*="-' + id + '/"]') });
-    assert.match((await card("61557").innerText()).replace(/\s/g, " "), /4 900 ₽ за единицу по карточке/);
+    assert.match((await card("61557").innerText()).replace(/\s/g, " "), /Цена позиции: 4 900 ₽/);
     assert.match(await card("61557").innerText(), /Срок лицензии неизвестен/);
     assert.match(await card("48093").innerText(), /Наличие требует подтверждения/);
     assert.match(await card("504").innerText(), /Цена по запросу/);
@@ -83,6 +83,49 @@ test("Виджет Т09 на примерах контракта", async t => {
     assert.equal(await page.locator(`#log a[href="${article.url}"]`).count(), 1);
     assert.equal(await page.locator(`#log a[href="${reply.data.sources[0].url}"]`).count(), 2);
   });
+  await t.test("Единица цены сохраняется от карточки до КП, количество лицензий не становится количеством заказа", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    await page.addInitScript(() => { window.EventSource = undefined; });
+    const cases = [
+      ["380385", "Microsoft Windows 11 Pro FQC-10572, электронный ключ", 3044800, "Цена электронного ключа: 30 448 ₽"],
+      ["460481", "ООО ПКФ «Информ-Сервис» ПК ИС Заготовка 36и6 (лицензия), ПК ИС Заготовка 36и6 (комплект на 3 пользователя)", 10459000, "Цена комплекта: 104 590 ₽"],
+      ["61557", "SunRav Software BookOffice (лицензии), Лицензия на 1 ПК", 490000, "Цена позиции: 4 900 ₽"],
+    ];
+    const products = cases.map(([offerId, name, unitPriceKopecks]) => ({ offerId, name, unitPriceKopecks,
+      priceState: "listed", source: {url: "https://example.org/" + offerId, label: "Карточка"} }));
+    const lines = products.map(product => ({...product, packages: 2}));
+    const data = [{type: "products", products}, {type: "quote", quote: {quoteId: "q", revision: 1, lines, terms: {}}}];
+    const events = data.map((data, i) => ({seq: i + 1, at: "2026-11-27T12:00:00Z", data}));
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({json: {events: events.slice(after), nextAfter: events.length, hasMore: false}});
+    });
+    await page.route("**/quotes/current?*", route => route.fulfill({json: {revision: 1, choices: products, items: lines}}));
+    await page.goto(url);
+    await page.locator("#launch").click();
+    const edit = page.getByRole("button", {name: "Изменить КП"});
+    await edit.waitFor();
+    for (const [id, name, , price] of cases) {
+      const card = page.locator(".result").filter({hasText: "Артикул " + id});
+      await card.getByText(price, {exact: true}).waitFor();
+      await page.getByText(name + " · " + price + " · Количество: 2", {exact: true}).waitFor();
+    }
+    await edit.click();
+    const qty = page.getByRole("spinbutton", {name: "Количество: " + cases[1][1]});
+    assert.equal(await qty.inputValue(), "2");
+    await qty.fill("4");
+    await page.getByLabel("Организация").fill("ООО Проверка");
+    await page.getByLabel("ИНН").fill("7700000001");
+    await page.getByLabel("КПП").fill("770001001");
+    const submitUrl = "**/quotes?*";
+    await page.route(submitUrl, route => route.fulfill({status: 202, json: {actionId: "a-test"}}));
+    const sent = page.waitForRequest(submitUrl);
+    await page.getByRole("button", {name: "Подтвердить выбор и получить КП"}).click();
+    assert.deepEqual((await sent).postDataJSON().items, [
+      {offerId: "380385", packages: 2}, {offerId: "460481", packages: 4}, {offerId: "61557", packages: 2},
+    ]);
+  });
   await t.test("Подборки открывают собственные позиции, изменить можно только актуальный расчёт", async t => {
     const page = await browser.newPage();
     t.after(() => page.close());
@@ -119,8 +162,8 @@ test("Виджет Т09 на примерах контракта", async t => {
     }
     assert.equal(await edit.first().isDisabled(), true);
     await edit.nth(1).click();
-    await page.getByLabel("Упаковки: Товар B").waitFor();
-    assert.equal(await page.getByLabel("Упаковки: Товар B").inputValue(), "3");
+    await page.getByLabel("Количество: Товар B").waitFor();
+    assert.equal(await page.getByLabel("Количество: Товар B").inputValue(), "3");
     await close.click();
     saved.revision = 3;
     await edit.nth(1).click();
