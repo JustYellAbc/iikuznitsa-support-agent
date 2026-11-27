@@ -128,8 +128,9 @@ class Preview(BaseHTTPRequestHandler):
             page = [e for e in events if e["seq"] > after][:100]
             end = page[-1]["seq"] if page else after
             return self.respond(200, {"events": page, "nextAfter": end, "hasMore": end < len(events)})
-        name = url.path.removeprefix("/chat/") or "index.html"
-        if url.path.startswith("/chat/") and name in FILES:
+        asset_path = "/chat/" if url.path == "/chat" else url.path
+        name = asset_path.removeprefix("/chat/") or "index.html"
+        if asset_path.startswith("/chat/") and name in FILES:
             raw = (FRONTEND / "chat" / name).read_bytes()
             self.send_response(200)
             mime = FILES[name]
