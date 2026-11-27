@@ -14,6 +14,14 @@ from app.agent.handoff import OFFER_HELP, offers_operator
 from app.config import get_settings
 
 
+def test_quote_name_does_not_hide_an_actual_customer_type():
+    assert not Selection("").qualifiers("Нужна копия коммерческого предложения.", followup=False).organization
+    assert (
+        Selection("").qualifiers("Коммерческое предложение для коммерческой компании.", followup=False).organization
+        == "Коммерческая"
+    )
+
+
 @pytest.fixture
 def index(tmp_path):
     path = get_settings().data_dir / "private" / "catalog.sqlite3"

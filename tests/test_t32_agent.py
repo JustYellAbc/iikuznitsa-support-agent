@@ -166,7 +166,10 @@ def test_tools_retrieve_new_manager_publication_for_different_buyer(api, provide
 
 
 @pytest.mark.usefixtures("index")
-def test_quote_acceptance_uses_verified_selection_without_another_model_call(api, provider):
+@pytest.mark.parametrize(
+    "question", ["И что дальше?", "Я выбрал этот товар. Можете предложить подготовить коммерческое предложение?"]
+)
+def test_quote_acceptance_uses_verified_selection_without_another_model_call(api, provider, question):
     responses, requests = provider
     responses.extend(
         [
@@ -178,7 +181,7 @@ def test_quote_acceptance_uses_verified_selection_without_another_model_call(api
     )
     cid = api.new_conversation()
     say(api, cid, "Цена по артикулу new20?")
-    say(api, cid, "И что дальше?")
+    say(api, cid, question)
     for prompt in ("Да", "Эй бля подготавливай КП"):
         receipt = api.say(cid, prompt, key=prompt.encode().hex())
         assert receipt.status_code == 202 and receipt.headers["X-Chat-Action"] == "open-quote-form"
