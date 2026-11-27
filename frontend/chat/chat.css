@@ -1,7 +1,16 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-:root { --ink: #22212a; --muted: #625f68; --accent: #a20c33; --line: #dedbe0; color: var(--ink); background: #f7f6f2; font: 16px/1.5 "Segoe UI", sans-serif; }
+:root { --ink: #22212a; --muted: #625f68; --accent: #a20c33; --line: #dedbe0; --demo-h: 30px; color: var(--ink); background: #f7f6f2; font: 16px/1.5 "Segoe UI", sans-serif; }
 body { margin: 0; }
+/* #90: маркировка конкурсного стенда. Высота в --demo-h, чтобы окно чата не заходило под полосу. */
+.demo-banner { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: center; height: var(--demo-h); padding: 0 12px; overflow: hidden; background: #22212a; color: #fff; font-size: 13px; line-height: 16px; text-align: center; white-space: nowrap; }
+.demo-banner > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 800px) {
+  :root { --demo-h: 36px; }
+  .demo-banner { font-size: 12px; line-height: 15px; white-space: normal; }
+  .demo-extra { display: none; }
+}
+@media (max-width: 360px) { .demo-banner { font-size: 11px; } }
 button, textarea, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: default; opacity: .55; }
@@ -33,7 +42,7 @@ dt { color: var(--muted); } dd { margin: 0; }
 .launcher, #chat { position: fixed; right: max(20px,3vw); bottom: max(20px, env(safe-area-inset-bottom)); z-index: 1; box-shadow: 0 12px 45px #33203030; }
 .launcher { display: flex; align-items: center; gap: 9px; padding: 12px 22px; border: none; border-radius: 28px; background: var(--accent); color: white; font-weight: 600; }
 .launcher span { width: 17px; height: 14px; border: 1.6px solid; border-radius: 6px 6px 6px 1px; font-size: 0; }
-#chat { display: flex; flex-direction: column; width: min(440px,95vw); height: min(780px,calc(100dvh - 40px)); border: 1px solid var(--line); border-radius: 19px; overflow: hidden; background: #fff; }
+#chat { display: flex; flex-direction: column; width: min(440px,95vw); height: min(780px,calc(100dvh - 40px - var(--demo-h))); border: 1px solid var(--line); border-radius: 19px; overflow: hidden; background: #fff; }
 .chatbar { justify-content: space-between; background: var(--accent); color: white; padding: 10px 16px; }
 .wordmark { width: 116px; margin-bottom: 4px; }
 .chatbar h2 { font-size: 20px; line-height: 1.25; letter-spacing: -.035em; }
@@ -86,6 +95,6 @@ footer { border-top: 1px solid var(--line); padding: 8px 12px; }
   .storebar nav a:last-child { display: none; } .product { grid-template-columns: 1fr; }
   .cover { min-height: 115px; padding: 20px; position: relative; }.envelope { width: 84px; position: absolute; right: 8%; top: 0; margin: 20px 0; }
   .description { padding: 24px; } main { padding-bottom: 84px; }
-  #chat { inset: auto 0 0; width: 100%; height: 100dvh; padding-top: env(safe-area-inset-top); border-radius: 0; }
+  #chat { inset: auto 0 0; width: 100%; height: calc(100dvh - var(--demo-h)); padding-top: env(safe-area-inset-top); border-radius: 0; }
   footer { padding-bottom: max(8px,env(safe-area-inset-bottom)); }
 }

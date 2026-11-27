@@ -10,7 +10,7 @@ from app.api import routes_manager, routes_public, routes_v1
 from app.config import get_settings
 from app.core.errors import install_error_handlers
 from app.core.llm import close_http_client
-from app.core.security import RateLimitMiddleware
+from app.core.security import NoIndexMiddleware, RateLimitMiddleware
 from app.db.database import close_db, init_db
 from app.services import invoices, price_policy, turn_service
 
@@ -54,6 +54,7 @@ def create_app() -> FastAPI:
         allow_headers=["Content-Type", "Idempotency-Key"],
         expose_headers=["Retry-After"],
     )
+    app.add_middleware(NoIndexMiddleware)  # внешний слой: заголовок есть и у 429, и у ответов CORS
     install_error_handlers(app)
     app.include_router(routes_public.router)
     app.include_router(knowledge.router)
