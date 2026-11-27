@@ -15,9 +15,10 @@ from app.contracts.t04 import (
     EventPage,
     HandoffList,
     ManagerDecision,
+    MessageAction,
     Receipt,
 )
-from app.core import auth, events
+from app.core import auth, events, prefilter
 from app.core.auth import Principal, require_manager, require_principal
 from app.core.errors import ApiError, not_found
 from app.db import repository
@@ -92,6 +93,9 @@ async def submit_action(
     """Реплика, вызов оператора, подтверждение расчёта или запрос документа. Результат — в журнале."""
     if principal.role != "customer":
         raise ApiError(403, "forbidden", "Команда доступна покупателю.")
+    if isinstance(action, MessageAction):
+        # До Idempotency-Key, журнала и очереди хода: отказ ничего не занимает и не пишет.
+        prefilter.check_message_length(action.text)
     body = action.model_dump(mode="json")
     return _json(
         await svc.idempotent(
