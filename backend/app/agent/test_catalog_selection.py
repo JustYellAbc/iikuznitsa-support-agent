@@ -215,3 +215,25 @@ def test_ordinal_option_preserves_stated_buyer():
 def test_independent_product_families_use_feed_price_states(index, name, state, amount):
     [p] = select(index, Selection(name)).products
     assert (p.priceState, p.unitPriceKopecks) == (state, amount)
+
+
+def test_renewal_type_conflict_is_scoped_to_matching_platform_and_capacity(index):
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(index)) as db:
+        db.execute("UPDATE offers SET params=json_set(params, '$.Платформа', json_array('Linux'))")
+        db.execute(
+            "UPDATE offers SET name=name || ' продление просроченной подписки', params=json_set(params, '$.Платформа', json_array('Windows')) WHERE id='new5'"
+        )
+        db.execute("DELETE FROM offers WHERE id IN ('renew','late')")
+        db.commit()
+    for seats, platforms in [(20, ["Windows"]), (5, ["Linux"])]:
+        hit = select(index, Selection("MDaemon Messaging Server", kind="Продление", seats=seats, platforms=platforms))
+        assert hit.text == OFFER_HELP and not hit.products and not hit.sources
+    hit = select(index, Selection("MDaemon Messaging Server", kind="Продление", seats=5, platforms=["Windows"]))
+    assert "другой тип" in hit.text and all(source.url.endswith("/new5") for source in hit.sources)
+    current = select(
+        index, Selection("MDaemon Messaging Server", kind="Продление", seats=5, platforms=["Windows"], expired=False)
+    )
+    assert current.text == OFFER_HELP and not current.sources

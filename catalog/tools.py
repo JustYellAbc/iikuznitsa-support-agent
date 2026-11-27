@@ -146,20 +146,6 @@ def referenced_offers(index: Path, links: dict[str, str], parts: list[str]) -> T
         return ToolResult(ok=False, error="catalog_unavailable")
 
 
-def recalled_offers(index: Path, sources: list[str]) -> ToolResult:
-    """Resolve citations from an earlier answer locally; trust only an exact source match."""
-    rows = []
-    for url in dict.fromkeys(sources[:3]):
-        slug = urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]
-        offer_id = slug.rsplit("-", 1)[-1]
-        if not offer_id.isdecimal():
-            continue
-        hit = get_offer(index, offer_id)
-        if hit.ok:
-            rows.extend(row for row in hit.data if row["source"] == url)
-    return _results(rows)
-
-
 def search_store_knowledge(index: Path, query: str, *, limit: int = 3) -> ToolResult:
     """Return short articles from the indexed store help pages."""
     if not 1 <= limit <= 5 or len(query) > 500:

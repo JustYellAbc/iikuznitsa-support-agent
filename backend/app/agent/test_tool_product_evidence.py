@@ -15,7 +15,14 @@ from tests.test_t32_agent import tool
 from app.agent.handoff import ASK_DETAIL, offers_operator
 from app.agent.test_catalog_selection import index as index
 from app.agent.test_catalog_selection import say
-from app.agent.tool_agent import Answer, Evidence, Recall, catalog_feedback, checked_answer, recall_message
+from app.agent.tool_agent import (
+    Answer,
+    Evidence,
+    Recall,
+    catalog_feedback,
+    checked_answer,
+    recall_message,
+)
 from app.config import get_settings
 
 
@@ -318,3 +325,37 @@ def test_same_catalog_ref_is_sent_in_full_again_when_the_record_changes():
     assert catalog_feedback({"results": [row]}, shown)["results"][0]["already_shown"]
     changed = {**row, "seatLimit": ["20"]}
     assert catalog_feedback({"results": [changed]}, shown)["results"][0]["seatLimit"] == ["20"]
+
+
+def test_recall_matching_requires_the_requested_subject_even_when_a_generic_word_matches():
+    history = [SimpleNamespace(role="client", text="лицензия Windows")]
+    with pytest.raises(ValueError):
+        recall_message(
+            history, Recall(author="customer", which="matching", words="лицензия Oracle", quote_to_customer=True)
+        )
+
+
+def test_previous_clarification_citation_is_not_price_evidence_for_new_product(stand_api, provider, index):
+    with closing(sqlite3.connect(index)) as db:
+        db.execute(
+            "UPDATE offers SET id='321', source='https://store.softline.ru/vendor/paperdesk-321/' WHERE id='desk'"
+        )
+        db.commit()
+    replies, requests = provider
+    replies.extend(
+        [
+            tool("respond", kind="clarify", question="Вам нужен PaperDesk Pro или PaperDesk Basic?"),
+            tool("search_catalog", query="PaperDesk Pro"),
+            tool("get_offer", offer_id="321"),
+            tool("respond", kind="product", field="summary", refs=["r1"]),
+            tool("respond", kind="product", field="price", refs=["r1"]),
+            tool("respond", kind="clarify", question="Какая редакция Windows нужна?"),
+        ]
+    )
+    cid = stand_api.new_conversation()
+    say(stand_api, cid, "Нужна лицензия PaperDesk")
+    pending = say(stand_api, cid, "PaperDesk")
+    assert pending[-1]["sources"] and not any(e["type"] == "products" for e in pending)
+    events = say(stand_api, cid, "А сколько стоит Windows?")
+    assert len(requests) == 6 and "Windows" in events[-1]["text"]
+    assert "790" not in events[-1]["text"] and not any(e["type"] == "products" for e in events)

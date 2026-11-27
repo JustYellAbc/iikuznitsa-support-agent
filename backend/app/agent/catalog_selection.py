@@ -374,21 +374,12 @@ def select(index: Path, selection: Selection) -> Result:
         }
 
     # Known constraints are applied before deciding what still needs clarification.
+    buyer_restriction = None
     if selection.buyer:
         buyers = values(BUYER)
         if buyers and selection.buyer not in buyers:
-            source = Source(url=source.url, label="В карточках указан тип покупателя: " + ", ".join(sorted(buyers)))
+            buyer_restriction = Source(url=source.url, label="В карточках указан тип покупателя: " + ", ".join(sorted(buyers)))
         rows = [r for r in rows if selection.buyer in r["params"].get(BUYER, [])]
-    if selection.kind:
-        if selection.kind == "Продление" and not correction and selection.kind not in values(KIND):
-            conflicts = [
-                Source(url=r["source"], label=r["name"])
-                for r in rows
-                if renewal_type_conflict(r["name"], r["params"].get(KIND))
-            ][:2]
-            if conflicts:
-                return result(renewal_review(conflicts), sources=conflicts)
-        rows = [r for r in rows if selection.kind in r["params"].get(KIND, [])]
     if selection.organization:
         rows = [r for r in rows if selection.organization in r["params"].get("Тип организации", [])]
     if selection.platforms:
@@ -431,13 +422,28 @@ def select(index: Path, selection: Selection) -> Result:
                 lb.isdecimal() and int(lb) <= selection.seats for lb in r["params"].get("К-во пользователей от", [])
             )
         ]
-        if sized:
-            smallest = min(n for n, _ in sized)
-            rows = [r for n, r in sized if n == smallest]
-        else:
-            rows = []
+        capacity = {}
+        for bound, row in sized:
+            key = row["id"]
+            capacity[key] = min(bound, capacity.get(key, bound))
+        rows = [row for row in rows if row["id"] in capacity]
+    if selection.kind == "Продление" and selection.expired is not None:
+        rows = [r for r in rows if ("просроч" in r["name"].casefold()) == selection.expired]
+    if selection.kind:
+        if selection.kind == "Продление" and not correction and selection.kind not in values(KIND):
+            conflicts = [
+                Source(url=r["source"], label=r["name"])
+                for r in rows
+                if renewal_type_conflict(r["name"], r["params"].get(KIND))
+            ][:2]
+            if conflicts:
+                return result(renewal_review(conflicts), sources=conflicts)
+        rows = [r for r in rows if selection.kind in r["params"].get(KIND, [])]
+    if rows and selection.seats is not None:
+        smallest = min(capacity[r["id"]] for r in rows)
+        rows = [r for r in rows if capacity[r["id"]] == smallest]
     if not rows:
-        return result(OFFER_HELP, sources=[source])
+        return result(OFFER_HELP, sources=[buyer_restriction] if buyer_restriction else [])
     source = Source(url=rows[0]["source"], label=rows[0]["name"])
     if correction:
         alternative = result(
@@ -472,13 +478,8 @@ def select(index: Path, selection: Selection) -> Result:
             questions.append(
                 "Какой нужен срок лицензии? Варианты: " + ", ".join(sorted(values("Срок действия"))[:6]) + "."
             )
-    expired = {r["id"] for r in rows if "просроч" in r["name"].casefold()}
-    if selection.kind == "Продление":
-        if selection.expired is not None:
-            rows = [r for r in rows if (r["id"] in expired) == selection.expired]
-            if not rows:
-                return result(OFFER_HELP, sources=[source])
-        elif expired and len(expired) < len(rows):
+    if selection.kind == "Продление" and selection.expired is None:
+        if len({"просроч" in r["name"].casefold() for r in rows}) > 1:
             questions.append("Подписка ещё действует или уже истекла?")
     if questions:
         pending = result(prefix + " ".join(questions), sources=[source])

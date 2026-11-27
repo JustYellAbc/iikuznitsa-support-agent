@@ -107,8 +107,7 @@ def recall_message(history, args):
         words = set(re.findall(r"\w+", args.words.casefold()))
         if not words:
             raise ValueError("Укажи ключевые слова прежней реплики или выбери first/last.")
-        ranked = [(len(words.intersection(re.findall(r"\w+", m.text.casefold()))), i, m) for i, m in entries]
-        entries = [(i, m) for score, i, m in sorted(ranked, key=lambda item: item[:2], reverse=True) if score]
+        entries = [(i, m) for i, m in reversed(entries) if words.issubset(re.findall(r"\w+", m.text.casefold()))]
     if not entries:
         raise ValueError("В истории этого диалога такой реплики не найдено.")
     i, m = entries[-1] if args.which == "last" else entries[0]
@@ -251,7 +250,7 @@ class Evidence:
                 ref = f"r{len(self.rows) + 1}"
             if "body" in row:
                 row = {**row, "body": scrub_pii(row["body"])[:1800]}
-            complete_offer = tool in {"get_offer", "recalled_offers", "referenced_offers"} or detailed_search
+            complete_offer = tool in {"get_offer", "referenced_offers"} or detailed_search
             if ref not in self.detailed or complete_offer:
                 self.rows[ref] = row
             if complete_offer:
@@ -779,21 +778,6 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
             )
         if ABOUT_ASSISTANT.fullmatch(" ".join(text.casefold().strip(" .!?").split())):
             return CAPABILITIES, "answer", [], [], None
-        if len(discovery) > 1 and not previous and kb_retry is None and index.is_file():
-            sources = next(
-                (m.sources for m in reversed(history[-2 * len(discovery) :]) if m.role == "agent" and m.sources), []
-            )
-            if sources:
-                recent = await read("recalled_offers", {}, t31.recalled_offers, index, sources)
-                if recent["results"]:
-                    messages[-1]["content"] += "\n" + serialize(
-                        {
-                            "previously_discussed_candidates": recent["results"],
-                            "usage": "Это карточки из предыдущего ответа. Если покупатель продолжает этот подбор, "
-                            "используй refs и актуальные условия. При смене товара начни новый подбор. "
-                            "Упоминание карточки не означает согласия на покупку.",
-                        }
-                    )
         turns = discovery_context(history, text)
         capacities = followup_capacities(text) if len(turns) > 1 and kb_retry is None else None
         if capacities is not None and history[-1].sources:
