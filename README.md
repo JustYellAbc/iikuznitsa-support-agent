@@ -7,10 +7,10 @@
 ```sh
 cp .env.example .env        # заполнить OPERATOR_PASSWORD; для реального LLM: MOCK_LLM=false и LLM_API_KEY
 docker compose up -d --build
-./scripts/smoke_test.sh     # BASE_URL=https://176-53-253-178.sslip.io для стенда
+./scripts/smoke_test.sh     # BASE_URL=https://139-100-217-243.sslip.io для стенда
 ```
 
-Swagger открывается по `/api/docs`. Первичная настройка сервера (Ubuntu 26.04): `sudo ./deploy/setup_server.sh`.
+На Linux без `setup_server.sh` заранее создайте папку данных для пользователя контейнера (`uid 1000`): `mkdir -p data && sudo chown -R 1000:1000 data`. Swagger открывается по `/api/docs`. Первичная настройка сервера (Ubuntu 26.04): `sudo ./deploy/setup_server.sh`.
 
 ### Как проверить публикацию знания (T15)
 
@@ -21,12 +21,12 @@ Swagger открывается по `/api/docs`. Первичная настро
 
 При смене домена задайте `PUBLIC_BASE_URL` равным внешнему HTTPS-адресу этого экземпляра, чтобы ссылки в чате открывали его базу знаний.
 
-Локально без Docker (Python 3.12+):
+Локально без Docker (Python 3.12–3.13; на минимальном Linux для PDF КП нужны системные шрифты `fonts-dejavu-core` или `fonts-liberation`):
 
 ```sh
 uv venv -p 3.12 .venv && uv pip install -p .venv -r backend/requirements-dev.txt
 .venv/bin/pytest
-cd backend && ../.venv/bin/uvicorn app.main:app --reload   # .env читается из текущей папки
+PYTHONPATH=.:backend .venv/bin/uvicorn app.main:app --reload
 ```
 
 С `MOCK_LLM=true` стенд работает без ключа и без трат: ответ модели заменяет заглушка, токены оцениваются по длине текста, стоимость считается по прайсу из `.env`.
@@ -71,7 +71,7 @@ API следует контракту T04 ([contracts/t04](contracts/t04/README.
 
 Каждый вызов LLM проходит через `llm_call()`. Обёртка проверяет дневной лимит `DAILY_BUDGET_RUB` и пишет токены и стоимость в рублях в `llm_calls`. Сводка доступна в `GET /api/v1/manager/telemetry`, шаги агента — в `GET /api/v1/manager/conversations/{id}/trace`.
 
-Контрактный тест `tests/test_t04_examples.py` прогоняет примеры T04 (`c-tender`, `c-help`, `c-price`, `c-need`) через настоящий API и проверяет ответы схемой `contracts/t04/openapi.yaml`. Блок КП и документов (`c-docs`) ещё не реализован: `confirm_quote`, `request_document` и `downloadDocument` отвечают 404.
+Контрактный тест `tests/test_t04_examples.py` прогоняет примеры T04 (`c-tender`, `c-help`, `c-price`, `c-need`) через настоящий API и проверяет ответы схемой `contracts/t04/openapi.yaml`. Выпуск КП (T16) и демо-счёта (T29: `confirm_quote`, `request_document`, `downloadDocument`) проверяется в `tests/test_quotes.py`, `tests/test_quote_review.py` и `tests/test_demo_invoices.py`.
 
 Контуры, инварианты и стыки описаны в [AGENTS.md](AGENTS.md).
 
