@@ -125,10 +125,14 @@ async def close_http_client() -> None:
         _client = None
 
 
-async def _post_chat(payload: dict[str, Any]) -> dict[str, Any]:
+async def _post_chat(payload: dict[str, Any], session_id: str | None = None) -> dict[str, Any]:
     s = get_settings()
     url = s.llm_base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {s.llm_api_key}"} if s.llm_api_key else {}
+    if s.llm_base_url.rstrip("/") == "https://opencode.ai/inference/go/openai/v1":
+        headers["User-Agent"] = "SoftlineSupportLab/0.1"
+        if session_id:
+            headers["x-opencode-session"] = session_id
     last_error: Exception | None = None
     for attempt in range(2):
         try:
@@ -194,7 +198,7 @@ async def llm_call(
         payload["max_tokens"] = max_tokens
 
     started = time.perf_counter()
-    data = _mock_completion(messages, model) if s.mock_llm else await _post_chat(payload)
+    data = _mock_completion(messages, model) if s.mock_llm else await _post_chat(payload, session_id)
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     try:

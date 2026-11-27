@@ -25,6 +25,8 @@ RUN pip install -r /app/requirements.txt
 COPY backend/app /app/app
 COPY scripts /app/scripts
 COPY catalog /app/catalog
+COPY evals/t35/skills.md /app/evals/t35/skills.md
+COPY eval/pii.py /app/eval/pii.py
 
 RUN useradd --uid 1000 --create-home app && mkdir -p /app/data && chown app:app /app/data
 USER app

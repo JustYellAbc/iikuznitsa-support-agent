@@ -99,6 +99,13 @@ async def run_turn(
             text=text,
             purpose="clarification",
         )
+    if get_settings().agent_engine == "tools" and action_type == "message":
+        # Keep explicit handoffs on T12, including a change of terms in the same message.
+        mandatory = route_action(history, user_text, [], action_type=action_type, finding=finding)
+        if mandatory is None:
+            from app.agent.tool_agent import run_tool_turn
+
+            return await run_tool_turn(session, history, user_text, products, emit_step)
     # Approved procedures can interrupt an active selection. Commercial facts and
     # mandatory handoffs always keep their own source, regardless of punctuation.
     if (
