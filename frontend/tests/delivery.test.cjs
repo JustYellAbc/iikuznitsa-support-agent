@@ -91,6 +91,9 @@ test("Виджет Т09 на примерах контракта", async t => {
       ["380385", "Microsoft Windows 11 Pro FQC-10572, электронный ключ", 3044800, "Цена электронного ключа: 30 448 ₽"],
       ["460481", "ООО ПКФ «Информ-Сервис» ПК ИС Заготовка 36и6 (лицензия), ПК ИС Заготовка 36и6 (комплект на 3 пользователя)", 10459000, "Цена комплекта: 104 590 ₽"],
       ["61557", "SunRav Software BookOffice (лицензии), Лицензия на 1 ПК", 490000, "Цена позиции: 4 900 ₽"],
+      ["204194", "ООО «МАКСИМА» МАКСИМА (базовый комплект лицензий),", 6000000, "Цена комплекта: 60 000 ₽"],
+      ["538468", "ООО «АВИ» Uvatron Lite (электронная лицензия на 1 устройство), Тип поставки: Электронный ключ", 2999000, "Цена электронного ключа: 29 990 ₽"],
+      ["accessory", "Оборудование (для электронного ключа)", 10000, "Цена позиции: 100 ₽"],
     ];
     const products = cases.map(([offerId, name, unitPriceKopecks]) => ({ offerId, name, unitPriceKopecks,
       priceState: "listed", source: {url: "https://example.org/" + offerId, label: "Карточка"} }));
@@ -122,9 +125,8 @@ test("Виджет Т09 на примерах контракта", async t => {
     await page.route(submitUrl, route => route.fulfill({status: 202, json: {actionId: "a-test"}}));
     const sent = page.waitForRequest(submitUrl);
     await page.getByRole("button", {name: "Подтвердить выбор и получить КП"}).click();
-    assert.deepEqual((await sent).postDataJSON().items, [
-      {offerId: "380385", packages: 2}, {offerId: "460481", packages: 4}, {offerId: "61557", packages: 2},
-    ]);
+    const expectedItems = products.map(({offerId}) => ({offerId, packages: offerId === "460481" ? 4 : 2}));
+    assert.deepEqual((await sent).postDataJSON().items, expectedItems);
   });
   await t.test("Подборки открывают собственные позиции, изменить можно только актуальный расчёт", async t => {
     const page = await browser.newPage();

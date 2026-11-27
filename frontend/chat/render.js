@@ -33,8 +33,10 @@ function sourceLink(source, label = source.label) {
 // T04 exposes the catalogue name but no separate sale unit.
 function priceLabel(name) {
   const parts = name.toLowerCase().split(/[,;()]/).map(part => part.trim());
-  if (parts.some(part => /^комплект (?:лицензий$|(?:из |на )?\d+ (?:лицензи|пользовател))/.test(part))) return "Цена комплекта";
-  if (parts.includes("электронный ключ")) return "Цена электронного ключа";
+  const kit = /^(?:базовый\s+)?комплект\s+(?:лицензий(?:\s|$)|(?:из\s+|на\s+)?\d+\s+(?:лицензи|пользовател))/;
+  const key = /^(?:тип поставки:\s*)?электронный ключ(?:\s+на\s+\d+\s+рабоч(?:ее место|их мест[а]?))?$/;
+  if (parts.some(part => kit.test(part))) return "Цена комплекта";
+  if (parts.some(part => key.test(part))) return "Цена электронного ключа";
   return "Цена позиции";
 }
 
