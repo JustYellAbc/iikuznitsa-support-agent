@@ -1,5 +1,6 @@
 """Render the dated revision in the partner's six-column proposal format."""
 
+from datetime import date
 from decimal import Decimal
 from functools import lru_cache
 from io import BytesIO
@@ -35,8 +36,9 @@ def money(value: int | None) -> str:
     return f"{Decimal(value) / 100:,.2f}".replace(",", " ").replace(".", ",") if value is not None else PENDING
 
 
-def render(snapshot: Snapshot) -> bytes:
+def render(snapshot: Snapshot, *, invoice_number: str | None = None) -> bytes:
     regular, bold = fonts()
+    title = "Демо-счёт" if invoice_number else "Коммерческое предложение"
 
     def para(value, size=9, strong=False):
         return Paragraph(
@@ -59,7 +61,7 @@ def render(snapshot: Snapshot) -> bytes:
         rightMargin=17 * mm,
         topMargin=15 * mm,
         bottomMargin=18 * mm,
-        title="Коммерческое предложение",
+        title=title,
     )
     q = snapshot.quote
     letterhead = Image(
@@ -68,7 +70,9 @@ def render(snapshot: Snapshot) -> bytes:
     recipient = [
         para(f"Куда: {snapshot.customer.company}", 10, True),
         para(f"ИНН {snapshot.customer.inn}   КПП {snapshot.customer.kpp}"),
-        para(f"Исх. № {q.quoteId.removeprefix('q_')[:12]} от {snapshot.dated:%d.%m.%Y}"),
+        para(
+            f"{'КП' if invoice_number else 'Исх.'} № {q.quoteId.removeprefix('q_')[:12]} от {snapshot.dated:%d.%m.%Y}"
+        ),
     ]
     sender = [
         letterhead,
@@ -82,10 +86,19 @@ def render(snapshot: Snapshot) -> bytes:
     story = [
         heading,
         Spacer(1, 8 * mm),
-        para("Коммерческое предложение", 19, True),
-        para(f"{'Черновик · ' if q.state == 'needs_review' else ''}Версия {q.revision}"),
+        para(title, 19, True),
+        para(f"№ {invoice_number} от {date.today():%d.%m.%Y}", 10, True) if invoice_number else Spacer(1, 1),
+        para(
+            f"По подтверждённому КП · версия {q.revision}"
+            if invoice_number
+            else f"{'Черновик · ' if q.state == 'needs_review' else ''}Версия {q.revision}"
+        ),
         Spacer(1, 4 * mm),
-        para("Уважаемый заказчик! Предлагаем вашему вниманию следующие позиции."),
+        para(
+            "Демонстрационный документ. Оплата не предусмотрена."
+            if invoice_number
+            else "Уважаемый заказчик! Предлагаем вашему вниманию следующие позиции."
+        ),
         Spacer(1, 3 * mm),
     ]
     header = ("Артикул", "Наименование", "Кол-во, уп.", "Цена, руб.", "Сумма, руб.", "В т.ч. НДС, руб.")

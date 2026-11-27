@@ -279,7 +279,14 @@ class DocumentData(Contract):
     document: Document
 
 
-EventData = Annotated[MessageData | ProductsData | HandoffData | QuoteData | DocumentData, Field(discriminator="type")]
+class FailedActionData(Contract):
+    type: Literal["action_failed"] = "action_failed"
+    error: Error
+
+
+EventData = Annotated[
+    MessageData | ProductsData | HandoffData | QuoteData | DocumentData | FailedActionData, Field(discriminator="type")
+]
 
 
 class Event(Contract):

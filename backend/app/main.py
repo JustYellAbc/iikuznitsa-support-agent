@@ -12,7 +12,7 @@ from app.core.errors import install_error_handlers
 from app.core.llm import close_http_client
 from app.core.security import RateLimitMiddleware
 from app.db.database import close_db, init_db
-from app.services import price_policy, turn_service
+from app.services import invoices, price_policy, turn_service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -25,8 +25,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     s.quotes_dir.mkdir(parents=True, exist_ok=True)
     await init_db(s.db_path)
     try:
+        await invoices.resume_pending()
         yield
     finally:
+        await invoices.wait_idle()
         await turn_service.wait_idle()
         await close_http_client()
         await close_db()

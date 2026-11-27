@@ -5,6 +5,7 @@ import json
 import re
 from datetime import date
 
+from app.agent.handoff import handoff_reason
 from app.agent.quote_calculation import (
     Conditions,
     Customer,
@@ -41,6 +42,11 @@ BUYER_FIELDS = (
     r"\s*[,;]\s*ИНН\s*[: ]\s*([0-9]{10})\s*[,; ]+\s*КПП\s*[: ]\s*([0-9]{4}[0-9A-Z]{2}[0-9]{3})"
 )
 CHANGE_QUOTE = r"(?:измените|поменяйте|пересчитайте|обновите|переделайте)\s+(?:наше\s+)?(?:кп|коммерческое предложение)"
+QUANTITY_EDIT = re.compile(
+    r"\b(?:вместо|изменим|поменяем|замените|пересчитайте|измените|поменяйте|бер[её]м|возьм[её]м)\b"
+    r"|\b(?:теперь|нужно|надо)\s+(?:по\s+|нуж\w*\s+|\d|одн|дв[аеу]|тр[иеё]|четыр|пят|шес|сем|вос|дев|десят)",
+    re.I,
+)
 
 
 async def latest(cid):
@@ -99,13 +105,7 @@ async def invalidate_exception(conn, handoff):
         not handoff.products
         or {p.offerId for p in handoff.products}.intersection(d.product.offerId for d in read(row).details)
     ):
-        await conn.execute(
-            "UPDATE quote_revisions SET reselect=1 WHERE quote_id=? AND revision=?", (row["quote_id"], row["revision"])
-        )
-        await conn.execute(
-            "DELETE FROM drafts WHERE conversation_id=? AND action_id=? AND status='pending'",
-            (handoff.conversationId, row["action_id"]),
-        )
+        await invalidate_revision(conn, handoff.conversationId, row["revision"])
 
 
 async def apply_deal_conditions(cid, customer, details):
@@ -213,18 +213,22 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None, select
     return await repo.append_events(cid, action_id, [d.model_dump(mode="json") for d in data], conn=conn)
 
 
-async def reset_selection(conn, cid, revision):
+async def invalidate_revision(conn, cid, revision):
     await conn.execute("UPDATE quote_revisions SET reselect=1 WHERE conversation_id=? AND revision=?", (cid, revision))
+    await conn.execute(
+        "DELETE FROM drafts WHERE conversation_id=? AND status='pending' AND action_id="
+        "(SELECT action_id FROM quote_revisions WHERE conversation_id=? AND revision=?)",
+        (cid, cid, revision),
+    )
+
+
+async def reset_selection(conn, cid, revision):
+    await invalidate_revision(conn, cid, revision)
     await conn.execute(
         "INSERT INTO quote_selection_resets(conversation_id,after_seq) "
         "SELECT ?,COALESCE(MAX(seq),0) FROM events WHERE conversation_id=? "
         "ON CONFLICT(conversation_id) DO UPDATE SET after_seq=excluded.after_seq",
         (cid, cid),
-    )
-    await conn.execute(
-        "DELETE FROM drafts WHERE conversation_id=? AND status='pending' AND action_id="
-        "(SELECT action_id FROM quote_revisions WHERE conversation_id=? AND revision=?)",
-        (cid, cid, revision),
     )
 
 
@@ -239,6 +243,44 @@ async def selectable_products(cid):
         (cid, cid),
     )
     return {row["id"]: row["name"] for row in rows}
+
+
+async def invalidate_changed_selection(conn, cid):
+    """A published new selection cannot revive an earlier acceptance, even after A -> B -> A."""
+    row = await get_db().fetchone(
+        "SELECT revision,snapshot,reselect FROM quote_revisions WHERE conversation_id=? ORDER BY revision DESC LIMIT 1",
+        (cid,),
+    )
+    if row and not row["reselect"]:
+        quote = Snapshot.model_validate_json(row["snapshot"]).quote
+        selected = {p["offerId"] for p in await repo.last_products(cid)}
+        if selected != {line.offerId for line in quote.lines}:
+            await invalidate_revision(conn, cid, row["revision"])
+
+
+async def clarification(conn, cid, text, reply):
+    action_id = repo.new_id("a")
+    messages = [
+        MessageData(author="customer", purpose="input", text=text, sources=[]),
+        MessageData(author="agent", purpose="clarification", text=reply, sources=[]),
+    ]
+    written = await repo.append_events(cid, action_id, [m.model_dump(mode="json") for m in messages], conn=conn)
+    result = await repo.record_quote_response(conn, 202, {"conversationId": cid, "actionId": action_id})
+    return result, written
+
+
+async def clarify_quantity(cid, current, text):
+    async with get_db().tx() as conn:
+        await require_published(current)
+        await invalidate_revision(conn, cid, current["revision"])
+        result, written = await clarification(
+            conn,
+            cid,
+            text,
+            "Уточните новые позиции и количество. Откройте «Изменить КП», выберите строки и укажите число упаковок.",
+        )
+    events.publish(cid, written)
+    return result
 
 
 async def from_message(cid: str, text: str):
@@ -260,7 +302,9 @@ async def from_message(cid: str, text: str):
         return await prepare(cid, req, customer_message=text, seats=int(seats[1]))
     quantity = re.fullmatch(
         r"(?:теперь\s+|(?:измените|поменяйте)\s+(?:количество\s+)?на\s+)?"
-        r"([1-9]\d{0,4})\s+упаков(?:ка|ки|ок|ку)[.! ]*",
+        r"(?:по\s+)?([1-9]\d{0,5})\s+упаков(?:ка|ки|ок|ку)"
+        r"(?:\s+(?:для\s+)?(кажд(?:ой|ого)|обеих|обоих|всех)"
+        r"(?:\s+(?:позиций|позиции|товаров|товара|строк|строки))?)?[.! ]*",
         text.strip(),
         re.I,
     )
@@ -277,12 +321,23 @@ async def from_message(cid: str, text: str):
             async with get_db().tx() as conn:
                 if current := await latest(cid):
                     await reset_selection(conn, cid, current["revision"])
+        elif (
+            QUANTITY_EDIT.search(text)
+            and re.search(r"\b(?:упаков\w*|пач\w*|количеств\w*|мест[ао]?|пользовател\w*|штук\w*|шт)\b", text, re.I)
+            and (current := await latest(cid))
+        ):
+            if handoff_reason(text.casefold()):
+                # Keep the entire request for T12, including the reason and new quantity.
+                async with get_db().tx() as conn:
+                    await invalidate_revision(conn, cid, current["revision"])
+                return None
+            return await clarify_quantity(cid, current, text)
         return None
     products = await repo.last_products(cid)
-    if len(products) != 1:
-        return None
     current = await latest(cid)
     if order:
+        if len(products) != 1:
+            return None
         packs, company, inn, kpp = order.groups()
         customer = Customer(company=company, inn=inn, kpp=kpp.upper())
         count = int(packs or 1)
@@ -290,10 +345,23 @@ async def from_message(cid: str, text: str):
         if not current:
             return None
         old = read(current)
-        if len(old.details) != 1 or old.details[0].product.offerId != products[0]["offerId"]:
-            return None
-        count = int(quantity[1])
-        customer = old.customer
+        if (
+            current["reselect"]
+            or {d.product.offerId for d in old.details} != {p["offerId"] for p in products}
+            or len(old.details) > 1
+            and not quantity[2]
+            or int(quantity[1]) > 100000
+        ):
+            return await clarify_quantity(cid, current, text)
+        return await prepare(
+            cid,
+            ProposalRequest(
+                customer=old.customer,
+                items=[Item(offerId=d.product.offerId, packages=int(quantity[1])) for d in old.details],
+                baseRevision=old.quote.revision,
+            ),
+            customer_message=text,
+        )
     req = ProposalRequest(
         customer=customer,
         items=[Item(offerId=products[0]["offerId"], packages=count)],
@@ -334,26 +402,20 @@ async def prepare_revision(conn, cid, request, customer_message, seats):
         )
     except NoSeatVariant:
         await reset_selection(conn, cid, revision)
-        action_id = repo.new_id("a")
-        written = await repo.append_events(
+        return await clarification(
+            conn,
             cid,
-            action_id,
-            [
-                MessageData(author="customer", purpose="input", text=customer_message, sources=[]).model_dump(
-                    mode="json"
-                ),
-                MessageData(
-                    author="agent",
-                    purpose="clarification",
-                    text=f"На {seats} мест нужно заново подобрать варианты. "
-                    "Уточните товар, затем подтвердите новые позиции в форме КП.",
-                    sources=[],
-                ).model_dump(mode="json"),
-            ],
-            conn=conn,
+            customer_message,
+            f"На {seats} мест нужно заново подобрать варианты. "
+            "Уточните товар, затем подтвердите новые позиции в форме КП.",
         )
-        result = await repo.record_quote_response(conn, 202, {"conversationId": cid, "actionId": action_id})
-        return result, written
+    except ApiError as exc:
+        if not customer_message or not current or exc.code != "invalid_input":
+            raise
+        await invalidate_revision(conn, cid, revision)
+        return await clarification(
+            conn, cid, customer_message, f"{exc.message} Пересмотрите позиции в форме «Изменить КП»."
+        )
     await apply_deal_conditions(cid, request.customer, details)
     old = read(current) if current else None
     if old:
@@ -419,26 +481,30 @@ def current_quote(row, qid, revision):
     return read(row)
 
 
-async def quote_action(cid, action: ConfirmQuoteAction | RequestDocumentAction):
+async def actionable_quote(cid, qid, revision):
     from app.services.turn_service import is_busy
 
     if is_busy(cid):
         raise ApiError(409, "agent_busy", "Дождитесь проверки новых условий в чате.")
+    row = await latest(cid)
+    snapshot = current_quote(row, qid, revision)
+    await require_published(row)
+    await check_exceptions(cid, [d.product.offerId for d in snapshot.details])
+    if row["reselect"]:
+        raise ApiError(409, "stale_revision", "Покупатель изменил потребность. Требуется актуальный подбор.")
+    q = snapshot.quote
+    if q.state == "needs_review" or (q.terms.validUntil and q.terms.validUntil < date.today().isoformat()):
+        raise ApiError(409, "terms_pending", "Для выпуска документа требуется согласовать действующие условия.")
+    return row, snapshot
+
+
+async def quote_action(cid, action: ConfirmQuoteAction | RequestDocumentAction):
     async with get_db().tx() as conn:
-        row = await latest(cid)
-        snapshot = current_quote(row, action.quoteId, action.revision)
-        await require_published(row)
-        await check_exceptions(cid, [d.product.offerId for d in snapshot.details])
-        if row["reselect"]:
-            raise ApiError(409, "stale_revision", "Покупатель изменил потребность. Требуется актуальный подбор.")
+        row, snapshot = await actionable_quote(cid, action.quoteId, action.revision)
         q = snapshot.quote
-        if q.state == "needs_review" or (q.terms.validUntil and q.terms.validUntil < date.today().isoformat()):
-            raise ApiError(409, "terms_pending", "Для выпуска документа требуется согласовать действующие условия.")
         if isinstance(action, RequestDocumentAction):
             if action.kind != "quote_pdf":
-                if q.state != "confirmed":
-                    raise ApiError(409, "confirmation_required", "Подтвердите текущую ревизию КП.")
-                raise not_found("Демо-счёт ещё не выпущен.")
+                raise invalid_input("Ожидался запрос PDF коммерческого предложения.")
             doc = document(row)
             if row["issued_action"]:
                 return await repo.record_quote_response(conn, 200, doc.model_dump(mode="json"))

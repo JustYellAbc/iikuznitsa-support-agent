@@ -178,10 +178,11 @@ def _event(row: aiosqlite.Row) -> dict[str, Any]:
 
 
 async def list_events(conversation_id: str, after: int, limit: int = EVENTS_PAGE) -> tuple[list[dict], bool]:
-    rows = await get_db().fetchall(
-        "SELECT * FROM events WHERE conversation_id = ? AND seq > ? ORDER BY seq LIMIT ?",
-        (conversation_id, after, limit + 1),
-    )
+    async with get_db().committed_read():
+        rows = await get_db().fetchall(
+            "SELECT * FROM events WHERE conversation_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+            (conversation_id, after, limit + 1),
+        )
     return [_event(r) for r in rows[:limit]], len(rows) > limit
 
 

@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS quote_selection_resets (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
     after_seq INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS demo_invoices (
+    quote_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    document_id TEXT NOT NULL UNIQUE, action_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+    pdf BLOB,
+    PRIMARY KEY (quote_id, revision),
+    FOREIGN KEY (quote_id, revision) REFERENCES quote_revisions(quote_id, revision)
+);
 CREATE TABLE IF NOT EXISTS quote_handoffs (
     handoff_id TEXT PRIMARY KEY REFERENCES handoffs(id),
     quote_id TEXT NOT NULL, revision INTEGER NOT NULL, offer_id TEXT NOT NULL,

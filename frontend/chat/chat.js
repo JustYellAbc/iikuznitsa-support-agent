@@ -202,7 +202,7 @@ async function submit(body) {
   try {
     const receipt = await request(base + "/" + encodeURIComponent(state.id) + "/actions", state.pending.key, body);
     if (denied) return;
-    if (body.type === "request_document" && receipt.documentId && receipt.quoteId === body.quoteId &&
+    if (body.type === "request_document" && receipt.documentId && receipt.kind === body.kind && receipt.quoteId === body.quoteId &&
         receipt.revision === body.revision && /^\/api\/v1\/documents\/[\w.-]+$/.test(receipt.url)) {
       state.receipt = null;
       const link = document.createElement("a"); link.href = receipt.url; link.download = ""; link.click();
