@@ -35,7 +35,8 @@
       <div class="actions"><button id="operator" type="button" hidden>Позвать оператора</button>
         <button id="quote-open" type="button" hidden>Подготовить КП</button></div>
       <label id="target-label" hidden>Кому отправить сообщение <select id="target"></select></label>
-      <form id="compose"><textarea id="message" rows="1" maxlength="8000" aria-label="Ваше сообщение" placeholder="Ваше сообщение"></textarea><button id="send" class="icon" aria-label="Отправить сообщение">↑</button></form>
+      <form id="compose"><textarea id="message" rows="1" aria-label="Ваше сообщение" aria-describedby="counter" placeholder="Ваше сообщение"></textarea><button id="send" class="icon" aria-label="Отправить сообщение">↑</button></form>
+      <div id="counter">0 / 500</div>
       <div id="feedback" role="status"></div><button id="retry" hidden>Повторить</button>
     </footer>
   </section>

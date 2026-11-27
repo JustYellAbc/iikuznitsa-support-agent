@@ -29,7 +29,6 @@ class Settings(BaseSettings):
     rate_limit_ip_per_min: int = 60
     rate_limit_session_msg_per_min: int = 10
     max_turns_per_session: int = 30
-    max_message_chars: int = 4000
 
     operator_user: str = "manager"
     operator_password: str = ""

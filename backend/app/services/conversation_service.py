@@ -27,7 +27,7 @@ from app.contracts.t04 import (
     RequestOperatorAction,
     Source,
 )
-from app.core import events
+from app.core import events, prefilter
 from app.core.auth import Principal
 from app.core.errors import ApiError, invalid_input, not_found
 from app.db import repository
@@ -139,8 +139,6 @@ async def _customer_message(conv: repository.Conversation, action: MessageAction
     text = action.text.strip()
     if not text:
         raise invalid_input("Пустое сообщение.")
-    if len(text) > s.max_message_chars:
-        raise invalid_input(f"Сообщение длиннее {s.max_message_chars} символов.")
 
     action_id = repository.new_id("a")
     if action.handoffId is not None:
@@ -162,14 +160,48 @@ async def _customer_message(conv: repository.Conversation, action: MessageAction
             "rate_limited",
             "Достигнут лимит сообщений в диалоге. Дождитесь ответа оператора или начните новый диалог.",
         )
+    if prefilter.role_override(text):
+        return await _decline_role_override(cid, action_id, text)
     result = await quotes.from_message(cid, text)
     if result:
         return result
-    history = await repository.history_messages(cid)
+    history = prefilter.without_role_overrides(await repository.history_messages(cid))
     data = MessageData(author="customer", purpose="input", text=text, sources=[])
     await append(cid, action_id, [data.model_dump(mode="json")])
     turn_service.start_turn(conv.session, action_id, text, history)
     return 202, receipt(cid, action_id)
+
+
+async def _decline_role_override(cid: str, action_id: str, text: str) -> Result:
+    """Префильтр T33: попытка сменить роль не запускает ход агента, модель и пересчёт КП.
+
+    Требование скидки, своей цены или документа в такой реплике уходит менеджеру как особые условия:
+    одно открытое обращение на диалог, вопрос — текст покупателя.
+    """
+    escalate = prefilter.special_terms(text)
+    datas: list[Any] = [
+        MessageData(author="customer", purpose="input", text=text, sources=[]),
+        MessageData(author="agent", purpose="notice", text=prefilter.SPECIAL_TERMS_REPLY, sources=[])
+        if escalate
+        else MessageData(author="agent", purpose="clarification", text=prefilter.ROLE_OVERRIDE_REPLY, sources=[]),
+    ]
+    products = await _current_products(cid) if escalate else []
+    async with get_db().tx() as conn:
+        if escalate and await repository.find_open_handoff(cid, "special_terms") is None:
+            handoff = await repository.create_handoff(
+                cid, action_id, "special_terms", text, [p.model_dump(mode="json") for p in products], conn=conn
+            )
+            datas.append(HandoffData(handoff=handoff))
+        written = await repository.append_events(cid, action_id, [d.model_dump(mode="json") for d in datas], conn=conn)
+        result = await repository.record_quote_response(conn, 202, receipt(cid, action_id))
+    events.publish(cid, written)
+    return result
+
+
+async def _current_products(cid: str) -> list[Product]:
+    """Последние показанные карточки с актуальными ценой и доступностью из каталога."""
+    saved = [Product.model_validate(p) for p in await repository.last_products(cid)]
+    return await asyncio.to_thread(refresh_products, get_settings().data_dir / "private" / "catalog.sqlite3", saved)
 
 
 async def _request_operator(conv: repository.Conversation) -> Result:
@@ -180,10 +212,7 @@ async def _request_operator(conv: repository.Conversation) -> Result:
         if existing is not None:
             return 202, receipt(cid, existing.action_id)
         action_id = repository.new_id("a")
-        saved_products = [Product.model_validate(p) for p in await repository.last_products(cid)]
-        products = await asyncio.to_thread(
-            refresh_products, get_settings().data_dir / "private" / "catalog.sqlite3", saved_products
-        )
+        products = await _current_products(cid)
         question = OPERATOR_QUESTION
         history = await repository.history_messages(cid)
         if history and history[-1].role == "agent":

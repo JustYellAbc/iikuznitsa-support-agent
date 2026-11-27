@@ -7,6 +7,9 @@ const log = byId("log"), retry = byId("retry"), operator = byId("operator"), tar
 const storageKey = "softline.t09.conversation.v1";
 const base = "/api/v1/conversations";
 const newKey = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+// T33: the server counts Unicode code points of the sent text, not UTF-16 units; CRLF is one line break.
+const maxChars = 500;
+const charCount = text => Array.from(text.replace(/\r\n/g, "\n")).length;
 let state;
 try { state = JSON.parse(sessionStorage.getItem(storageKey)) || {}; } catch { state = {}; }
 function save() { sessionStorage.setItem(storageKey, JSON.stringify(state)); }
@@ -41,7 +44,12 @@ async function request(path, key, body) {
 
 function sync() {
   const locked = posting || denied || !state.id || Date.now() < waitUntil;
-  byId("send").disabled = locked || !message.value.trim();
+  const length = charCount(message.value.trim());
+  const tooLong = length > maxChars;
+  byId("counter").textContent = length + " / " + maxChars;
+  byId("counter").classList.toggle("over", tooLong);
+  message.setAttribute("aria-invalid", String(tooLong));
+  byId("send").disabled = locked || !message.value.trim() || tooLong;
   operator.hidden = denied || !operatorOffered || openHandoffs.size > 0;
   operator.disabled = locked || operator.hidden || Boolean(state.receipt);
   // After an ambiguous network error only replay the exact original command.
@@ -53,7 +61,8 @@ function sync() {
   retry.hidden = !(actionError || historyError);
   retry.textContent = denied ? "Начать новый диалог" : "Повторить";
   retry.disabled = posting || Date.now() < waitUntil || (denied && polling);
-  byId("feedback").textContent = actionError || historyError || (posting ? "Отправляем…" : state.receipt ? "Ожидаем ответ…" : "");
+  const shorten = tooLong ? "Сообщение длиннее " + maxChars + " символов (сейчас " + length + "). Сократите его, чтобы отправить." : "";
+  byId("feedback").textContent = shorten || actionError || historyError || (posting ? "Отправляем…" : state.receipt ? "Ожидаем ответ…" : "");
 }
 
 function updateHandoffs(handoff) {
@@ -226,7 +235,8 @@ async function submit(body) {
 
 function sendText() {
   const text = message.value.trim();
-  if (!text || byId("send").disabled) return;
+  // An over-long draft stays in the field untouched; the hint asks to shorten it.
+  if (!text || charCount(text) > maxChars || byId("send").disabled) { sync(); return; }
   const body = { type: "message", text };
   if (target.value) body.handoffId = target.value;
   submit(body);
