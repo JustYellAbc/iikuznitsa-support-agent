@@ -44,6 +44,11 @@ test("Виджет Т09 на примерах контракта", async t => {
     assert.match(await card("48093").innerText(), /Наличие требует подтверждения/);
     assert.match(await card("504").innerText(), /Цена по запросу/);
     assert.doesNotMatch(await card("504").innerText(), /₽/);
+    await page.locator("#log .handoff").waitFor();
+    for (const link of await cards.locator("a").all()) {
+      const href = await link.getAttribute("href");
+      assert.equal(await page.locator(`#log a[href="${href}"]`).count(), 1);
+    }
     assert.equal(await page.locator("#log .entry:has(.result) .quote-open").count(), 1);
     assert.equal(await page.locator("footer .quote-open").count(), 0);
     await page.route("**/quotes/current?*", route => route.fulfill({ json: {
@@ -56,6 +61,27 @@ test("Виджет Т09 на примерах контракта", async t => {
       assert.ok(await logo.evaluate(img => img.complete && img.naturalWidth > 0));
     }
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  });
+  await t.test("Статья остаётся рядом с подборкой, а новый ответ сохраняет свой источник", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    const steps = cases.find(item => item.id === "c-price").steps;
+    const batch = structuredClone(steps.find(step => step.operationId === "readEvents").response.events);
+    const reply = batch.find(e => e.data.author === "agent");
+    const article = {url: "https://support.softline.ru/kb/demo", label: "Как оформить заказ"};
+    reply.data.sources.push(article);
+    batch.push({...reply, seq: batch.at(-1).seq + 1, actionId: "later-turn",
+      data: {...reply.data, text: "Отдельный ответ", sources: [reply.data.sources[0]]}});
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({json:{events:batch.filter(e => e.seq > after),nextAfter:batch.at(-1).seq,hasMore:false}});
+    });
+    await page.route("**/events/stream?*", route => route.abort());
+    await page.goto(url);
+    await page.locator("#launch").click();
+    await page.getByText("Отдельный ответ", {exact:true}).waitFor();
+    assert.equal(await page.locator(`#log a[href="${article.url}"]`).count(), 1);
+    assert.equal(await page.locator(`#log a[href="${reply.data.sources[0].url}"]`).count(), 2);
   });
   await t.test("Подборки открывают собственные позиции, изменить можно только актуальный расчёт", async t => {
     const page = await browser.newPage();

@@ -131,7 +131,12 @@ function display(event) {
         updateHandoffs({...item,status:"resolved"});
     }
   }
-  const row = renderEvent(event, state.id, submit);
+  const cardLinks = new Set();
+  if (event.data.type === "message" && event.data.author === "agent" && event.data.sources.length) {
+    const cards = log.querySelectorAll(`[data-products-for="${CSS.escape(event.actionId)}"] .result a[href]`);
+    for (const link of cards) cardLinks.add(link.href);
+  }
+  const row = renderEvent(event, state.id, submit, cardLinks);
   log.append(row);
   quoteEvent(event.data, row);
   byId("welcome").hidden = true;

@@ -160,8 +160,8 @@ def product_from_row(row):
     )
 
 
-def product_line(row, field_name):
-    parts = [f"{row['name']} (артикул {row['offerId']})."]
+def product_line(row, field_name, *, compact=False):
+    parts = [f"Артикул {row['offerId']}." if compact else f"{row['name']} (артикул {row['offerId']})."]
     if field_name in {"summary", "price"}:
         kopecks = row["unitPriceKopecks"]
         if kopecks is None:
@@ -176,10 +176,26 @@ def product_line(row, field_name):
     if field_name == "availability" and not row.get("priceCaveat"):
         parts.append("В наличии по каталогу." if row["available"] else "Поставку нужно подтвердить.")
     if field_name in {"summary", "term"} and row["licenseTerm"]:
-        parts.append("Срок по карточке — " + row["licenseTerm"] + ".")
+        parts.append("Срок по карточке — " + row["licenseTerm"].rstrip(". ") + ".")
     if field_name in {"delivery", "edition", "platform", "licenseType"} and row.get(field_name):
         value = row[field_name]
         parts.append(", ".join(value) if isinstance(value, list) else value)
+    return " ".join(parts)
+
+
+def selection_summary(rows, seats):
+    parts = [f"Нашёл {len(rows)} позиции в каталоге."]
+    if seats and all(str(seats) in (row.get("seatLimit") or []) for row in rows):
+        parts.append(f"В каждой карточке указана лицензия на {seats} мест.")
+    if any(row["priceState"] == "on_request" for row in rows):
+        parts.append("Стоимость позиций с пометкой «Цена по запросу» уточнит менеджер.")
+    notes = {}
+    for row in rows:
+        for note in dict.fromkeys([row.get("salesNotes"), row.get("priceCaveat")]):
+            if note:
+                notes.setdefault(note, []).append(row["offerId"])
+    for note, ids in notes.items():
+        parts.append(note if len(ids) == len(rows) else f"Артикул {', '.join(ids)} — {note}")
     return " ".join(parts)
 
 
@@ -239,7 +255,10 @@ def checked_answer(answer, evidence, history, text, previous):
         reason = "price_request"
     if answer.field == "availability" and len(products) == 1 and not products[0].available:
         reason = "availability"
-    body = "\n".join(product_line(row, answer.field) for row in rows)
+    if len(rows) > 1 and answer.field == "summary":
+        body = selection_summary(rows, seats)
+    else:
+        body = "\n".join(product_line(row, answer.field, compact=len(rows) > 1) for row in rows)
     handoff = HandoffRequest(reason=reason, question=text, products=products) if reason else None
     return (
         body + (" " + CONFIRMED if handoff else ""),

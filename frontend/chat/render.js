@@ -15,8 +15,8 @@ function element(tag, text, className) {
   return node;
 }
 
-function sourceLink(source) {
-  const link = element("a", source.label + " ↗");
+function sourceLink(source, label = source.label) {
+  const link = element("a", label + " ↗");
   try {
     const url = new URL(source.url);
     if (url.protocol === "https:") {
@@ -33,22 +33,28 @@ function sourceLink(source) {
 function productCard(product) {
   const card = element("div", null, "result");
   const price = product.priceState === "on_request" ? "Цена по запросу" : money(product.unitPriceKopecks) + " за единицу по карточке";
-  card.append(element("strong", product.name), element("div", price));
+  card.append(element("strong", product.name), element("small", "Артикул " + product.offerId), element("div", price));
   if (product.priceState === "availability_check") card.append(element("small", "Наличие требует подтверждения"));
-  card.append(element("small", product.licenseTerm ? "Срок: " + product.licenseTerm : "Срок лицензии неизвестен"), sourceLink(product.source));
+  const link = sourceLink(product.source, "Открыть в магазине");
+  link.setAttribute("aria-label", "Открыть в магазине · " + product.name);
+  card.append(element("small", product.licenseTerm ? "Срок: " + product.licenseTerm : "Срок лицензии неизвестен"), link);
   return card;
 }
 
-export function renderEvent({ data, at }, conversationId, submit) {
+export function renderEvent({ data, at, actionId }, conversationId, submit, cardLinks = new Set()) {
   const row = element("div", null, "entry");
   const time = new Date(at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
   switch (data.type) {
     case "message":
       row.classList.add(data.author);
       row.append(element("div", names[data.author] + " · " + time, "meta"), element("div", data.text, "bubble"));
-      for (const source of data.sources) row.append(sourceLink(source));
+      for (const source of data.sources) {
+        const link = sourceLink(source);
+        if (!cardLinks.has(link.href)) row.append(link);
+      }
       break;
     case "products":
+      row.dataset.productsFor = actionId;
       for (const product of data.products) row.append(productCard(product));
       break;
     case "handoff":
