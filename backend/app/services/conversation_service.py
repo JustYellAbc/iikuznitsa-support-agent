@@ -245,6 +245,7 @@ async def resolve_handoff(handoff_id: str, decision: ManagerDecision) -> Result:
     datas = [message.model_dump(mode="json")]
     async with get_db().tx() as conn:
         if decision.type == "close":
+            await quotes.invalidate_exception(conn, handoff)
             await repository.resolve_handoff(handoff_id, conn=conn)
             closed = handoff.model_copy(update={"status": "resolved"})
             datas.append(HandoffData(handoff=closed).model_dump(mode="json"))

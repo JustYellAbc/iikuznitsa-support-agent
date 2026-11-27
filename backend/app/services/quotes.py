@@ -6,6 +6,7 @@ import re
 from datetime import date
 
 from app.agent.quote_calculation import (
+    Conditions,
     Customer,
     Item,
     NoSeatVariant,
@@ -90,6 +91,49 @@ async def check_exceptions(cid, offer_ids):
             raise ApiError(409, "terms_pending", "Сначала дождитесь решения менеджера по особым условиям этой закупки.")
 
 
+async def invalidate_exception(conn, handoff):
+    if handoff.reason not in ("tender", "special_terms", "outside_catalog"):
+        return
+    row = await latest(handoff.conversationId)
+    if row and (
+        not handoff.products
+        or {p.offerId for p in handoff.products}.intersection(d.product.offerId for d in read(row).details)
+    ):
+        await conn.execute(
+            "UPDATE quote_revisions SET reselect=1 WHERE quote_id=? AND revision=?", (row["quote_id"], row["revision"])
+        )
+        await conn.execute(
+            "DELETE FROM drafts WHERE conversation_id=? AND action_id=? AND status='pending'",
+            (handoff.conversationId, row["action_id"]),
+        )
+
+
+async def apply_deal_conditions(cid, customer, details):
+    rows = await get_db().fetchall(
+        "SELECT id, products FROM handoffs WHERE conversation_id=? AND status='resolved' "
+        "AND reason IN ('tender','special_terms','outside_catalog') ORDER BY updated_at DESC",
+        (cid,),
+    )
+    for line in details:
+        for row in rows:
+            products = json.loads(row["products"])
+            if products and all(p["offerId"] != line.product.offerId for p in products):
+                continue
+            # A negotiated deal needs its own verified terms; free-text replies do not authorize final documents.
+            path = get_settings().data_dir / "private" / "quote_terms" / (row["id"] + ".json")
+            terms = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            offer = (
+                terms.get("offers", {}).get(line.product.offerId)
+                if terms.get("customer") == customer.model_dump()
+                else None
+            )
+            rule = Conditions.model_validate(offer) if offer else None
+            line.conditions = rule if rule and rule.validUntil and rule.validUntil >= date.today() else None
+            if line.conditions and line.conditions.article:
+                line.article = line.conditions.article
+            break
+
+
 async def check_line_revision(handoff):
     if handoff.quoteLine:
         row = await latest(handoff.conversationId)
@@ -97,7 +141,7 @@ async def check_line_revision(handoff):
             raise ApiError(409, "stale_revision", STALE)
 
 
-async def save_revision(conn, cid, action_id, snapshot, *, resolved=None):
+async def save_revision(conn, cid, action_id, snapshot, *, resolved=None, selection=False):
     q = snapshot.quote
     blob = await asyncio.to_thread(render, snapshot)
     doc_id = repo.new_id("d")
@@ -121,8 +165,13 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None):
         if h.status == "open" and (h.quoteLine.offerId, h.reason) in active:
             carry[(h.quoteLine.offerId, h.reason)] = h
     quote_event = QuoteData(quote=q)
+    buyer_events = [quote_event]
+    if selection:
+        products = [d.product for d in snapshot.details]
+        if [p.model_dump(mode="json") for p in products] != await repo.last_products(cid):
+            buyer_events.append(ProductsData(products=products))
     if (await repo.get_conversation(cid)).session.mode == "pilot":
-        await repo.create_draft(cid, action_id, [quote_event.model_dump(mode="json")], conn=conn)
+        await repo.create_draft(cid, action_id, [e.model_dump(mode="json") for e in buyer_events], conn=conn)
         data.append(
             MessageData(
                 author="agent",
@@ -132,7 +181,7 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None):
             )
         )
     else:
-        data.append(quote_event)
+        data.extend(buyer_events)
     for d in snapshot.details:
         if not d.reason:
             continue
@@ -245,7 +294,8 @@ async def prepare_revision(conn, cid, request, customer_message, seats):
     if len(ids) != len(set(ids)):
         raise invalid_input("Каждую позицию укажите один раз с нужным количеством упаковок.")
     current = await latest(cid)
-    await require_published(current)
+    if current and not current["reselect"]:
+        await require_published(current)
     revision = current["revision"] if current else 0
     if request.baseRevision != revision:
         raise ApiError(409, "stale_revision", STALE)
@@ -286,19 +336,19 @@ async def prepare_revision(conn, cid, request, customer_message, seats):
         )
         result = await repo.record_quote_response(conn, 202, {"conversationId": cid, "actionId": action_id})
         return result, written
+    await apply_deal_conditions(cid, request.customer, details)
     old = read(current) if current else None
     if old:
-        for fresh in details:
-            prior = next((d for d in old.details if d.product.offerId == fresh.product.offerId), None)
-            if (
-                prior
-                and prior.decision
-                and prior.product == fresh.product
-                and prior.packages == fresh.packages
-                and prior.feedDate == fresh.feedDate
-                and old.customer == request.customer
-            ):
-                fresh.unit, fresh.reason, fresh.decision = prior.unit, prior.reason, prior.decision
+        market_fields = {"product", "packages", "article", "conditions", "feedDate"}
+        if (
+            old.customer == request.customer
+            and [d.model_dump(include=market_fields) for d in old.details]
+            == [d.model_dump(include=market_fields) for d in details]
+            and not current["reselect"]
+        ):
+            for fresh, prior in zip(details, old.details, strict=True):
+                if prior.decision:
+                    fresh.unit, fresh.reason, fresh.decision = prior.unit, prior.reason, prior.decision
         if old.details == details and old.customer == request.customer and not current["reselect"]:
             if not customer_message:
                 return await repo.record_quote_response(
@@ -339,10 +389,7 @@ async def prepare_revision(conn, cid, request, customer_message, seats):
             ],
             conn=conn,
         )
-    if seats is not None:
-        data = ProductsData(products=[d.product for d in details]).model_dump(mode="json")
-        written.extend(await repo.append_events(cid, action_id, [data], conn=conn))
-    written.extend(await save_revision(conn, cid, action_id, snapshot))
+    written.extend(await save_revision(conn, cid, action_id, snapshot, selection=True))
     return await repo.record_quote_response(conn, 202, {"conversationId": cid, "actionId": action_id}), written
 
 
@@ -355,6 +402,10 @@ def current_quote(row, qid, revision):
 
 
 async def quote_action(cid, action: ConfirmQuoteAction | RequestDocumentAction):
+    from app.services.turn_service import is_busy
+
+    if is_busy(cid):
+        raise ApiError(409, "agent_busy", "Дождитесь проверки новых условий в чате.")
     async with get_db().tx() as conn:
         row = await latest(cid)
         snapshot = current_quote(row, action.quoteId, action.revision)

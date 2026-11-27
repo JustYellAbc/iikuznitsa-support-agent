@@ -37,7 +37,11 @@ def test_quote_moderation_blocks_both_pdf_paths_and_confirmation(api, tmp_path):
     assert api.call("manager", "GET", preview).status_code == 200
     assert command(api, cid, q, "confirm_quote").json()["code"] == "terms_pending"
     assert api.call("manager", "POST", f"/api/v1/manager/drafts/{d['id']}/send", json={}).status_code == 200
-    assert api.call("customer", "GET", preview).status_code == 200 and last_quote(api, cid)["state"] == "ready"
+    assert last_quote(api, cid)["state"] == "ready"
+    assert api.call("customer", "GET", preview).status_code == 404
+    act = {"type": "request_document", "quoteId": q["quoteId"], "revision": q["revision"], "kind": "quote_pdf"}
+    assert api.call("customer", "POST", f"/api/v1/conversations/{cid}/actions", json=act).status_code == 202
+    assert api.call("customer", "GET", preview).status_code == 200
 
 
 def test_quote_receipt_rolls_back_together_with_revision(api, tmp_path, monkeypatch):
@@ -115,6 +119,13 @@ def test_removed_line_does_not_accept_replies_from_either_role(api, tmp_path):
     [case] = [h for h in api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] if h.get("quoteLine")]
     assert request(api, cid, [("t1", 1)], 1).status_code == 202
     assert api.say(cid, "Новый вопрос", handoffId=case["handoffId"]).json()["code"] == "stale_revision"
+    api.say(cid, "Теперь 3 упаковки")
+    api.idle()
+    q = last_quote(api, cid)
+    assert q["revision"] == 3 and [(r["offerId"], r["packages"]) for r in q["lines"]] == [("t1", 3)]
+    api.say(cid, "Какая цена?")
+    api.idle()
+    assert "100 ₽" in api.events(cid)[-1]["data"]["text"]
     assert (
         api.call(
             "manager",
@@ -124,3 +135,26 @@ def test_removed_line_does_not_accept_replies_from_either_role(api, tmp_path):
         ).json()["code"]
         == "stale_revision"
     )
+
+
+def test_manager_free_text_cannot_reconfirm_general_terms(api, tmp_path):
+    cid = setup_quote(api, tmp_path, ["t1"], rules=True)
+    request(api, cid, [("t1", 1)])
+    q = last_quote(api, cid)
+    api.say(cid, "Нужна постоплата")
+    api.idle()
+    api.login()
+    [h] = api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+    assert (
+        api.call(
+            "manager",
+            "POST",
+            f"/api/v1/manager/handoffs/{h['handoffId']}/resolution",
+            json={"type": "close", "reply": "Согласована постоплата через 10 дней."},
+        ).status_code
+        == 202
+    )
+    assert command(api, cid, q, "confirm_quote").json()["code"] == "stale_revision"
+    assert request(api, cid, [("t1", 1)], 1).status_code == 202
+    new = last_quote(api, cid)
+    assert new["revision"] == 2 and new["state"] == "needs_review" and new["terms"]["payment"] is None

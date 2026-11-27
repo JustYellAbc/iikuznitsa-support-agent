@@ -193,10 +193,11 @@ async def quote_preview(
         if principal.role == "customer" and not await quotes.published(conversationId, quoteId, revision):
             raise not_found("Документ не найден.")
         row = await get_db().fetchone(
-            "SELECT pdf FROM quote_revisions WHERE conversation_id=? AND quote_id=? AND revision=?",
+            "SELECT pdf, issued_action, json_extract(snapshot,'$.quote.state') AS state FROM quote_revisions "
+            "WHERE conversation_id=? AND quote_id=? AND revision=?",
             (conversationId, quoteId, revision),
         )
-    if row is None:
+    if row is None or (principal.role == "customer" and row["state"] == "ready" and not row["issued_action"]):
         raise not_found("Документ не найден.")
     return Response(
         row["pdf"],
@@ -236,7 +237,7 @@ async def quote_inputs(conversationId: PathId, principal: Principal = Depends(re
     await svc.conversation_for(principal, conversationId)
     async with get_db().committed_read():
         row = await quotes.latest(conversationId)
-        if principal.role == "customer":
+        if principal.role == "customer" and row and not row["reselect"]:
             await quotes.require_published(row)
     snapshot = quotes.read(row) if row else None
     return JSONResponse(
