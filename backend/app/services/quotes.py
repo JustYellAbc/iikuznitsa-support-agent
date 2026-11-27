@@ -165,6 +165,18 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None, select
         h = (await repo.get_handoff(record["id"])).handoff
         if h.status == "open" and (h.quoteLine.offerId, h.reason) in active:
             carry[(h.quoteLine.offerId, h.reason)] = h
+    unlinked = await get_db().fetchall(
+        "SELECT h.id FROM handoffs h LEFT JOIN quote_handoffs l ON h.id=l.handoff_id "
+        "WHERE h.conversation_id=? AND h.status='open' AND l.handoff_id IS NULL "
+        "ORDER BY h.created_at DESC",
+        (cid,),
+    )
+    for record in unlinked:
+        h = (await repo.get_handoff(record["id"])).handoff
+        if len(h.products) == 1:
+            key = (h.products[0].offerId, h.reason)
+            if key in active and key not in carry:
+                carry[key] = h
     quote_event = QuoteData(quote=q)
     buyer_events = [quote_event]
     if selection:
@@ -571,12 +583,14 @@ async def approve_price(handoff, decision: ApproveLinePriceDecision):
             raise ApiError(409, "stale_revision", STALE)
         if ref.revision != decision.revision:
             raise ApiError(409, "stale_revision", STALE)
-        line = next(d for d in snapshot.details if d.product.offerId == ref.offerId)
-        if line.reason != "price_request":
-            raise ApiError(409, "terms_pending", "Подтверждение цены не подтверждает доступность.")
+        line = next((d for d in snapshot.details if d.product.offerId == ref.offerId), None)
+        if line is None:
+            raise not_found("Строка расчёта не найдена.")
+        if line.reason not in ("price_request", "availability"):
+            raise ApiError(409, "terms_pending", "Строка не требует согласования цены или доступности.")
         line.unit = decision.unitPriceKopecks
         line.decision = handoff.handoffId
-        line.reason = None if line.product.available else "availability"
+        line.reason = None
         updated = calculate(snapshot.customer, snapshot.details, ref.quoteId, ref.revision + 1)
         action_id = repo.new_id("a")
         written = await save_revision(conn, cid, action_id, updated, resolved=handoff)

@@ -326,6 +326,18 @@ async def find_open_handoff(conversation_id: str, reason: HandoffReason) -> Hand
     return _handoff(row) if row else None
 
 
+async def find_open_quote_handoff(conversation_id: str, reason: HandoffReason, offer_id: str) -> HandoffRow | None:
+    row = await get_db().fetchone(
+        HANDOFF_SELECT + "WHERE h.conversation_id = ? AND h.reason = ? AND h.status = 'open' "
+        "AND l.offer_id = ? AND EXISTS ("
+        "SELECT 1 FROM quote_revisions qr WHERE qr.quote_id = l.quote_id AND qr.revision = l.revision "
+        "AND qr.reselect = 0 AND qr.revision = (SELECT max(revision) FROM quote_revisions WHERE quote_id = l.quote_id)"
+        ") ORDER BY h.created_at DESC LIMIT 1",
+        (conversation_id, reason, offer_id),
+    )
+    return _handoff(row) if row else None
+
+
 async def list_open_handoffs() -> list[Handoff]:
     rows = await get_db().fetchall(
         HANDOFF_SELECT + "WHERE status = 'open' AND (l.quote_id IS NULL OR "

@@ -148,6 +148,8 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
     datas = _reply_events(reply)
     async with get_db().tx() as conn:
         existing = await repository.find_open_handoff(cid, request.reason)
+        if existing is None and len(request.products) == 1:
+            existing = await repository.find_open_quote_handoff(cid, request.reason, request.products[0].offerId)
         if existing is None:
             handoff = await repository.create_handoff(
                 cid,
