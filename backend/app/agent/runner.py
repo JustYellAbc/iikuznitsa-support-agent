@@ -26,6 +26,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
 
+import app.agent.needs as needs
 from app.agent.catalog_selection import Selection, named_request, select, selection_for
 from app.agent.handoff import (
     CONFIRMED,
@@ -68,6 +69,11 @@ async def run_turn(
     products: list[Product] | None = None,
     finding: SearchFinding | None = None,
 ) -> AgentReply:
+    recommendation = await needs.run_turn(
+        session, history, user_text, emit_step, action_type=action_type, finding=finding
+    )
+    if recommendation:
+        return recommendation
     started = time.perf_counter()
     if products is None:
         products = [Product.model_validate(p) for p in await last_products(session.id)]

@@ -24,7 +24,7 @@ function sourceLink(source) {
 
 function productCard(product) {
   const card = element("div", null, "result");
-  const price = product.priceState === "on_request" ? "Цена по запросу" : money(product.unitPriceKopecks) + " за упаковку";
+  const price = product.priceState === "on_request" ? "Цена по запросу" : money(product.unitPriceKopecks) + " за единицу по карточке";
   card.append(element("strong", product.name), element("div", price));
   if (product.priceState === "availability_check") card.append(element("small", "Наличие требует подтверждения"));
   card.append(element("small", product.licenseTerm ? "Срок: " + product.licenseTerm : "Срок лицензии неизвестен"), sourceLink(product.source));
