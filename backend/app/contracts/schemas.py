@@ -169,6 +169,37 @@ class Health(Strict):
     today_spend_rub: float
 
 
+class CatalogSnapshot(Strict):
+    """Метаданные снимка фида, из которого собран рабочий индекс каталога (T14)."""
+
+    feed_date: str = Field(description="yml_catalog/@date как в фиде")
+    feed_sha256: str
+    feed_name: str
+    feed_bytes: int
+    offers_count: int
+    listed: int = Field(description="available=true, цена > 0")
+    availability_check: int = Field(description="available=false, цена > 0")
+    on_request: int = Field(description="цена 0 или пустая")
+    refreshed_at: datetime
+
+
+class AvailabilityCheckPolicy(Strict):
+    """Правило для available=false и цены > 0 до Q&A с заказчиком."""
+
+    show_snapshot_price_with_caveat: bool
+    allow_quote_draft: bool
+    allow_auto_invoice: bool
+    confirmed: bool
+    policy_source: str
+    loaded_from: str = Field(description="файл, из которого политика прочитана при старте")
+    overridden: bool = Field(description="true — $DATA_DIR/config/price_policy.json, false — встроенная")
+
+
+class CatalogStatus(Strict):
+    snapshot: CatalogSnapshot | None = Field(description="null — индекс ещё не собран через refresh_feed")
+    availability_check: AvailabilityCheckPolicy
+
+
 class ManagerLogin(Strict):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=256)

@@ -30,6 +30,15 @@ AFFIRMATIVE = re.compile(
     r"(?:да|давайте|согласен|согласна|конечно|подключайте)(?:[, .!]+(?:пожалуйста|давайте|подключайте))?[.! ]*"
 )
 PRICE = re.compile(r"\b(?:цен[а-яё]*|стоимост\w*|стоит|стоят|прайс|поч[её]м)\b")
+STOCK_ITEM = r"(?:товары?|продукты?|программ[аы]|программное обеспечение|по|лицензи[яи]|позици[яи]|артикул|он[аи]?)"
+STOCK = re.compile(
+    r"\b(?:наличи[еяюи]|наличием|в продаже)\b"
+    r"|\bдоступ(?:ен|на|но|ны) ли\b(?:\s+(?:сейчас|сегодня|ещ[её]|уже))*\s*"
+    r"(?=$|[?!.;,]|(?:(?:этот|эта|это|эти|выбранн\w+|данн\w+)\s+)?"
+    rf"(?:{STOCK_ITEM}\b|для покупки\b|[a-z0-9]))"
+    rf"|\b{STOCK_ITEM} доступ(?:ен|на|но|ны)\b"
+    r"|\bдоступность (?:товара|продукта|лицензии|позиции)\b"
+)
 TERM = re.compile(r"срок\w*|сколько\s+(?:месяцев|лет)|бессроч\w*")
 TENDER = re.compile(r"\b(?:тендер\w*|госзакуп\w*|закупк\w*\s+по\s+(?:44|223)|(?:44|223)[ -]?фз)\b")
 NO_TENDER = re.compile(r"\b(?:не\s+тендер\w*|без\s+тендер\w*|тендер\w*\s+(?:нет|не\s+(?:будет|нужен)))\b")
@@ -107,6 +116,7 @@ def route_action(
     *,
     action_type: ActionType = "message",
     finding: SearchFinding | None = None,
+    product_reason: HandoffReason | None = None,
 ) -> Routing | None:
     """Route a T04 action using the server's selected products and verified search outcome."""
     body = " ".join(text.casefold().split())
@@ -128,11 +138,14 @@ def route_action(
         return Routing("outside_catalog", text)
     if len(products) == 1:
         p = products[0]
+        asks_availability = STOCK.search(body) or re.search(
+            r"купить|поставк|достав|получить .*?ключ|получить ключ|электронн\w* ключ|прид[её]т", body
+        )
+        if asks_availability and (product_reason == "availability" or p.priceState == "availability_check"):
+            return Routing("availability", text)
         if PRICE.search(body) and p.priceState == "on_request":
             return Routing("price_request", text)
-        if p.priceState == "availability_check" and re.search(
-            r"наличи|доступн|купить|поставк|достав|получить .*?ключ|получить ключ|электронн\w* ключ|прид[её]т", body
-        ):
+        if asks_availability and not p.available:
             return Routing("availability", text)
         if TERM.search(body) and p.licenseTerm is None:
             finding = "insufficient_evidence"

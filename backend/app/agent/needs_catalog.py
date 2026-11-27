@@ -12,6 +12,7 @@ from app.agent.handoff import OFFER_HELP
 from app.agent.needs_brief import Brief, questions
 from app.agent.needs_discovery import compare_catalog
 from app.contracts.t04 import Product, Source
+from app.services.price_policy import is_supported_currency
 
 
 @dataclass(frozen=True)
@@ -85,12 +86,13 @@ def allowed_quantity(notes: str, units: int) -> bool:
 def find_line(db: sqlite3.Connection, family: Family, b: Brief, count: int) -> Line | None:
     rows = db.execute(
         """SELECT o.* FROM products JOIN offers o ON products.rowid=o.rowid
-           WHERE products MATCH ? AND o.available=1 AND o.price_state='priced_available'
-           AND o.currency IN ('RUR','RUB')""",
+           WHERE products MATCH ? AND o.available=1 AND o.price_state='priced_available'""",
         (f'name:"{family.name}"',),
     )
     candidates = []
     for row in rows:
+        if not is_supported_currency(row["currency"]):
+            continue
         params, details = json.loads(row["params"]), json.loads(row["details"])
         name = row["name"].casefold()
         term = params.get("Срок действия", [])

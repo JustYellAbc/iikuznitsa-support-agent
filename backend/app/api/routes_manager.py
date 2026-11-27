@@ -1,5 +1,7 @@
-"""Менеджерские расширения T05 (/api/v1/manager/*): телеметрия, режим, трейс, черновики, патчи БЗ."""
+"""Менеджерские расширения T05 (/api/v1/manager/*): телеметрия, режим, трейс, черновики, патчи БЗ, каталог."""
 
+import asyncio
+from dataclasses import asdict
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path
@@ -8,6 +10,7 @@ from pydantic import Field
 from app.config import get_settings
 from app.contracts.schemas import (
     AgentTurn,
+    CatalogStatus,
     Draft,
     DraftSend,
     KBPatch,
@@ -23,6 +26,8 @@ from app.core.errors import ApiError, not_found
 from app.core.llm import today_spend_rub, today_start
 from app.db import repository
 from app.services import conversation_service, turn_service
+from app.services.catalog_snapshot import read_snapshot
+from app.services.price_policy import active_policy
 
 router = APIRouter(
     prefix="/api/v1/manager",
@@ -45,6 +50,21 @@ async def telemetry(all_time: bool = False, principal: Principal = Depends(requi
         usd_rub_rate=s.usd_rub_rate,
         steps=await repository.step_stats(None if all_time else today_start()),
         recent_calls=await repository.recent_llm_calls(20),
+    )
+
+
+@router.get("/catalog", response_model=CatalogStatus)
+async def catalog(principal: Principal = Depends(require_manager)) -> CatalogStatus:
+    """Снимок фида рабочего индекса (дата, SHA-256, счётчики состояний цены) и действующая политика цены."""
+    snapshot = await asyncio.to_thread(read_snapshot, get_settings().catalog_index_path)
+    policy = active_policy()
+    return CatalogStatus(
+        snapshot=snapshot,
+        availability_check={
+            **asdict(policy.rule),
+            "loaded_from": str(policy.path),
+            "overridden": policy.overridden,
+        },
     )
 
 

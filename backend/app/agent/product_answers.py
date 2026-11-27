@@ -6,11 +6,22 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from app.agent.catalog_selection import CODE, LATIN, MDAEMON, Selection, named_request, offer_product, result
-from app.agent.handoff import OFFER_HELP, PRICE
+from app.agent.catalog_selection import (
+    CODE,
+    LATIN,
+    MDAEMON,
+    Selection,
+    named_request,
+    offer_assessment,
+    offer_product,
+    result,
+)
+from app.agent.handoff import OFFER_HELP, PRICE, STOCK
 from app.contracts.t04 import Product, Source
+from app.services.price_policy import is_supported_currency
 
 TOPICS = {
+    "availability": STOCK.pattern,
     "term": r"\bсрок\b|срок[аи] (?:действия|лицензии|подписки)|на (?:сколько|год)|сколько (?:лет|месяц)|длительность",
     "updates": r"обновлен|что (?:точно )?входит",
     "rights": r"навсегда|бессроч|пользоваться после|после (?:окончания|истечения)|останется ли",
@@ -59,7 +70,7 @@ GENERIC_NOUN = re.compile(
 def topics_for(text: str, has_products: bool) -> set[str]:
     body = text.casefold()
     if not PRICE.search(body) and not re.search(
-        r"\?|\b(?:како\w*|какая|какие|как|что|есть ли|можно ли|сколько|когда|где|подскажите|навсегда|бессроч\w*)\b",
+        r"\?|\b(?:како\w*|какая|какие|как|что|ли|сколько|когда|где|подскажите|навсегда|бессроч\w*)\b",
         body,
     ):
         return set()
@@ -128,7 +139,7 @@ def current_offer(db: sqlite3.Connection, product: Product) -> dict | None:
         "SELECT id,name,params,available,price,currency,source,price_state FROM offers WHERE id=? AND source=?",
         (product.offerId, product.source.url),
     ).fetchone()
-    if row and row["currency"] in {"RUB", "RUR"}:
+    if row and is_supported_currency(row["currency"]):
         return {**row, "params": json.loads(row["params"])}
     return None
 
@@ -166,7 +177,8 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
         if not row:
             return result(OFFER_HELP)
         name, params = row["name"], row["params"]
-        p = offer_product(row)
+        assessment = offer_assessment(row)
+        p = assessment.to_product()
         facts = []
         unknown = []
         refs = []
@@ -215,17 +227,22 @@ def answer_facts(index: Path, text: str, topics: set[str], products: list[Produc
         if "order_status" in topics:
             unknown.append("состояние конкретного заказа")
         if "price" in topics:
-            if p.unitPriceKopecks is None:
+            if not assessment.show_price or p.unitPriceKopecks is None:
                 unknown.append("цена")
             else:
                 rub, kop = divmod(p.unitPriceKopecks, 100)
                 money = f"{rub:,}".replace(",", " ") + (f",{kop:02}" if kop else "")
                 facts.append(f"Цена по снимку — {money} ₽.")
-        if p.priceState == "availability_check":
+        if assessment.price_state == "availability_check":
             facts.append("Наличие требует подтверждения.")
+        elif "availability" in topics:
+            facts.append("По снимку каталога позиция в наличии." if p.available else "Наличие требует подтверждения.")
         if unknown:
             # The T09/T12 offer opens the operator button. Show the sourced partial answer
             # alongside it, even when one detail requires the manager.
             label = " ".join([*facts, "Требует уточнения: " + ", ".join(unknown) + "."])
-            return result(OFFER_HELP, products=[p], sources=[Source(url=p.source.url, label=label), *refs])
-        return result(" ".join([*facts, *(ref.label for ref in refs)]), "answer", [p], sources=[p.source, *refs])
+            reply = result(OFFER_HELP, products=[p], sources=[Source(url=p.source.url, label=label), *refs])
+        else:
+            reply = result(" ".join([*facts, *(ref.label for ref in refs)]), "answer", [p], sources=[p.source, *refs])
+        reply.handoff_reason = assessment.handoff_reason
+        return reply

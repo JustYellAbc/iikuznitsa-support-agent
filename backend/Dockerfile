@@ -24,6 +24,7 @@ RUN pip install -r /app/requirements.txt
 
 COPY backend/app /app/app
 COPY scripts /app/scripts
+COPY catalog /app/catalog
 
 RUN useradd --uid 1000 --create-home app && mkdir -p /app/data && chown app:app /app/data
 USER app
