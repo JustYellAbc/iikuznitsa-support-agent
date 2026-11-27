@@ -44,7 +44,58 @@ test("Виджет Т09 на примерах контракта", async t => {
     assert.match(await card("48093").innerText(), /Наличие требует подтверждения/);
     assert.match(await card("504").innerText(), /Цена по запросу/);
     assert.doesNotMatch(await card("504").innerText(), /₽/);
+    assert.equal(await page.locator("#log .entry:has(.result) #quote-open").count(), 1);
+    assert.equal(await page.locator("footer #quote-open").count(), 0);
+    await page.route("**/quotes/current?*", route => route.fulfill({ json: {
+      revision: 0, items: [], choices: [{ offerId: "61557", name: "BookOffice" }]
+    } }));
+    await page.getByRole("button", { name: "Подготовить КП" }).click();
+    assert.equal(await page.getByLabel("BookOffice · ID 61557").isChecked(), true);
+    await page.getByRole("button", { name: "Закрыть", exact: true }).click();
+    for (const logo of await page.locator(".brand img, .wordmark").all()) {
+      assert.ok(await logo.evaluate(img => img.complete && img.naturalWidth > 0));
+    }
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  });
+  await t.test("Адресат сохраняется после перезагрузки и сбрасывается после закрытия обращений", async t => {
+    const page = await browser.newPage({ viewport: { width: 320, height: 690 } });
+    t.after(() => page.close());
+    await page.addInitScript(() => { window.EventSource = undefined; });
+    const journal = [];
+    function handoff(id, question, status) {
+      const seq = journal.length + 1;
+      journal.push({ seq, at: "2026-11-27T12:00:00Z", actionId: "action-" + seq,
+        data: { type: "handoff", handoff: { handoffId: id, question, status } } });
+    }
+    handoff("first", "Срок лицензии", "open");
+    handoff("second", "Условия поставки", "open");
+    await page.route("**/events?*", route => {
+      const after = Number(new URL(route.request().url()).searchParams.get("after"));
+      return route.fulfill({ json: { events: journal.slice(after), nextAfter: journal.length, hasMore: false } });
+    });
+    await page.goto(url);
+    const open = () => page.locator("#launch").click();
+    await open();
+    const summary = page.locator("#recipient-summary");
+    await summary.click();
+    await page.getByLabel("Оператор · Условия поставки").check();
+    assert.match(await summary.textContent(), /Условия поставки/);
+    await page.reload();
+    await open();
+    await page.getByText("Сообщение оператору · Условия поставки", { exact: true }).waitFor();
+    await summary.click();
+    await page.getByRole("radio", { name: "Ассистент", exact: true }).click();
+    assert.equal(await summary.textContent(), "Сообщение ассистенту");
+    const sent = page.waitForRequest(req => new URL(req.url()).pathname.endsWith("/actions"));
+    await page.locator("#message").fill("Теперь вопрос ассистенту");
+    await page.locator("#send").click();
+    assert.deepEqual((await sent).postDataJSON(), { type: "message", text: "Теперь вопрос ассистенту" });
+    handoff("first", "Срок лицензии", "resolved");
+    handoff("second", "Условия поставки", "resolved");
+    await page.reload();
+    await open();
+    await page.getByText("Обращение закрыто", { exact: true }).last().waitFor();
+    assert.equal(await page.locator("#recipient").isVisible(), false);
   });
   await t.test("После обрыва потока виджет дочитывает историю с последнего события", async t => {
     const page = await browser.newPage();

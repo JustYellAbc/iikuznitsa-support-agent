@@ -1,23 +1,32 @@
 const form = document.getElementById("quote-form");
 const dialog = document.getElementById("quote-dialog");
 const list = document.getElementById("quote-items");
-const openButton = document.getElementById("quote-open");
+const openButton = document.createElement("button");
+openButton.type = "button";
+openButton.id = "quote-open";
+openButton.textContent = "Подготовить КП";
 const status = document.getElementById("quote-status");
 let openingRevision = 0, retry = null, busy = false;
 
 export function resetQuotes() {
   retry = null;
   openButton.textContent = "Подготовить КП";
-  openButton.hidden = true; dialog.close(); form.reset();
+  openButton.remove(); dialog.close(); form.reset();
 }
 
-export function quoteEvent(data) {
-  if (data.type === "products") {
-    openButton.hidden = false;
+export function quoteEvent(data, row) {
+  if (data.type === "quote") openButton.textContent = "Изменить КП";
+  if (data.type === "handoff" && data.handoff.quoteLine) {
+    openButton.textContent = data.handoff.status === "open" ? "Изменить количество в КП" : "Изменить КП";
   }
-  if (data.type === "quote") {
-    openButton.textContent = "Изменить КП";
-    openButton.hidden = false;
+  if (data.type === "products" && !data.products.length) {
+    openButton.remove();
+  } else if (data.type === "products" || data.type === "quote" ||
+      (data.type === "handoff" && data.handoff.quoteLine && data.handoff.status === "open")) {
+    row.append(openButton);
+  } else if (openButton.isConnected && data.type === "message" && data.author === "agent" &&
+      /«(?:Подготовить|Изменить) КП»/.test(data.text)) {
+    row.append(openButton);
   }
 }
 
