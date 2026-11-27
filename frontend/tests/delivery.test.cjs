@@ -98,6 +98,9 @@ test("Виджет Т09 на примерах контракта", async t => {
       return route.fulfill({ json: { events: journal.slice(after), nextAfter: journal.length, hasMore: false } });
     });
     const saved = { revision: 2, items: [{ offerId: "B", packages: 3 }], choices: ["A", "B"].map(product) };
+    await page.route("**/quotes/history?*", route => route.fulfill({json:{revisions:[
+      {quoteId:"q",revision:2,previous:1,changes:["Позиция B · количество 1 → 3 уп."]}
+    ]}}));
     await page.route("**/quotes/current?*", route => route.fulfill({ json: saved }));
     await page.goto(url);
     await page.locator("#launch").click();
@@ -105,6 +108,9 @@ test("Виджет Т09 на примерах контракта", async t => {
     const edit = page.getByRole("button", { name: "Изменить КП" });
     const close = page.getByRole("button", { name: "Закрыть", exact: true });
     await edit.nth(1).waitFor();
+    await page.getByText("Изменения к версии 1. Позиция B · количество 1 → 3 уп.").waitFor();
+    assert.equal(await page.getByText("Предыдущая версия", {exact:true}).count(), 1);
+    assert.equal(await page.getByText("Последняя версия в чате", {exact:true}).count(), 1);
     for (const [index, id] of ["A", "B"].entries()) {
       await prepare.nth(index).click();
       await page.getByRole("checkbox", { name: "Товар " + id + " · ID " + id }).waitFor();
