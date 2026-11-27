@@ -37,9 +37,10 @@ from app.agent.handoff import (
     bare_request,
     handoff_notice,
     handoff_reason,
+    opening_chatter,
     route_action,
 )
-from app.agent.knowledge import answer_published
+from app.agent.knowledge import answer_published, asks_to_recheck
 from app.agent.product_answers import answer_facts, question_target, refresh_products, topics_for
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Session, StepTrace
@@ -104,23 +105,37 @@ async def run_turn(
             text=text,
             purpose="clarification",
         )
-    if get_settings().agent_engine == "tools" and action_type == "message":
-        # Keep explicit handoffs on T12, including a change of terms in the same message.
-        mandatory = route_action(history, user_text, [], action_type=action_type, finding=finding)
-        if mandatory is None:
+    if action_type == "message" and not route_action(history, user_text, [], finding=finding):
+        retry = asks_to_recheck(user_text)
+        question = user_text
+        if retry:
+            question = next(
+                (m.text for m in reversed(history) if m.role == "client" and not asks_to_recheck(m.text)), ""
+            )
+            if opening_chatter(question.strip().casefold()) or question.count("?") > 1:
+                question = ""
+        topics = topics_for(question + "?", bool(products))
+        address_change = topics == {"delivery"} and re.search(
+            r"\b(?:изменить|исправить|поменять|сменить|обновить)\s+адрес\b", question, re.I
+        )
+        public_question = (not topics or address_change) and not route_action(
+            history, question, products, finding=finding
+        )
+        if question and public_question:
+            published = await answer_published(session.id, question, emit_step)
+            if published:
+                return published
+        if get_settings().agent_engine == "tools":
             from app.agent.tool_agent import run_tool_turn
 
-            return await run_tool_turn(session, history, user_text, products, emit_step)
-    # Approved procedures can interrupt an active selection. Commercial facts and
-    # mandatory handoffs always keep their own source, regardless of punctuation.
-    if (
-        action_type == "message"
-        and not topics_for(user_text + "?", bool(products))
-        and not route_action(history, user_text, products, action_type=action_type, finding=finding)
-    ):
-        published = await answer_published(session.id, user_text, emit_step)
-        if published:
-            return published
+            return await run_tool_turn(
+                session,
+                history,
+                user_text,
+                products,
+                emit_step,
+                kb_retry=question if retry and public_question else None,
+            )
     recommendation = await needs.run_turn(
         session, history, user_text, emit_step, action_type=action_type, finding=finding
     )

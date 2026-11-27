@@ -24,6 +24,7 @@ from app.agent.handoff import (
     offers_operator,
     route_action,
 )
+from app.agent.knowledge import keeps_question_qualifiers
 from app.agent.quote_intent import offers_quote
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, StepTrace
@@ -105,6 +106,7 @@ def instructions():
 Для SKU из запроса сначала get_offer. Для смены условий заново ищи товар под новые условия.
 При поиске товара по названию или задаче сначала search_catalog. Не угадывай offerId.
 Для процедур, восстановления доступа и проблем после покупки вызови search_knowledge.
+Сообщай, что проверил источник, только после его чтения. Пустая выдача относится только к запросу.
 При прямом совпадении используй опубликованный ответ. Проверяй, что статья отвечает именно на вопрос.
 Для нового вопроса о факте товара получи свежую карточку. Не подменяй её смежным товаром.
 Заверши через respond или JSON той же схемы. Для product верни refs подтверждённых товаров и field.
@@ -304,7 +306,7 @@ def checked_answer(answer, evidence, history, text, previous):
     )
 
 
-async def run_tool_turn(session, history, text, previous, emit):
+async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None):
     started = time.monotonic()
     settings = get_settings()
     steps = []
@@ -354,14 +356,16 @@ async def run_tool_turn(session, history, text, previous, emit):
 
     async def execute(name, args):
         if name == "search_knowledge":
-            pub = await read("search_published_knowledge", {}, t31.search_published_knowledge, text[:500])
+            original = (kb_retry or text)[:500]
+            pub = await read("search_published_knowledge", {}, t31.search_published_knowledge, original)
             if pub["results"]:
                 return pub
-            if args.query != text[:500]:
+            if args.query != original and keeps_question_qualifiers(original, args.query):
                 pub = await read("search_published_knowledge", {}, t31.search_published_knowledge, args.query)
                 if pub["results"]:
                     return pub
-            return await read("search_store_knowledge", {}, t31.search_store_knowledge, index, args.query, limit=2)
+            query = args.query if keeps_question_qualifiers(original, args.query) else original
+            return await read("search_store_knowledge", {}, t31.search_store_knowledge, index, query, limit=2)
         if name == "get_offer":
             allowed = {p.offerId for p in previous} | {r.get("offerId") for r in evidence.rows.values()}
             if args.offer_id not in allowed and not re.search(r"(?<!\w)" + re.escape(args.offer_id) + r"(?!\w)", text):
@@ -372,6 +376,30 @@ async def run_tool_turn(session, history, text, previous, emit):
         return await read(name, args.model_dump(), t31.search_catalog, index, **args.model_dump(), limit=3)
 
     async def loop():
+        if kb_retry is not None:
+            if not kb_retry:
+                return "Какой именно вопрос проверить в базе знаний?", "clarification", [], [], None
+            result = await execute("search_knowledge", Knowledge(query=kb_retry[:500]))
+            if not result["results"]:
+                return (
+                    "По вашему вопросу в базе не нашёл ответа. Что именно вы хотите уточнить?",
+                    "clarification",
+                    [],
+                    [],
+                    None,
+                )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": serialize(
+                        {
+                            "question_to_recheck": scrub_pii(kb_retry),
+                            "knowledge_results": result["results"],
+                            "instruction": "Ответь цитатой из релевантной статьи или попроси уточнить вопрос.",
+                        }
+                    ),
+                }
+            )
         calls = 0
         for _ in range(settings.agent_max_model_calls):
             if len(serialize([messages, TOOLS]).encode()) > MAX_CONTEXT_BYTES:
@@ -456,7 +484,7 @@ async def run_tool_turn(session, history, text, previous, emit):
             [] if evidence.replaced or Selection("").qualifiers(text, followup=False) != Selection("") else previous
         )
         handoff = HandoffRequest(reason="technical", question=text, products=current)
-    replaces = evidence.replaced or bool(previous and purpose == "clarification")
+    replaces = evidence.replaced or bool(previous and purpose == "clarification" and kb_retry is None)
     if (
         body in {ASK_DETAIL, OFFER_HELP}
         and not evidence.replaced
