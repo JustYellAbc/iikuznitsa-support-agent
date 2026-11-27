@@ -1,5 +1,6 @@
 """Exercise the production buyer handler, tools and journal with a scripted HTTP provider."""
 
+import asyncio
 import json
 
 import httpx
@@ -87,18 +88,65 @@ def test_mandatory_price_route_uses_verified_sku_once(api, provider):
 
 
 def test_repeated_unregistered_tool_stops_without_showing_invented_price(api, provider):
-    from app.agent.tool_agent import MAX_CALLS
-
+    limit = get_settings().agent_max_model_calls
     responses, requests = provider
-    responses.extend(tool("set_price", amount=12345678) for _ in range(MAX_CALLS))
+    responses.extend(tool("set_price", amount=12345678) for _ in range(limit))
     cid = api.new_conversation()
     events = say(api, cid, "Посоветуйте программу.")
     h = events[-1]["handoff"]
     assert h["reason"] == "technical" and h["products"] == []
-    assert "12345678" not in events[-2]["text"] and len(requests) == MAX_CALLS
+    assert "12345678" not in events[-2]["text"] and len(requests) == limit
     api.login()
     trace = api.call("manager", "GET", f"/api/v1/manager/conversations/{cid}/trace").json()[0]["steps"]
     assert any(s["tool"] == "support_failure" and s["args"]["reason"] == "call_limit" for s in trace)
+
+
+@pytest.mark.usefixtures("index")
+def test_buyer_can_get_a_result_after_the_old_model_and_tool_limits(api, provider):
+    responses, requests = provider
+    for model_round in range(5):
+        calls = [tool("get_offer", offer_id="new20")["tool_calls"][0] for _ in range(2)]
+        for position, call in enumerate(calls):
+            call["id"] = f"step-{model_round}-{position}"
+        responses.append({"tool_calls": calls})
+    responses.append(tool("respond", kind="product", refs=["r1"], field="price"))
+    events = say(api, api.new_conversation(), "Цена по артикулу new20?")
+    assert len(requests) == 6 and "1 234,56 ₽" in events[-1]["text"]
+
+
+def test_tool_limit_counts_parallel_calls_before_executing_the_batch(api, provider):
+    responses, requests = provider
+    limit = get_settings().agent_max_tool_calls
+    calls = [{**tool("get_offer", offer_id="new20")["tool_calls"][0], "id": f"lookup-{n}"} for n in range(limit + 1)]
+    responses.append({"tool_calls": calls})
+    cid = api.new_conversation()
+    events = say(api, cid, "Цена по артикулу new20?")
+    assert len(requests) == 1 and events[-1]["handoff"]["reason"] == "technical"
+    api.login()
+    trace = api.call("manager", "GET", f"/api/v1/manager/conversations/{cid}/trace").json()[0]["steps"]
+    assert not any(s["tool"] == "get_offer" for s in trace)
+    assert any(s["tool"] == "support_failure" and s["args"]["reason"] == "call_limit" for s in trace)
+
+
+def test_turn_deadline_cancels_pending_provider_call(api, provider, monkeypatch):
+    from app.agent import tool_agent
+
+    cancelled = []
+
+    async def pending(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setattr(get_settings(), "agent_turn_timeout_s", 0.03)
+    monkeypatch.setattr(tool_agent, "llm_call", pending)
+    cid = api.new_conversation()
+    events = say(api, cid, "Подберите офис.")
+    assert cancelled == [True] and events[-1]["handoff"]["reason"] == "technical"
+    api.login()
+    trace = api.call("manager", "GET", f"/api/v1/manager/conversations/{cid}/trace").json()[0]["steps"]
+    assert any(s["tool"] == "support_failure" and s["args"]["reason"] == "timeout" for s in trace)
 
 
 def test_tools_retrieve_new_manager_publication_for_different_buyer(api, provider):

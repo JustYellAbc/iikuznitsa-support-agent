@@ -22,9 +22,6 @@ from app.core.llm import LLMError, llm_call
 from app.db.repository import new_id
 from eval.pii import scrub_pii
 
-MAX_CALLS = 5
-MAX_TOOLS = 8
-TURN_SECONDS = 45
 MAX_OUTPUT_TOKENS = 800
 MAX_CONTEXT_BYTES = 80_000
 Query = Annotated[str, Field(min_length=1, max_length=500)]
@@ -254,9 +251,10 @@ def checked_answer(answer, evidence, history, text, previous):
 
 async def run_tool_turn(session, history, text, previous, emit):
     started = time.monotonic()
+    settings = get_settings()
     steps = []
     evidence = Evidence()
-    index = get_settings().catalog_index_path
+    index = settings.catalog_index_path
     context = [
         {"role": "user" if m.role == "client" else "assistant", "content": scrub_pii(m.text)[:600]}
         for m in history[-8:]
@@ -320,7 +318,7 @@ async def run_tool_turn(session, history, text, previous, emit):
 
     async def loop():
         calls = 0
-        for _ in range(MAX_CALLS):
+        for _ in range(settings.agent_max_model_calls):
             if len(serialize([messages, TOOLS]).encode()) > MAX_CONTEXT_BYTES:
                 raise LLMError("context_limit")
             response = await llm_call(
@@ -332,7 +330,7 @@ async def run_tool_turn(session, history, text, previous, emit):
                 max_tokens=MAX_OUTPUT_TOKENS,
             )
             step = response.to_step_trace("Вызов инструментов" if response.tool_calls else "Ответ модели")
-            step.args["transport"] = "mock" if get_settings().mock_llm else "provider"
+            step.args["transport"] = "mock" if settings.mock_llm else "provider"
             await record(step)
             if response.finish_reason == "length":
                 raise LLMError("output_limit")
@@ -353,7 +351,7 @@ async def run_tool_turn(session, history, text, previous, emit):
                     messages.append({"role": "user", "content": "Используй respond или сначала вызови поиск."})
                     continue
             calls += len(response.tool_calls)
-            if calls > MAX_TOOLS:
+            if calls > settings.agent_max_tool_calls:
                 break
             messages.append(response.message)
             for call in response.tool_calls:
@@ -391,7 +389,7 @@ async def run_tool_turn(session, history, text, previous, emit):
         raise LLMError("call_limit")
 
     try:
-        async with asyncio.timeout(TURN_SECONDS):
+        async with asyncio.timeout(settings.agent_turn_timeout_s):
             body, purpose, products, sources, handoff = await loop()
     except (TimeoutError, LLMError) as exc:
         limits = {"call_limit", "output_limit", "context_limit", "invalid_tool_call", "conflicting_publications"}
