@@ -66,13 +66,17 @@ def main() -> int:
     limits = Limits(min_offers=args.min_offers, max_drop=args.max_drop, allow_older=args.allow_older)
     try:
         try:
-            report = refresh(downloaded or Path(args.feed), args.index, args.knowledge, limits, feed_name=feed_name)
-        except FeedRejected as exc:
+            report = refresh(
+                downloaded or Path(args.feed),
+                args.index,
+                args.knowledge,
+                limits,
+                feed_name=feed_name,
+                download_archive=downloaded.with_name(feed_name) if downloaded and feed_name else None,
+            )
+        except (FeedRejected, OSError) as exc:
             print(f"Каталог не изменён: {exc}", file=sys.stderr)
             return 1
-        if downloaded is not None and feed_name is not None:
-            os.replace(downloaded, settings.data_dir / "raw" / feed_name)
-            downloaded = None
     finally:
         if downloaded is not None:
             downloaded.unlink(missing_ok=True)

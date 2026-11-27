@@ -244,6 +244,24 @@ def _copy_atomic(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+@contextmanager
+def _publish_download(download: Path, archive: Path) -> Iterator[None]:
+    """Replace the raw archive under the index lock, restoring it if backup rotation fails."""
+    with tempfile.TemporaryDirectory(dir=archive.parent, prefix=".feed-backup-") as directory:
+        backup = Path(directory) / "previous"
+        if archive.is_file():
+            _copy_atomic(archive, backup)
+        os.replace(download, archive)
+        try:
+            yield
+        except BaseException:
+            if backup.exists():
+                os.replace(backup, archive)
+            else:
+                archive.unlink()
+            raise
+
+
 def refresh(
     feed: Path,
     index: Path,
@@ -252,6 +270,7 @@ def refresh(
     now: datetime | None = None,
     *,
     feed_name: str | None = None,
+    download_archive: Path | None = None,
 ) -> dict:
     if not feed.is_file():
         raise FeedRejected(f"Фид пуст или не найден: {feed}")
@@ -309,8 +328,9 @@ def refresh(
                 raise
             try:
                 report = self_check(index, snapshot)
-                if had_index and current and not same_snapshot:
-                    os.replace(rollback_backup, previous)
+                with _publish_download(feed, download_archive) if download_archive is not None else nullcontext():
+                    if had_index and current and not same_snapshot:
+                        os.replace(rollback_backup, previous)
             except BaseException:
                 if had_index:
                     os.replace(rollback_backup, index)

@@ -2,6 +2,7 @@
 
 import gzip
 import hashlib
+import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -345,6 +346,51 @@ def test_failed_published_check_restores_live_and_preserves_previous(tmp_path, m
     assert (digest(index) if index.exists() else None) == live_before
     assert (digest(prev) if prev.exists() else None) == prev_before
     assert not index.with_name("catalog.rollback.sqlite3").exists()
+
+
+@pytest.mark.parametrize("fail_at", ["archive", "rotate"])
+def test_download_publish_failure_restores_both_generations_and_raw(tmp_path, monkeypatch, fail_at):
+    index = tmp_path / "catalog.sqlite3"
+    prev = tmp_path / "catalog.prev.sqlite3"
+    archive = tmp_path / "archive.xml"
+    for day in (1, 2):
+        feed = write_feed(tmp_path / "download", f"2026-11-{day:02} 10:00")
+        refresh(feed, index, KNOWLEDGE, LIMITS, download_archive=archive)
+    before = tuple(map(digest, (index, prev, archive)))
+    original = os.replace
+    feed = write_feed(tmp_path / "download", "2026-11-03 10:00")
+
+    def fail_publication(src, dst):
+        if (fail_at == "archive" and src == feed and dst == archive) or (fail_at == "rotate" and dst == prev):
+            raise OSError("publication failed")
+        return original(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_publication)
+    with pytest.raises(OSError, match="publication failed"):
+        refresh(feed, index, KNOWLEDGE, LIMITS, download_archive=archive)
+    assert tuple(map(digest, (index, prev, archive))) == before
+
+
+def test_parallel_refresh_cannot_publish_between_index_and_archive(tmp_path, monkeypatch):
+    index = tmp_path / "catalog.sqlite3"
+    archive = tmp_path / "archive.xml"
+    first = write_feed(tmp_path / "first", "2026-11-01 10:00")
+    second = write_feed(tmp_path / "second", "2026-11-02 10:00")
+    original = os.replace
+    overlaps = []
+
+    def overlap_before_archive(src, dst):
+        if src == first and dst == archive:
+            with pytest.raises(FeedRejected, match="уже выполняется"):
+                refresh(second, index, KNOWLEDGE, LIMITS, download_archive=archive)
+            overlaps.append(True)
+        return original(src, dst)
+
+    monkeypatch.setattr(os, "replace", overlap_before_archive)
+    for feed in (first, second):
+        refresh(feed, index, KNOWLEDGE, LIMITS, download_archive=archive)
+        assert digest(archive) == read_snapshot(index)["feed_sha256"]
+    assert overlaps == [True]
 
 
 @pytest.mark.parametrize("currency", ["rub", "rUr"])

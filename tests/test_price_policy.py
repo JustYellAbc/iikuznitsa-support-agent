@@ -374,7 +374,9 @@ def test_buyer_views_hide_price_when_policy_disables_it(tmp_path):
 
 
 @pytest.mark.parametrize("show_price", [True, False])
-@pytest.mark.parametrize("question", ["Есть ли в наличии?", "Какая цена и есть ли в наличии?"])
+@pytest.mark.parametrize(
+    "question", ["Есть ли в наличии?", "Какая цена и есть ли в наличии?", "Доступен ли товар?", "Программа доступна?"]
+)
 def test_availability_handoff_keeps_question_sku_and_current_visibility(api, tmp_path, show_price, question):
     from tests.test_feed_refresh import LIMITS, write_feed
 
@@ -398,3 +400,29 @@ def test_availability_handoff_keeps_question_sku_and_current_visibility(api, tmp
     if not show_price:
         events = json.dumps(api.events(cid), ensure_ascii=False)
         assert "250050" not in events and "2 500" not in events
+
+
+@pytest.mark.parametrize(
+    "sku,question",
+    [
+        ("t1", "Доступен ли товар?"),
+        ("t3", "Можно ли расширить число доступных лицензий?"),
+        ("t3", "Доступны ли обновления после покупки?"),
+        ("t3", "Доступен ли перенос лицензии?"),
+    ],
+)
+def test_stock_routing_requires_unconfirmed_stock_and_a_stock_question(api, tmp_path, sku, question):
+    from tests.test_feed_refresh import LIMITS, write_feed
+
+    refresh(
+        write_feed(tmp_path / "stock.xml", "2026-11-25 10:00"), tmp_path / "private/catalog.sqlite3", KNOWLEDGE, LIMITS
+    )
+    cid = api.new_conversation()
+    api.login()
+    for message in (f"Артикул {sku}", question):
+        assert api.say(cid, message).status_code == 202
+        api.idle()
+    assert api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] == []
+    if sku == "t1":
+        answer = api.events(cid)[-1]["data"]
+        assert "наличии" in answer["text"].lower() and answer["sources"]

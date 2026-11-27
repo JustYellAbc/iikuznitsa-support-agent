@@ -16,12 +16,12 @@ from app.agent.catalog_selection import (
     offer_product,
     result,
 )
-from app.agent.handoff import OFFER_HELP, PRICE
+from app.agent.handoff import OFFER_HELP, PRICE, STOCK
 from app.contracts.t04 import Product, Source
 from app.services.price_policy import is_supported_currency
 
 TOPICS = {
-    "availability": r"в наличии|\bналичи[еяю]\b|доступ(?:ен|на|но|ны) ли",
+    "availability": STOCK.pattern,
     "term": r"\bсрок\b|срок[аи] (?:действия|лицензии|подписки)|на (?:сколько|год)|сколько (?:лет|месяц)|длительность",
     "updates": r"обновлен|что (?:точно )?входит",
     "rights": r"навсегда|бессроч|пользоваться после|после (?:окончания|истечения)|останется ли",
@@ -70,7 +70,7 @@ GENERIC_NOUN = re.compile(
 def topics_for(text: str, has_products: bool) -> set[str]:
     body = text.casefold()
     if not PRICE.search(body) and not re.search(
-        r"\?|\b(?:како\w*|какая|какие|как|что|есть ли|можно ли|сколько|когда|где|подскажите|навсегда|бессроч\w*)\b",
+        r"\?|\b(?:како\w*|какая|какие|как|что|ли|сколько|когда|где|подскажите|навсегда|бессроч\w*)\b",
         body,
     ):
         return set()
