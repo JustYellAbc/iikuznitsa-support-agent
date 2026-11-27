@@ -347,6 +347,44 @@ def test_missing_capacity_only_retries_if_the_evidence_changes(api, provider):
     assert all(event["type"] not in {"handoff", "products"} for event in events)
 
 
+@pytest.mark.usefixtures("index")
+@pytest.mark.parametrize(
+    ("opening", "reply", "codes"),
+    [
+        ("MDaemon на 20 пользователей для компании", "Это новая покупка, берём впервые.", {"new20"}),
+        (
+            "MDaemon для компании",
+            "Первая покупка. Покажите для сравнения варианты на 5 и 20 пользователей.",
+            {"new5", "new20"},
+        ),
+    ],
+)
+def test_named_selection_resumes_after_customer_supplies_fields(api, provider, opening, reply, codes):
+    responses, requests = provider
+    responses.append(tool("select_licenses", variants=[{"name": "MDaemon"}]))
+    cid = api.new_conversation()
+    assert say(api, cid, opening)[-1]["purpose"] == "clarification"
+    events = say(api, cid, reply)
+    assert {p["offerId"] for e in events for p in e.get("products", [])} == codes
+    assert len(requests) == 1
+
+
+@pytest.mark.usefixtures("index")
+def test_named_selection_allows_new_topic_after_clarification(api, provider):
+    responses, requests = provider
+    responses.extend(
+        [
+            tool("select_licenses", variants=[{"name": "MDaemon"}]),
+            tool("select_licenses", variants=[{"name": "PaperDesk Pro"}]),
+        ]
+    )
+    cid = api.new_conversation()
+    say(api, cid, "MDaemon для компании")
+    events = say(api, cid, "Новая покупка. Вместо этого нужен PaperDesk Pro для юрлица.")
+    assert {p["offerId"] for e in events for p in e.get("products", [])} == {"desk"}
+    assert len(requests) == 2
+
+
 @pytest.mark.parametrize("request_text", ["два КП", "2 коммерческих предложения", "КП на каждый товар"])
 def test_separate_quotes_do_not_publish_a_combined_basket(api, index, provider, request_text):  # noqa: F811
     import sqlite3

@@ -240,6 +240,7 @@ class Result:
     suggestion: str = ""
     followup: Selection | None = None
     handoff_reason: HandoffReason | None = None
+    awaiting_fields: bool = False
 
 
 def result(text: str, purpose: str = "clarification", products=(), *, sources=()) -> Result:
@@ -460,7 +461,9 @@ def select(index: Path, selection: Selection) -> Result:
         elif expired and len(expired) < len(rows):
             questions.append("Подписка ещё действует или уже истекла?")
     if questions:
-        return result(prefix + " ".join(questions), sources=[source])
+        pending = result(prefix + " ".join(questions), sources=[source])
+        pending.awaiting_fields = True
+        return pending
     products = [offer_product(r) for r in rows[:3]]
     if len(rows) != 1:
         options = "; ".join(f"{p.name} (ID {p.offerId})" for p in products)

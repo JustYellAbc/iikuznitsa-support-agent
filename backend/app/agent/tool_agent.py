@@ -27,14 +27,20 @@ from app.agent.handoff import (
     route_action,
 )
 from app.agent.knowledge import keeps_question_qualifiers
-from app.agent.license_options import SelectionInputError, alternate_proposals, quote_preview, resolve_options
+from app.agent.license_options import (
+    SelectionInputError,
+    alternate_proposals,
+    followup_capacities,
+    quote_preview,
+    resolve_options,
+)
 from app.agent.product_answers import topics_for
 from app.agent.quote_intent import offers_quote
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, StepTrace
 from app.contracts.t04 import Product, Source
 from app.core.llm import LLMError, llm_call
-from app.db.repository import new_id
+from app.db.repository import new_id, visible_turns
 from eval.pii import scrub_pii
 
 MAX_OUTPUT_TOKENS = 800
@@ -627,10 +633,13 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                 buyer_turns = [prior, text]
         start = time.monotonic()
         hits = await asyncio.to_thread(resolve_options, index, args.variants, buyer_turns)
+        trace_args = {"variants": len(hits)}
+        if len(hits) == 1 and hits[0].awaiting_fields:
+            trace_args["pending_name"] = args.variants[0].name
         await record(
             StepTrace(
                 tool="select_licenses",
-                args={"variants": len(hits)},
+                args=trace_args,
                 latency_ms=int((time.monotonic() - start) * 1000),
                 result_summary="Проверен подбор по условиям каталога",
             )
@@ -723,6 +732,19 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         if ABOUT_ASSISTANT.fullmatch(" ".join(text.casefold().strip(" .!?").split())):
             return CAPABILITIES, "answer", [], [], None
         turns = discovery_context(history, text)
+        capacities = followup_capacities(text) if len(turns) > 1 and kb_retry is None else None
+        if capacities is not None and history[-1].sources:
+            prior_turns = await visible_turns(session.id)
+            last_steps = prior_turns[-1].steps if prior_turns else []
+            if last_steps and last_steps[-1].result_summary == "clarification":
+                name = next((s.args.get("pending_name") for s in last_steps if s.tool == "select_licenses"), None)
+                if name:
+                    try:
+                        return await select_licenses(
+                            LicenseOptions(variants=[LicenseVariant(name=name, seats=n) for n in capacities])
+                        )
+                    except SelectionInputError:
+                        pass  # The saved name or quantities no longer match the buyer's words.
         if (
             len(turns) == 1
             and not previous

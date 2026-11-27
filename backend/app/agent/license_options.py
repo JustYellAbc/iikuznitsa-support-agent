@@ -9,6 +9,34 @@ from app.agent.quote_calculation import Item, catalog_lines
 from app.core.errors import ApiError
 from app.core.llm import LLMError
 
+CAPACITY_LIST = re.compile(r"\b(\d+(?:\s*(?:,|и|или)\s*\d+)+)\s+(?:мест|пользовател)", re.I)
+# Only resume automatically when the entire reply supplies purchase fields.
+# Mixed requests (new product, exclusions, documents, etc.) go through the model.
+FIELD_REPLY = re.compile(
+    r"(?:это|мы|на|для|и|или|покупа(?:ет|ем)|бер[её]м|впервые|первая|новая|покупка|"
+    r"коммерческ(?:ое|ая|ой)|юрлицо|компани[яию]|организаци[яию]|физлицо|"
+    r"электронная|коробочная|поставка|месяц(?:а|ев)?|год|лет|"
+    r"покажите|сравнения|вариант(?:ы|а)?|пользовател(?:я|ей|ь)|мест(?:о|а)?|\d{1,6})",
+    re.I,
+)
+
+
+def followup_capacities(text):
+    """None delegates interpretation; [None] inherits capacity from the conversation."""
+    words = re.findall(r"\w+|[^\w\s.,!]", text)
+    if not words or not all(FIELD_REPLY.fullmatch(word) for word in words):
+        return None
+    if Selection("").qualifiers(text, followup=True) == Selection(""):
+        return None
+    if re.search(r"\bили\b", CAPACITY_LIST.sub("", text), re.I):
+        return None
+    counts = [int(n) for group in CAPACITY_LIST.finditer(text) for n in re.findall(r"\d+", group[1])]
+    counts.extend(int(n) for n in SEATS.findall(text))
+    if set(re.findall(r"\d+", text)) - set(re.findall(r"\d+(?=\s*(?:месяц|год|лет))", text)) - {str(n) for n in counts}:
+        return None
+    counts = list(dict.fromkeys(counts))
+    return (counts or [None]) if len(counts) <= 5 and all(0 < n <= 1000000 for n in counts) else None
+
 
 class SelectionInputError(ValueError):
     """A tool argument that cannot be verified against the customer's request."""
@@ -111,7 +139,7 @@ def license_selection(name, seats, turns):
             selection.delivery = types.pop()
     if seats is not None:
         counts = {int(n) for n in SEATS.findall(scope[-1])}
-        for group in re.finditer(r"\b(\d+(?:\s*(?:,|и|или)\s*\d+)+)\s+(?:мест|пользовател)", scope[-1], re.I):
+        for group in CAPACITY_LIST.finditer(scope[-1]):
             counts.update(int(n) for n in re.findall(r"\d+", group[1]))
         if seats != selection.seats and seats not in counts:
             raise SelectionInputError(
