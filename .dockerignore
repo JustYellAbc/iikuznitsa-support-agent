@@ -2,6 +2,9 @@
 .venv
 .env
 .env.*
+.local
+.DS_Store
+config/pricing.yaml
 data
 data_raw
 frontend
@@ -11,6 +14,9 @@ tests
 **/.pytest_cache
 **/.ruff_cache
 *.db
+*.sqlite*
+*.pem
+*.key
 *.xml
 *.gz
 *.zip

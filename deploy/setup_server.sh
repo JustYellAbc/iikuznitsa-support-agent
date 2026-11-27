@@ -47,7 +47,7 @@ fi
 grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
 echo "==> Папки данных"
-mkdir -p "$REPO_DIR/data/raw" "$REPO_DIR/data/quotes"
+mkdir -p "$REPO_DIR/data/raw" "$REPO_DIR/data/private" "$REPO_DIR/data/config" "$REPO_DIR/data/quotes"
 chown -R "$APP_UID:$APP_UID" "$REPO_DIR/data"
 
 if [[ ! -f "$REPO_DIR/.env" ]]; then
