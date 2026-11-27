@@ -102,6 +102,8 @@ FILES = {
     "chat.js": "text/javascript",
     "render.js": "text/javascript",
     "quote.js": "text/javascript",
+    "softline.png": "image/png",
+    "softline-white.png": "image/png",
 }
 
 
@@ -130,7 +132,8 @@ class Preview(BaseHTTPRequestHandler):
         if url.path.startswith("/chat/") and name in FILES:
             raw = (FRONTEND / "chat" / name).read_bytes()
             self.send_response(200)
-            self.send_header("Content-Type", FILES[name] + "; charset=utf-8")
+            mime = FILES[name]
+            self.send_header("Content-Type", mime + "; charset=utf-8" if mime.startswith("text/") else mime)
             self.end_headers()
             self.wfile.write(raw)
             return
