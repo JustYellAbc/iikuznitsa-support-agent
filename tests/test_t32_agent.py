@@ -225,9 +225,9 @@ def test_tools_retrieve_new_manager_publication_for_different_buyer(api, provide
     pid = propose(api, hid)
     assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
     responses, requests = provider
-    responses.extend([tool("search_knowledge", query="уведомления"), {"content": ANSWER}])
+    responses.extend([tool("search_knowledge", query=QUESTION), {"content": ANSWER}])
     cid = api.new_conversation("second")
-    assert api.say(cid, QUESTION, role="second").status_code == 202
+    assert api.say(cid, "Хочу управлять уведомлениями магазина", role="second").status_code == 202
     api.idle()
     reply = api.events(cid, role="second")[-1]["data"]
     assert reply["text"] == ANSWER and len(requests) == 2

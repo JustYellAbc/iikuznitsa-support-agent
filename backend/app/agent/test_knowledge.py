@@ -114,6 +114,30 @@ def test_early_approval_is_retryable_after_close(stand_api):  # noqa: F811
     assert ask_new_buyer(api, QUESTION)[1]["text"] == ANSWER
 
 
+def test_tools_use_new_article_on_first_question_and_explicit_recheck(stand_api, monkeypatch):  # noqa: F811
+    api = stand_api
+    _, hid = source_case(api)
+    question = "Как изменить адрес доставки?"
+    pid = propose(api, hid, question=question)
+    # The first buyer asked while the FAQ was still a draft.
+    cid, draft = ask_new_buyer(api, question)
+    assert draft["text"] != ANSWER
+    assert api.call("manager", "POST", f"{PATCHES}/{pid}/approve").status_code == 200
+    monkeypatch.setattr(get_settings(), "agent_engine", "tools")
+    assert api.say(cid, "Проверь базу, там это есть", role="second").status_code == 202
+    api.idle()
+    retry = api.events(cid, role="second")[-1]["data"]
+    assert retry["text"] == ANSWER and retry["sources"][0]["url"].endswith(ARTICLE_PATH + pid)
+    _, first = ask_new_buyer(api, "Хеллоу, как мне поменять адрес доставки?")
+    assert first["text"] == ANSWER and first["sources"] == retry["sources"]
+
+
+def test_recheck_without_a_specific_question_asks_which(stand_api, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(get_settings(), "agent_engine", "tools")
+    _, reply = ask_new_buyer(stand_api, "Проверьте базу знаний")
+    assert reply["text"] == "Какой именно вопрос проверить в базе знаний?" and not reply["sources"]
+
+
 def test_manager_can_recover_a_premature_approval_from_an_older_database(stand_api):  # noqa: F811
     api = stand_api
     _, hid = source_case(api, resolve=False)
