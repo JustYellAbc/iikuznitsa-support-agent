@@ -78,7 +78,14 @@ def opening_chatter(text: str) -> bool:
 def handoff_reason(text: str) -> HandoffReason | None:
     if TENDER.search(text) and not NO_TENDER.search(text):
         return "tender"
-    if EXTRA_DOCUMENTS.search(text) or SPECIAL.search(text):
+    if (
+        EXTRA_DOCUMENTS.search(text)
+        or SPECIAL.search(text)
+        or (
+            re.search(r"\b(?:кп|коммерческ\w+ предложени\w*)\b", text)
+            and re.search(r"\b(?:с\s+(?:постоплатой|отсрочкой|индивидуальной скидкой)|со\s+скидкой)\b", text)
+        )
+    ):
         return "special_terms"
     if PARTNER.search(text):
         return "outside_catalog"

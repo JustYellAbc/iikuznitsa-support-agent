@@ -1,4 +1,5 @@
 import { renderEvent } from "./render.js";
+import { quoteEvent, resetQuotes, setupQuotes } from "./quote.js";
 
 const byId = id => document.getElementById(id);
 const panel = byId("chat"), launch = byId("launch"), message = byId("message");
@@ -56,12 +57,19 @@ function sync() {
 
 function updateHandoffs(handoff) {
   const selected = target.value;
-  if (handoff.status === "open") openHandoffs.set(handoff.handoffId, handoff.question);
+  const hadRecipient = openHandoffs.size > 0;
+  if (handoff.status === "open") openHandoffs.set(handoff.handoffId, handoff);
   else openHandoffs.delete(handoff.handoffId);
   target.replaceChildren();
-  for (const [id, question] of openHandoffs) target.add(new Option(question, id));
-  if (openHandoffs.has(selected)) target.value = selected;
-  byId("target-label").hidden = openHandoffs.size < 2;
+  for (const [id, item] of openHandoffs) target.add(new Option("Менеджеру — " + item.question, id));
+  target.add(new Option("Агенту поддержки", ""));
+  if (openHandoffs.has(selected) || (hadRecipient && !selected)) target.value = selected;
+  byId("target-label").hidden = openHandoffs.size === 0;
+  if ([...openHandoffs.values()].some(item => item.quoteLine)) {
+    byId("quote-open").textContent = "Изменить количество в КП";
+  } else if (handoff.quoteLine) {
+    byId("quote-open").textContent = "Изменить КП";
+  }
 }
 
 function showError(error, isAction) {
@@ -72,7 +80,7 @@ function showError(error, isAction) {
     closeStream();
     text = error.status === 401 ? "Войдите на стенд и обновите страницу." : "Диалог недоступен. Обновите страницу, чтобы начать заново.";
     state = {}; save();
-    log.replaceChildren(); openHandoffs.clear(); target.replaceChildren(); byId("target-label").hidden = true;
+    log.replaceChildren(); openHandoffs.clear(); resetQuotes(); target.replaceChildren(); byId("target-label").hidden = true;
     byId("welcome").hidden = false; message.value = "";
   }
   if (error.retryAfter > 0) {
@@ -90,7 +98,15 @@ function display(event) {
   if (event.seq !== cursor + 1) throw new Error("История пришла не полностью. Повторяем загрузку.");
   const scroller = byId("scroller");
   const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 72;
-  log.append(renderEvent(event));
+  if (event.data.type === "quote") {
+    for (const old of log.querySelectorAll("[data-confirm-quote]")) old.disabled = true;
+    for (const item of [...openHandoffs.values()]) {
+      if (item.quoteLine?.quoteId === event.data.quote.quoteId && item.quoteLine.revision < event.data.quote.revision)
+        updateHandoffs({...item,status:"resolved"});
+    }
+  }
+  log.append(renderEvent(event, state.id, submit));
+  quoteEvent(event.data);
   byId("welcome").hidden = true;
   cursor = event.seq;
   if (event.data.type === "handoff") updateHandoffs(event.data.handoff);
@@ -186,8 +202,14 @@ async function submit(body) {
   try {
     const receipt = await request(base + "/" + encodeURIComponent(state.id) + "/actions", state.pending.key, body);
     if (denied) return;
-    if (!receipt.actionId || receipt.conversationId !== state.id) throw new Error("Не удалось подтвердить отправку.");
-    state.receipt = completedActions.has(receipt.actionId) ? null : receipt.actionId;
+    if (body.type === "request_document" && receipt.documentId && receipt.quoteId === body.quoteId &&
+        receipt.revision === body.revision && /^\/api\/v1\/documents\/[\w.-]+$/.test(receipt.url)) {
+      state.receipt = null;
+      const link = document.createElement("a"); link.href = receipt.url; link.download = ""; link.click();
+    } else {
+      if (!receipt.actionId || receipt.conversationId !== state.id) throw new Error("Не удалось подтвердить отправку.");
+      state.receipt = completedActions.has(receipt.actionId) ? null : receipt.actionId;
+    }
     delete state.pending; save();
     if (body.type === "message") message.value = "";
     poll();
@@ -239,3 +261,4 @@ retry.onclick = () => {
   else poll();
 };
 if (state.pending) actionError = "Отправка не подтверждена. Можно повторить.";
+setupQuotes(() => state.id, request, newKey);
