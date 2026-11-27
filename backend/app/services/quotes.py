@@ -257,9 +257,9 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None, select
         if not d.reason:
             continue
         request = (
-            "Согласовать конечную цену за упаковку в рублях"
-            if d.reason == "price_request"
-            else "Проверить доступность и условия поставки"
+            "Согласовать цену за упаковку и подтвердить доступность поставки"
+            if not d.product.available
+            else "Согласовать конечную цену за упаковку в рублях"
         )
         question = f"{request}. КП, версия {q.revision}: {d.product.name}, ID {d.product.offerId}, {d.packages} уп."
         h = carry.get((d.product.offerId, d.reason))

@@ -192,6 +192,10 @@ def test_branch2_full_flow_for_disputed_skus(api, tmp_path, monkeypatch, sku, re
     handoff = queue[0]
     assert handoff["reason"] == reason
     assert handoff["quoteLine"] == {"quoteId": draft["quoteId"], "revision": 1, "offerId": sku}
+    assert handoff["question"].startswith(
+        "Согласовать цену за упаковку и подтвердить доступность поставки. КП, версия 1:"
+    )
+    assert f"ID {sku}, 3 уп." in handoff["question"]
     assert api.call("manager", "GET", f"/api/v1/conversations/{cid}/events").status_code == 200
 
     approve = api.call(
@@ -432,3 +436,60 @@ def test_no_duplicate_handoffs_between_chat_and_quote_revisions(api, tmp_path, m
     assert len(open2_rev2) == 1
     assert open2_rev2[0]["handoffId"] == quote_h["handoffId"]
     assert open2_rev2[0]["quoteLine"]["revision"] == 2
+
+
+def test_multi_line_quote_price_question_marks_reselect_and_creates_workable_handoff(api, tmp_path, monkeypatch):
+    """P1-1: quote [61557, 504] rev 1 -> price question on 504 marks rev 1 reselect and opens a workable handoff."""
+    monkeypatch.setattr(get_settings(), "rate_limit_session_msg_per_min", 50)
+    api.login()
+
+    cid = _setup_branch2(api, tmp_path, ["61557", "504"])
+    assert request(api, cid, [("61557", 2), ("504", 1)]).status_code == 202
+    [quote_h] = [
+        h for h in api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] if h["conversationId"] == cid
+    ]
+    assert quote_h["reason"] == "price_request"
+    assert quote_h["quoteLine"]["revision"] == 1 and quote_h["quoteLine"]["offerId"] == "504"
+
+    asked = api.say(cid, "Какая цена на артикул 504?")
+    assert asked.status_code == 202
+    api.idle()
+
+    current = api.call("customer", "GET", f"/api/v1/conversations/{cid}/quotes/current").json()
+    assert current["revision"] == 1 and current["requiresReselection"] is True
+
+    turn_types = [e["data"]["type"] for e in api.events(cid) if e["actionId"] == asked.json()["actionId"]]
+    assert turn_types == ["message", "products", "message", "handoff"]
+
+    stale = api.call(
+        "manager",
+        "POST",
+        f"/api/v1/manager/handoffs/{quote_h['handoffId']}/resolution",
+        json={"type": "close", "reply": "Устаревшая карточка"},
+    )
+    assert stale.status_code == 409 and stale.json()["code"] == "stale_revision"
+
+    open_handoffs = [
+        h for h in api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] if h["conversationId"] == cid
+    ]
+    chat_handoffs = [h for h in open_handoffs if not h.get("quoteLine")]
+    assert len(chat_handoffs) == 1
+    chat_h = chat_handoffs[0]
+    assert chat_h["handoffId"] != quote_h["handoffId"]
+    assert chat_h["reason"] == "price_request"
+    assert [p["offerId"] for p in chat_h["products"]] == ["504"]
+
+    reply_res = api.call(
+        "manager",
+        "POST",
+        f"/api/v1/manager/handoffs/{chat_h['handoffId']}/resolution",
+        json={"type": "reply", "reply": "Уточняю стоимость позиции 504."},
+    )
+    assert reply_res.status_code == 202
+    close_res = api.call(
+        "manager",
+        "POST",
+        f"/api/v1/manager/handoffs/{chat_h['handoffId']}/resolution",
+        json={"type": "close", "reply": "Ориентировочная цена — 1250,50 руб., для КП выберите актуальные позиции."},
+    )
+    assert close_res.status_code == 202

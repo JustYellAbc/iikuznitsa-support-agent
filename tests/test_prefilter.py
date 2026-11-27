@@ -320,9 +320,71 @@ def test_customer_cannot_rewrite_prices_or_approve_lines(api: Api, tmp_path):
     path = f"/api/v1/manager/handoffs/{line['handoffId']}/resolution"
     r = api.call("customer", "POST", path, json=decision)
     assert r.status_code == 403 and r.json()["code"] == "forbidden"
-    # Доступность не подтверждается согласованием цены даже оператором.
-    assert api.call("manager", "POST", path, json=decision).json()["code"] == "terms_pending"
     assert last_quote(api, cid) == quote
+    assert command(api, cid, quote, "confirm_quote").json()["code"] == "terms_pending"
+    assert api.call("customer", "POST", actions(cid), json=invoice).json()["code"] == "terms_pending"
+
+    # Явное approve_line_price менеджера разблокирует именно подтверждённую строку текущей ревизии;
+    # в этом диалоге общий статус остаётся needs_review из-за незафиксированных особых условий.
+    assert api.call("manager", "POST", path, json=decision).status_code == 202
+    rev2 = last_quote(api, cid)
+    assert (rev2["revision"], rev2["knownSubtotalKopecks"], rev2["state"], rev2["totalKopecks"]) == (
+        2,
+        20001,
+        "needs_review",
+        None,
+    )
+    assert [(item["offerId"], item["unitPriceKopecks"]) for item in rev2["lines"]] == [("t1", 10000), ("t3", 1)]
+
+    # Без особых условий: до approve_line_price (и после free-text close) available=false остаётся в needs_review,
+    # а явное approve_line_price менеджера разблокирует именно эту строку текущей ревизии.
+    cid_clean = setup_quote(api, tmp_path, ["t1", "t3"], rules=True)
+    assert request(api, cid_clean, [("t1", 2), ("t3", 1)]).status_code == 202
+    clean_v1 = last_quote(api, cid_clean)
+    assert (clean_v1["revision"], clean_v1["state"], clean_v1["totalKopecks"]) == (1, "needs_review", None)
+    assert command(api, cid_clean, clean_v1, "confirm_quote").json()["code"] == "terms_pending"
+    clean_inv1 = {"type": "request_document", "kind": "demo_invoice", "quoteId": clean_v1["quoteId"], "revision": 1}
+    assert api.call("customer", "POST", actions(cid_clean), json=clean_inv1).json()["code"] == "terms_pending"
+
+    [clean_h1] = [
+        h
+        for h in api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+        if h["conversationId"] == cid_clean and h.get("quoteLine")
+    ]
+    assert (
+        api.call(
+            "manager",
+            "POST",
+            f"/api/v1/manager/handoffs/{clean_h1['handoffId']}/resolution",
+            json={"type": "close", "reply": "Поставка возможна, цена 1 рубль."},
+        ).status_code
+        == 202
+    )
+    assert last_quote(api, cid_clean) == clean_v1
+    assert command(api, cid_clean, clean_v1, "confirm_quote").json()["code"] == "terms_pending"
+    assert api.call("customer", "POST", actions(cid_clean), json=clean_inv1).json()["code"] == "terms_pending"
+
+    assert request(api, cid_clean, [("t1", 2), ("t3", 2)], revision=1).status_code == 202
+    clean_v2 = last_quote(api, cid_clean)
+    assert (clean_v2["revision"], clean_v2["state"], clean_v2["totalKopecks"]) == (2, "needs_review", None)
+    [clean_h2] = [
+        h
+        for h in api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]
+        if h["conversationId"] == cid_clean and h.get("quoteLine")
+    ]
+    assert (
+        api.call(
+            "manager",
+            "POST",
+            f"/api/v1/manager/handoffs/{clean_h2['handoffId']}/resolution",
+            json={"type": "approve_line_price", **clean_h2["quoteLine"], "unitPriceKopecks": 500},
+        ).status_code
+        == 202
+    )
+    clean_v3 = last_quote(api, cid_clean)
+    assert (clean_v3["revision"], clean_v3["state"], clean_v3["totalKopecks"]) == (3, "ready", 21000)
+    assert [(item["offerId"], item["unitPriceKopecks"]) for item in clean_v3["lines"]] == [("t1", 10000), ("t3", 500)]
+    assert command(api, cid_clean, clean_v3, "confirm_quote").status_code == 202
 
 
 # --- Замер на открытой выборке T02 ---------------------------------------------------------
