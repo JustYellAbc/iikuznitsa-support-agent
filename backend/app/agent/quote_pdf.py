@@ -12,7 +12,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from app.agent.quote_calculation import Snapshot, amount_vat
 
@@ -62,18 +62,28 @@ def render(snapshot: Snapshot) -> bytes:
         title="Коммерческое предложение",
     )
     q = snapshot.quote
-    story = [
-        para("ПАО «Софтлайн»", 15, True),
-        para("119021, Москва, ул. Льва Толстого, д. 5, стр. 1 · +7 495 232 00 23 · info@softline.com"),
-        Spacer(1, 8 * mm),
-        para("Коммерческое предложение", 19, True),
-        para(
-            f"{'Черновик · ' if q.state == 'needs_review' else ''}Версия {q.revision} · "
-            f"Исх. № {q.quoteId} от {snapshot.dated:%d.%m.%Y}"
-        ),
-        Spacer(1, 5 * mm),
+    letterhead = Image(
+        str(Path(__file__).with_name("softline-letterhead.jpg")), width=43 * mm, height=43 * 75 / 381 * mm
+    )
+    recipient = [
         para(f"Куда: {snapshot.customer.company}", 10, True),
         para(f"ИНН {snapshot.customer.inn}   КПП {snapshot.customer.kpp}"),
+        para(f"Исх. № {q.quoteId.removeprefix('q_')[:12]} от {snapshot.dated:%d.%m.%Y}"),
+    ]
+    sender = [
+        letterhead,
+        Spacer(1, 2 * mm),
+        para("ПАО «Софтлайн»", 9, True),
+        para("119021, Москва, ул. Льва Толстого, д. 5, стр. 1"),
+        para("+7 495 232 00 23 · info@softline.com"),
+    ]
+    heading = Table([[sender, recipient]], colWidths=[87 * mm, 87 * mm], hAlign="LEFT")
+    heading.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    story = [
+        heading,
+        Spacer(1, 8 * mm),
+        para("Коммерческое предложение", 19, True),
+        para(f"{'Черновик · ' if q.state == 'needs_review' else ''}Версия {q.revision}"),
         Spacer(1, 4 * mm),
         para("Уважаемый заказчик! Предлагаем вашему вниманию следующие позиции."),
         Spacer(1, 3 * mm),

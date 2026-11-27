@@ -35,6 +35,11 @@ from app.db.database import get_db
 
 STALE = "Условия изменились. Откройте последнюю версию расчёта."
 NO_QUOTE = "Расчёт не найден."
+BUYER_FIELDS = (
+    r"((?:ООО|ПАО|АО|АНО|ФГУП|МУП|ГУП)\s+(?:«[^«»\n]{1,150}»|\"[^\"\n]{1,150}\"|[а-яёa-z0-9-]+))"
+    r"\s*[,;]\s*ИНН\s*[: ]\s*([0-9]{10})\s*[,; ]+\s*КПП\s*[: ]\s*([0-9]{4}[0-9A-Z]{2}[0-9]{3})"
+)
+CHANGE_QUOTE = r"(?:измените|поменяйте|пересчитайте|обновите|переделайте)\s+(?:наше\s+)?(?:кп|коммерческое предложение)"
 
 
 async def latest(cid):
@@ -71,6 +76,25 @@ async def published(cid, qid, revision):
 async def require_published(row):
     if row and not await published(row["conversation_id"], row["quote_id"], row["revision"]):
         raise ApiError(409, "terms_pending", "Ревизию КП проверяет менеджер.")
+
+
+async def check_exceptions(cid, offer_ids):
+    rows = await get_db().fetchall(
+        "SELECT products FROM handoffs WHERE conversation_id=? AND status='open' "
+        "AND reason IN ('tender','special_terms','outside_catalog')",
+        (cid,),
+    )
+    for row in rows:
+        products = json.loads(row["products"])
+        if not products or any(p["offerId"] in offer_ids for p in products):
+            raise ApiError(409, "terms_pending", "Сначала дождитесь решения менеджера по особым условиям этой закупки.")
+
+
+async def check_line_revision(handoff):
+    if handoff.quoteLine:
+        row = await latest(handoff.conversationId)
+        if row is None or row["revision"] != handoff.quoteLine.revision or row["reselect"]:
+            raise ApiError(409, "stale_revision", STALE)
 
 
 async def save_revision(conn, cid, action_id, snapshot, *, resolved=None):
@@ -143,15 +167,16 @@ async def save_revision(conn, cid, action_id, snapshot, *, resolved=None):
 async def from_message(cid: str, text: str):
     """Unambiguous single-SKU purchase or pack count. Mixed intents stay in the normal agent flow."""
     seats = re.fullmatch(
-        r"(?:теперь\s+|вместо \d+ (?:нужно |на )?)?(?:нужно |нужны |на )?([1-9]\d{0,4})\s+"
-        r"(?:мест[ао]?|пользовател(?:я|ей|ь))(?:\s+для\s+(?:обоих|всех)\s+(?:продуктов|позиций))?[.! ]*",
+        rf"(?:(?:{CHANGE_QUOTE})\s+|теперь\s+|вместо \d+ (?:нужно |на )?)?(?:нужно |нужны |на )?([1-9]\d{{0,4}})\s+"
+        r"(?:мест[ао]?|пользовател(?:я|ей|ь))(?:\s+для\s+(?:обоих|всех)\s+(?:продуктов|позиций))?"
+        rf"(?:\s+для\s+{BUYER_FIELDS})?[.! ]*",
         text.strip(),
         re.I,
     )
     if seats and (current := await latest(cid)):
         old = read(current)
         req = ProposalRequest(
-            customer=old.customer,
+            customer=Customer(company=seats[2], inn=seats[3], kpp=seats[4].upper()) if seats[2] else old.customer,
             items=[Item(offerId=d.product.offerId, packages=d.packages) for d in old.details],
             baseRevision=old.quote.revision,
         )
@@ -165,13 +190,19 @@ async def from_message(cid: str, text: str):
     order = re.fullmatch(
         r"(?:да[, ]+)?(?:бер[её]м|оформите|пришлите|подготовьте|нужно|хочу)\s+"
         r"(?:кп|коммерческое предложение)(?:\s+на\s+([1-9]\d{0,4})\s+упаков(?:ка|ки|ок|ку))?"
-        r"\s*[,;]?\s*(?:для\s+)?((?:ООО|ПАО|АО|АНО|ФГУП|МУП|ГУП)\s+"
-        r"(?:«[^«»\n]{1,150}»|\"[^\"\n]{1,150}\"|[а-яёa-z0-9-]+))\s*[,;]\s*ИНН\s*[: ]\s*([0-9]{10})"
-        r"\s*[,; ]+\s*КПП\s*[: ]\s*([0-9]{4}[0-9A-Z]{2}[0-9]{3})[.! ]*",
+        rf"\s*[,;]?\s*(?:для\s+)?{BUYER_FIELDS}[.! ]*",
         text.strip(),
         re.I,
     )
     if not (quantity or order):
+        if re.match(CHANGE_QUOTE + r"\b", text.strip(), re.I):
+            # Unparsed explicit change goes through normal product discovery, but old terms are no longer actionable.
+            async with get_db().tx() as conn:
+                await conn.execute(
+                    "UPDATE quote_revisions SET reselect=1 WHERE conversation_id=? AND revision="
+                    "(SELECT max(revision) FROM quote_revisions WHERE conversation_id=?)",
+                    (cid, cid),
+                )
         return None
     products = await repo.last_products(cid)
     if len(products) != 1:
@@ -210,6 +241,7 @@ async def prepare(cid, request: ProposalRequest, customer_message: str | None = 
 
 async def prepare_revision(conn, cid, request, customer_message, seats):
     ids = [i.offerId for i in request.items]
+    await check_exceptions(cid, ids)
     if len(ids) != len(set(ids)):
         raise invalid_input("Каждую позицию укажите один раз с нужным количеством упаковок.")
     current = await latest(cid)
@@ -327,6 +359,7 @@ async def quote_action(cid, action: ConfirmQuoteAction | RequestDocumentAction):
         row = await latest(cid)
         snapshot = current_quote(row, action.quoteId, action.revision)
         await require_published(row)
+        await check_exceptions(cid, [d.product.offerId for d in snapshot.details])
         if row["reselect"]:
             raise ApiError(409, "stale_revision", "Покупатель изменил потребность. Требуется актуальный подбор.")
         q = snapshot.quote
@@ -376,6 +409,7 @@ async def approve_price(handoff, decision: ApproveLinePriceDecision):
         row = await latest(cid)
         snapshot = current_quote(row, decision.quoteId, decision.revision)
         await require_published(row)
+        await check_exceptions(cid, [d.product.offerId for d in snapshot.details])
         if row["reselect"]:
             raise ApiError(409, "stale_revision", STALE)
         if ref.revision != decision.revision:

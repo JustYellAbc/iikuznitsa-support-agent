@@ -145,6 +145,7 @@ async def _customer_message(conv: repository.Conversation, action: MessageAction
         found = await repository.get_handoff(action.handoffId)
         if found is None or found.handoff.conversationId != cid:
             raise not_found(HANDOFF_NOT_FOUND)
+        await quotes.check_line_revision(found.handoff)
         if found.handoff.status != "open":
             raise ApiError(409, "already_resolved", "Обращение уже закрыто.")
         data = MessageData(author="customer", purpose="input", text=text, sources=[], handoffId=action.handoffId)
@@ -225,6 +226,7 @@ async def resolve_handoff(handoff_id: str, decision: ManagerDecision) -> Result:
     handoff = found.handoff
     if handoff.status != "open":
         raise ApiError(409, "already_resolved", "Обращение уже закрыто.")
+    await quotes.check_line_revision(handoff)
     if not isinstance(decision, ReplyDecision):
         return await quotes.approve_price(handoff, decision)
 

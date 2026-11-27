@@ -84,6 +84,43 @@ def test_seats_change_all_licenses_and_preserve_pack_quantities(api, tmp_path):
     q = last_quote(api, cid)
     assert (q["revision"], q["knownSubtotalKopecks"]) == (2, 30000)
     assert [(r["offerId"], r["packages"]) for r in q["lines"]] == [("sv40", 1), ("cn40", 2)]
+    api.say(cid, "Измените КП на 20 пользователей для ООО «Проверка», ИНН 7700000001, КПП 770001001")
+    api.idle()
+    revised = last_quote(api, cid)
+    assert [(r["offerId"], r["packages"]) for r in revised["lines"]] == [("sv20", 1), ("cn20", 2)]
+    assert command(api, cid, q, "confirm_quote").json()["code"] == "stale_revision"
     api.say(cid, "Теперь нужно 45 мест для обоих продуктов.")
     api.idle()
-    assert command(api, cid, q, "confirm_quote").json()["code"] == "stale_revision"
+    assert command(api, cid, revised, "confirm_quote").json()["code"] == "stale_revision"
+
+
+def test_open_special_terms_block_form_confirmation_and_issue(api, tmp_path):
+    cid = setup_quote(api, tmp_path, ["t1"], rules=True)
+    assert request(api, cid, [("t1", 1)]).status_code == 202
+    q = last_quote(api, cid)
+    api.say(cid, "Пришлите КП с постоплатой для ООО «Проверка», ИНН 7700000001, КПП 770001001")
+    api.idle()
+    assert request(api, cid, [("t1", 2)], 1).json()["code"] == "terms_pending"
+    assert command(api, cid, q, "confirm_quote").json()["code"] == "terms_pending"
+    act = {"type": "request_document", "kind": "quote_pdf", "quoteId": q["quoteId"], "revision": q["revision"]}
+    assert (
+        api.call("customer", "POST", f"/api/v1/conversations/{cid}/actions", json=act).json()["code"] == "terms_pending"
+    )
+
+
+def test_removed_line_does_not_accept_replies_from_either_role(api, tmp_path):
+    cid = setup_quote(api, tmp_path, ["t1", "t2"])
+    assert request(api, cid, [("t1", 1), ("t2", 1)]).status_code == 202
+    api.login()
+    [case] = [h for h in api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] if h.get("quoteLine")]
+    assert request(api, cid, [("t1", 1)], 1).status_code == 202
+    assert api.say(cid, "Новый вопрос", handoffId=case["handoffId"]).json()["code"] == "stale_revision"
+    assert (
+        api.call(
+            "manager",
+            "POST",
+            f"/api/v1/manager/handoffs/{case['handoffId']}/resolution",
+            json={"type": "reply", "reply": "Получил"},
+        ).json()["code"]
+        == "stale_revision"
+    )

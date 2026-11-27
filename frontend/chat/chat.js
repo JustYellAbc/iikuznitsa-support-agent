@@ -56,10 +56,10 @@ function sync() {
 
 function updateHandoffs(handoff) {
   const selected = target.value;
-  if (handoff.status === "open") openHandoffs.set(handoff.handoffId, handoff.question);
+  if (handoff.status === "open") openHandoffs.set(handoff.handoffId, handoff);
   else openHandoffs.delete(handoff.handoffId);
   target.replaceChildren();
-  for (const [id, question] of openHandoffs) target.add(new Option(question, id));
+  for (const [id, item] of openHandoffs) target.add(new Option(item.question, id));
   if (openHandoffs.has(selected)) target.value = selected;
   byId("target-label").hidden = openHandoffs.size < 2;
 }
@@ -92,6 +92,10 @@ function display(event) {
   const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 72;
   if (event.data.type === "quote") {
     for (const old of log.querySelectorAll("[data-confirm-quote]")) old.disabled = true;
+    for (const item of [...openHandoffs.values()]) {
+      if (item.quoteLine?.quoteId === event.data.quote.quoteId && item.quoteLine.revision < event.data.quote.revision)
+        updateHandoffs({...item,status:"resolved"});
+    }
   }
   log.append(renderEvent(event, state.id, submit));
   quoteEvent(event.data);

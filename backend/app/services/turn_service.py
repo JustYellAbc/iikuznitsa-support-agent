@@ -163,6 +163,11 @@ async def send_draft(draft_id: str, text: str | None) -> list[dict[str, Any]] | 
         if draft is None or draft.status != "pending":
             return None
         datas = [dict(d) for d in draft.events]
+        for data in datas:
+            if data.get("type") == "quote":
+                from app.services.quotes import check_exceptions
+
+                await check_exceptions(draft.conversation_id, [line["offerId"] for line in data["quote"]["lines"]])
         messages = [d for d in datas if d.get("type") == "message"]
         if text is not None and not messages:
             datas.append(MessageData(author="agent", purpose="answer", text=text, sources=[]).model_dump(mode="json"))
