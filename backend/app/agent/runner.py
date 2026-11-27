@@ -38,12 +38,13 @@ from app.agent.handoff import (
     handoff_reason,
     route_action,
 )
+from app.agent.knowledge import answer_published
 from app.agent.product_answers import answer_facts, question_target, refresh_products, topics_for
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, Message, Session, StepTrace
 from app.contracts.t04 import Product
 from app.core.llm import llm_call
-from app.db.repository import last_products, list_turns, new_id
+from app.db.repository import last_products, new_id, visible_turns
 
 EmitStep = Callable[[StepTrace], Awaitable[None]]
 
@@ -69,14 +70,24 @@ async def run_turn(
     products: list[Product] | None = None,
     finding: SearchFinding | None = None,
 ) -> AgentReply:
+    if products is None:
+        products = [Product.model_validate(p) for p in await last_products(session.id)]
+    # Approved procedures can interrupt an active selection. Commercial facts and
+    # mandatory handoffs always keep their own source, regardless of punctuation.
+    if (
+        action_type == "message"
+        and not topics_for(user_text + "?", bool(products))
+        and not route_action(history, user_text, products, action_type=action_type, finding=finding)
+    ):
+        published = await answer_published(session.id, user_text, emit_step)
+        if published:
+            return published
     recommendation = await needs.run_turn(
         session, history, user_text, emit_step, action_type=action_type, finding=finding
     )
     if recommendation:
         return recommendation
     started = time.perf_counter()
-    if products is None:
-        products = [Product.model_validate(p) for p in await last_products(session.id)]
     original_products = products
     index = get_settings().data_dir / "private" / "catalog.sqlite3"
     bare = bare_request(user_text.casefold())
@@ -93,18 +104,22 @@ async def run_turn(
     suggestion = ""
     options = []
     pending_question = ""
+    awaiting_seats = False
     if history:
-        turns = await list_turns(session.id)
-        if turns and turns[-1].decision == "answer" and turns[-1].steps:
+        turns = [t for t in await visible_turns(session.id) if not t.steps or t.steps[0].tool != "published_knowledge"]
+        if turns and turns[-1].decision in {"answer", "draft"} and turns[-1].steps:
             last_step = turns[-1].steps[-1]
             pending_question = last_step.args.get("awaiting_product_for", "")
+            awaiting_seats = last_step.args.get(
+                "awaiting_seats", "На сколько пользователей" in last_step.result_summary
+            )
             if route and (bare or route.reason == "insufficient_evidence") and last_step.tool == "product_facts":
                 route = replace(route, question=last_step.args.get("question", route.question))
         for turn in reversed(turns):
             if not turn.steps:
                 break
             step = turn.steps[0]
-            if step.tool == "product_facts" and turn.decision == "answer":
+            if step.tool == "product_facts" and turn.decision in {"answer", "draft"}:
                 continue
             if step.tool == "catalog_search":
                 args = step.args
@@ -114,7 +129,6 @@ async def run_turn(
             break
 
     topics = topics_for(user_text, bool(products)) if not route else set()
-    awaiting_seats = bool(history and history[-1].role == "agent" and "На сколько пользователей" in history[-1].text)
     selected = (
         selection_for(search_text, previous, suggestion, options, awaiting_seats=awaiting_seats)
         if search_text
@@ -192,6 +206,8 @@ async def run_turn(
             )
         )
     if hit or route:
+        if hit and not route and "На сколько пользователей" in hit.text:
+            steps[-1].args["awaiting_seats"] = True
         for step in steps:
             await emit_step(step)
         escalate = route is not None and not route.clarification

@@ -11,7 +11,7 @@ from app.agent.needs_brief import Brief, initial_need, open_intake, questions, u
 from app.agent.needs_catalog import recommend
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, StepTrace
-from app.db.repository import list_turns, new_id, sent_draft_actions
+from app.db.repository import new_id, visible_turns
 
 
 def named_product(text):
@@ -51,19 +51,16 @@ async def run_turn(session, history, text, emit_step, *, action_type, finding):
     start = perf_counter()
     prior = None
     if history and history[-1].role == "agent":
-        turns = await list_turns(session.id)
-        sent = await sent_draft_actions(session.id) if any(t.decision == "draft" for t in turns) else set()
+        turns = await visible_turns(session.id)
         for turn in reversed(turns):
             if not turn.steps:
                 break
             step = turn.steps[0]
-            if turn.decision == "draft" and step.args.get("journal_action_id") not in sent:
-                continue
             if turn.decision not in {"answer", "draft"}:
                 break
             if step.tool == "needs_search":
                 prior = step.args
-            if step.tool != "product_facts":
+            if step.tool not in {"product_facts", "published_knowledge"}:
                 break
     if not prior and not (initial_need(text) or open_intake(text)):
         return None

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.agent import knowledge
 from app.api import routes_manager, routes_public, routes_v1
 from app.config import get_settings
 from app.core.errors import install_error_handlers
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
     )
     install_error_handlers(app)
     app.include_router(routes_public.router)
+    app.include_router(knowledge.router)
     app.include_router(routes_v1.router)
     app.include_router(routes_manager.router)
     return app

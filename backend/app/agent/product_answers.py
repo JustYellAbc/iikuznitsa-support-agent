@@ -58,12 +58,19 @@ GENERIC_NOUN = re.compile(
 
 def topics_for(text: str, has_products: bool) -> set[str]:
     body = text.casefold()
-    if not re.search(
+    if not PRICE.search(body) and not re.search(
         r"\?|\b(?:како\w*|какая|какие|как|что|есть ли|можно ли|сколько|когда|где|подскажите|навсегда|бессроч\w*)\b",
         body,
     ):
         return set()
     topics = {name for name, pattern in TOPICS.items() if re.search(pattern, body)}
+    if (
+        "delivery" in topics
+        and re.search(r"электронн\w* почт", body)
+        and re.search(r"смен[аиуеы]|сменить|менять|меняю|измен\w*|поменя\w*|настро\w*|профил\w*|уведомлен\w*", body)
+        and not re.search(r"достав|поставк|лицензи|\bключ\w*|\bзаказ\w*", body)
+    ):
+        topics.discard("delivery")
     if "delivery" in topics and DELIVERY_TIME.search(body):
         topics.add("delivery_time")
         if not re.search(r"срок (?:лицензии|действия|подписки)", body):
