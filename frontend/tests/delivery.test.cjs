@@ -135,6 +135,31 @@ test("Виджет Т09 на примерах контракта", async t => {
     await page.getByText("Обращение закрыто", { exact: true }).last().waitFor();
     assert.equal(await page.locator("#recipient").isVisible(), false);
   });
+  await t.test("Подтверждение из чата открывает форму с обеими выбранными позициями", async t => {
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    const selection = [{offerId: "office", priceState: "on_request"}, {offerId: "av", priceState: "on_request"}];
+    await page.route("**/quotes/current?*", route => route.fulfill({json: {
+      revision: 0, requiresReselection: false, customer: null, items: [], selection,
+      choices: [...selection, {offerId: "old"}].map(p => ({offerId: p.offerId, name: p.offerId}))
+    }}));
+    await page.route("**/actions?*", route => {
+      const cid = new URL(route.request().url()).pathname.split("/")[4];
+      return route.fulfill({status: 202, headers: {"X-Chat-Action": "open-quote-form"},
+        json: {conversationId: cid, actionId: "accepted-quote"}});
+    });
+    await page.goto(url);
+    await page.locator("#launch").click();
+    await page.locator("#message").fill("Да");
+    await page.locator("#send").click();
+    const form = page.locator("#quote-dialog[open]");
+    await form.getByText("av · ID av · Цена по запросу").waitFor();
+    assert.deepEqual(await form.locator("input[type=checkbox]:checked").evaluateAll(nodes => nodes.map(n => n.value)),
+      ["office", "av"]);
+    await page.reload();
+    await page.locator("#launch").click();
+    assert.equal(await page.locator("#quote-dialog").isVisible(), false);
+  });
   await t.test("После обрыва потока виджет дочитывает историю с последнего события", async t => {
     const page = await browser.newPage();
     t.after(() => page.close());

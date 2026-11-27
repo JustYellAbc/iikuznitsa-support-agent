@@ -42,6 +42,9 @@ ERRORS = {
 
 def _json(result: tuple[int, dict]) -> JSONResponse:
     status, payload = result
+    if payload.get("_open_quote_form"):
+        body = {k: v for k, v in payload.items() if k != "_open_quote_form"}
+        return JSONResponse(body, status_code=status, headers={"X-Chat-Action": "open-quote-form"})
     return JSONResponse(payload, status_code=status)
 
 
@@ -261,6 +264,7 @@ async def quote_inputs(conversationId: PathId, principal: Principal = Depends(re
         if principal.role == "customer" and row and not row["reselect"]:
             await quotes.require_published(row)
         choices = await quotes.selectable_products(conversationId)
+        selected = await repository.last_products(conversationId)
     snapshot = quotes.read(row) if row else None
     reselect = bool(row and row["reselect"])
     return JSONResponse(
@@ -268,6 +272,7 @@ async def quote_inputs(conversationId: PathId, principal: Principal = Depends(re
             "revision": snapshot.quote.revision if snapshot else 0,
             "requiresReselection": reselect,
             "choices": [{"offerId": offer_id, "name": name} for offer_id, name in choices.items()],
+            "selection": [{"offerId": p["offerId"], "priceState": p["priceState"]} for p in selected],
             "customer": snapshot.customer.model_dump() if snapshot else None,
             "items": [{"offerId": d.product.offerId, "packages": d.packages} for d in snapshot.details]
             if snapshot and not reselect

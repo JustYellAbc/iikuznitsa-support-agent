@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agent.catalog_selection import Selection
 from app.agent.handoff import CONFIRMED, OFFER_HELP, route_action
+from app.agent.quote_intent import offers_quote
 from app.config import get_settings
 from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, StepTrace
 from app.contracts.t04 import Product, Source
@@ -401,10 +402,21 @@ async def run_tool_turn(session, history, text, previous, emit):
             [] if evidence.replaced or Selection("").qualifiers(text, followup=False) != Selection("") else previous
         )
         handoff = HandoffRequest(reason="technical", question=text, products=current)
+    replaces = evidence.replaced or bool(previous and purpose == "clarification")
+    if purpose == "clarification" and offers_quote(body) and previous:
+        previous_ids = {p.offerId for p in previous}
+        checked_ids = {row["offerId"] for row in evidence.rows.values() if "offerId" in row}
+        new_search = any(s.tool == "search_catalog" for s in steps)
+        if (
+            not new_search
+            and checked_ids <= previous_ids
+            and Selection("").qualifiers(text, followup=False) == Selection("")
+        ):
+            replaces = False
     await record(
         StepTrace(
             tool="support_result",
-            args={"replaces_products": evidence.replaced or bool(previous and purpose == "clarification")},
+            args={"replaces_products": replaces},
             result_summary=handoff.reason if handoff else purpose,
         )
     )
