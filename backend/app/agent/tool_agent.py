@@ -909,6 +909,11 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                         matched = [
                             ref for ref, row in evidence.rows.items() if content and content in row.get("body", "")
                         ]
+                        if not matched:
+                            raise ValueError(
+                                "У ответа не указан источник. Для реплики из этого чата вызови recall_message "
+                                "с её автором. Для сведений о товаре или процедуре используй соответствующий ref."
+                            )
                         answer = Answer(kind="knowledge", refs=matched, excerpt=content)
                     return checked_answer(answer, evidence, history, text, previous)
                 except ValueError as exc:
