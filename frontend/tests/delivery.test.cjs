@@ -39,7 +39,7 @@ test("Виджет Т09 на примерах контракта", async t => {
     const cards = page.locator("#log .result");
     await cards.nth(2).waitFor();
     const card = id => cards.filter({ has: page.locator('a[href*="-' + id + '/"]') });
-    assert.match((await card("61557").innerText()).replace(/\s/g, " "), /4 900 ₽ за упаковку/);
+    assert.match((await card("61557").innerText()).replace(/\s/g, " "), /4 900 ₽ за единицу по карточке/);
     assert.match(await card("61557").innerText(), /Срок лицензии неизвестен/);
     assert.match(await card("48093").innerText(), /Наличие требует подтверждения/);
     assert.match(await card("504").innerText(), /Цена по запросу/);

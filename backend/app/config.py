@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
+from pydantic import AnyUrl, UrlConstraints
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,6 +36,9 @@ class Settings(BaseSettings):
     customer_session_hours: int = 720
 
     cors_origins: str = "*"
+    public_base_url: Annotated[AnyUrl, UrlConstraints(allowed_schemes=["https"], host_required=True)] = (
+        "https://139-100-217-243.sslip.io"
+    )
     data_dir: Path = Path("./data")
     default_mode: Literal["autopilot", "pilot"] = "autopilot"
 

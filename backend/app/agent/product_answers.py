@@ -44,6 +44,10 @@ PRODUCT_OBJECT = re.compile(
     r"([а-яё][\w.-]*(?:\s+[\w.-]+){0,6}))",
     re.I,
 )
+BUYER_PHRASE = re.compile(
+    r"\bдля\s+(?:[а-яё-]+(?:ой|ей|ых|их)\s+)+(?:компании|компаний|организации|организаций)\b",
+    re.I,
+)
 GENERIC_WORDS = set(
     "и ли он она оно они мы мне нас вас него неё нее её ее его них меня себя всех мой моя моё мое мои моей "
     "моего моих моему моим моими мою кого чего как когда где сколько сама сам на от до по в с без за "
@@ -63,12 +67,19 @@ GENERIC_NOUN = re.compile(
 
 def topics_for(text: str, has_products: bool) -> set[str]:
     body = text.casefold()
-    if not re.search(
+    if not PRICE.search(body) and not re.search(
         r"\?|\b(?:како\w*|какая|какие|как|что|есть ли|можно ли|сколько|когда|где|подскажите|навсегда|бессроч\w*)\b",
         body,
     ):
         return set()
     topics = {name for name, pattern in TOPICS.items() if re.search(pattern, body)}
+    if (
+        "delivery" in topics
+        and re.search(r"электронн\w* почт", body)
+        and re.search(r"смен[аиуеы]|сменить|менять|меняю|измен\w*|поменя\w*|настро\w*|профил\w*|уведомлен\w*", body)
+        and not re.search(r"достав|поставк|лицензи|\bключ\w*|\bзаказ\w*", body)
+    ):
+        topics.discard("delivery")
     if "delivery" in topics and DELIVERY_TIME.search(body):
         topics.add("delivery_time")
         if not re.search(r"срок (?:лицензии|действия|подписки)", body):
@@ -98,6 +109,7 @@ def question_target(text: str) -> Selection | None:
     quoted = re.search(r'[«"]([^»"]{2,100})[»"]', subject)
     if quoted or MDAEMON.search(subject):
         return named_request(subject)
+    subject = BUYER_PHRASE.sub("", subject)
     # Customers type brands in lower case too. A change of subject supersedes the
     # prior SKU; buyer attributes and references to the current license do not.
     for match in PRODUCT_OBJECT.finditer(subject):

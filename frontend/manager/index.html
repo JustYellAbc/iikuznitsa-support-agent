@@ -6,6 +6,7 @@
   <title>Обращения · Softline</title>
   <link rel="stylesheet" href="/manager/manager.css">
   <script src="/manager/manager.js" defer></script>
+  <script src="/manager/knowledge.js" defer></script>
 </head>
 <body>
   <header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span>Softline</div><span class="area">Поддержка клиентов</span></header>
@@ -23,6 +24,7 @@
         <div class="section-title"><h2>Открытые обращения</h2><span id="count" class="count">0</span></div>
         <p id="queue-empty" class="muted">Открытых обращений пока нет.</p>
         <nav id="queue" aria-label="Очередь обращений"></nav>
+        <details id="archive"><summary>Закрытые обращения</summary><nav id="resolved" aria-label="Закрытые обращения"></nav></details>
       </aside>
       <section class="panel detail">
         <p id="no-selection" class="muted">Выберите обращение в очереди.</p>
@@ -37,6 +39,18 @@
             <textarea id="reply" required maxlength="8000" rows="3" placeholder="Напишите сообщение…"></textarea>
             <div class="actions"><button class="primary" value="reply">Отправить</button><button value="close">Ответить и закрыть</button></div>
           </form>
+          <section id="knowledge" hidden>
+            <h3>База знаний</h3>
+            <div id="articles"></div>
+            <form id="article-form">
+              <label>Общий вопрос<input name="question" required maxlength="1000"></label>
+              <label>Ответ для всех покупателей<textarea name="answer" required maxlength="8000" rows="3"></textarea></label>
+              <label>Другие формулировки вопроса, по одной на строку<textarea name="phrasings" rows="2" maxlength="8000"></textarea></label>
+              <p class="muted">Условия сделки и данные покупателя остаются в обращении.</p>
+              <button>Сохранить черновик</button>
+            </form>
+            <p id="kb-result" role="status"></p>
+          </section>
         </div>
         <p class="feedback" id="result" role="status"></p>
       </section>
