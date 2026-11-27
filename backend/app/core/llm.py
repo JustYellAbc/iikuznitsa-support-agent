@@ -255,6 +255,8 @@ async def llm_call(
     model = model_for(profile, s)
 
     payload: dict[str, Any] = {"model": model, "messages": messages}
+    if s.llm_base_url.rstrip("/") == _OPENCODE_GO and model == "qwen3.8-flash":
+        payload["enable_thinking"] = False
     if tools:
         payload["tools"] = tools
     if tool_choice is not None:

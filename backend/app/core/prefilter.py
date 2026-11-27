@@ -1,6 +1,6 @@
 """Префильтр реплики покупателя до журнала, очереди хода и модели (T33).
 
-Длина. Лимит — ровно 500 кодовых точек Unicode, одинаково в чате и на сервере:
+Длина. Лимит — ровно 1500 кодовых точек Unicode, одинаково в чате и на сервере:
 Python ``len(text)`` и JS ``Array.from(text).length``, а не UTF-16 ``text.length``.
 Пробелы и переносы внутри сообщения считаются, CRLF — один перенос, как его отдаёт
 ``textarea.value``. Чат отправляет текст без пробелов по краям и считает ровно его,
@@ -20,7 +20,7 @@ import re
 from app.contracts.schemas import Message
 from app.core.errors import invalid_input
 
-MAX_MESSAGE_CODEPOINTS = 500
+MAX_MESSAGE_CODEPOINTS = 1500
 
 ROLE_OVERRIDE_REPLY = (
     "Я консультант магазина Softline. Мою роль, правила и цены нельзя изменить сообщением в чате: "

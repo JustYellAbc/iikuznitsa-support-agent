@@ -60,7 +60,7 @@ def actions(cid: str) -> str:
 
 
 def test_length_counts_code_points_like_the_chat():
-    assert LIMIT == 500
+    assert LIMIT == 1500
     assert message_length("😀") == 1  # JS: Array.from("😀").length === 1, "😀".length === 2
     assert message_length("👨‍👩‍👧") == 5  # ZWJ-последовательность: 5 кодовых точек и в JS
     assert message_length("й") == 2  # без NFC-нормализации, как Array.from
@@ -395,7 +395,10 @@ def test_t02_length_report_reads_only_open_dev_and_prints_aggregates(tmp_path, c
     spec = importlib.util.spec_from_file_location("message_lengths", ROOT / "scripts" / "message_lengths.py")
     script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(script)
-    rows = [f"#{900 + i} [Покупка] [https://example.test/p{i}] " + "ж" * n for i, n in enumerate([10, 20, 30, 600, 40])]
+    too_long = LIMIT + 100
+    rows = [
+        f"#{900 + i} [Покупка] [https://example.test/p{i}] " + "ж" * n for i, n in enumerate([10, 20, 30, too_long, 40])
+    ]
     rows.append("#999 [Покупка] [https://example.test/h] " + "закрытая " * 200)  # не из открытой выборки
     archive = tmp_path / "chats.zip"
     with zipfile.ZipFile(archive, "w") as zf:
@@ -418,8 +421,8 @@ def test_t02_length_report_reads_only_open_dev_and_prints_aggregates(tmp_path, c
         "over_limit": 1,
         "over_limit_pct": 20.0,
         "median": 30,
-        "p95": 600,
-        "max": 600,
+        "p95": too_long,
+        "max": too_long,
     }
     assert "ж" not in out and "закрытая" not in out and "900" not in out
 

@@ -21,7 +21,7 @@ sock.bind(("127.0.0.1", 0))
 print(sock.getsockname()[1], flush=True)
 uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=[sock])
 `;
-const limit = 500;
+const limit = 1500;
 // Exactly n Unicode code points. An emoji is two UTF-16 units, so text.length would count it twice.
 const samples = {
   "латиница": n => "a".repeat(n),
@@ -30,7 +30,7 @@ const samples = {
   "переносы строк": n => "👍\n".repeat((n - 1) >> 1) + "ё".repeat(n - 2 * ((n - 1) >> 1)),
 };
 
-test("Чат считает 500 символов как сервер и не теряет длинный текст", { timeout: 60000 }, async t => {
+test("Чат считает 1500 символов как сервер и не теряет длинный текст", { timeout: 60000 }, async t => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "t33-test-"));
   const server = spawn(process.env.PYTHON || "python", ["-u", "-c", boot], {
     cwd: root, env: { ...process.env, DATA_DIR: dataDir, MOCK_LLM: "true", OPERATOR_PASSWORD: "" },
@@ -69,14 +69,14 @@ test("Чат считает 500 символов как сервер и не т�
       const over = make(limit + 1);
       await message.fill(over);
       assert.equal(await counter.isVisible(), true);
-      assert.equal(await counter.innerText(), "501 / 500");
+      assert.equal(await counter.innerText(), "1501 / 1500");
       assert.equal(await send.isDisabled(), true);
       assert.equal(await message.getAttribute("aria-invalid"), "true");
-      assert.match(await feedback.innerText(), /длиннее 500 символов \(сейчас 501\)\. Сократите/);
+      assert.match(await feedback.innerText(), /длиннее 1500 символов \(сейчас 1501\)\. Сократите/);
       await message.press("Enter");
       assert.equal(await message.inputValue(), over);
       await message.fill(make(limit));
-      assert.equal(await counter.innerText(), "500 / 500");
+      assert.equal(await counter.innerText(), "1500 / 1500");
       assert.equal(await send.isDisabled(), false);
       assert.equal(await feedback.innerText(), "");
     });
@@ -88,7 +88,7 @@ test("Чат считает 500 символов как сервер и не т�
   assert.deepEqual(await journal(), []);
 
   await t.test("Отказ сервера сохраняет текст и показывает подсказку", async () => {
-    const hint = "Сообщение длиннее 500 символов (сейчас 501). Сократите его и отправьте снова.";
+    const hint = "Сообщение длиннее 1500 символов (сейчас 1501). Сократите его и отправьте снова.";
     await page.route(url => url.pathname.endsWith("/actions"), route => route.fulfill({ status: 422, json: { code: "invalid_input", message: hint } }), { times: 1 });
     const text = samples["эмодзи"](limit);
     await message.fill(text);
@@ -97,7 +97,7 @@ test("Чат считает 500 символов как сервер и не т�
     assert.equal(await message.inputValue(), text);
   });
 
-  await t.test("Прямой запрос на 501 символ не создаёт событие и не занимает ключ", async () => {
+  await t.test("Прямой запрос на 1501 символ не создаёт событие и не занимает ключ", async () => {
     const post = (text, key) => page.evaluate(async ({ id, text, key }) => {
       const res = await fetch("/api/v1/conversations/" + id + "/actions?view=buyer", {
         method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key },
@@ -109,7 +109,7 @@ test("Чат считает 500 символов как сервер и не т�
       const rejected = await post(make(limit + 1), "t33-direct");
       assert.equal(rejected.status, 422);
       assert.deepEqual(rejected.body, {
-        code: "invalid_input", message: "Сообщение длиннее 500 символов (сейчас 501). Сократите его и отправьте снова."
+        code: "invalid_input", message: "Сообщение длиннее 1500 символов (сейчас 1501). Сократите его и отправьте снова."
       });
     }
     assert.deepEqual(await journal(), []);
@@ -118,7 +118,7 @@ test("Чат считает 500 символов как сервер и не т�
     assert.equal(accepted.body.conversationId, id);
   });
 
-  await t.test("Сообщение ровно из 500 символов уходит и попадает в историю", async () => {
+  await t.test("Сообщение ровно из 1500 символов уходит и попадает в историю", async () => {
     await page.locator("#log .entry.agent").first().waitFor(); // the accepted direct message has been answered
     const text = samples["переносы строк"](limit);
     sent.length = 0;
@@ -129,7 +129,7 @@ test("Чат считает 500 символов как сервер и не т�
     assert.equal(Array.from(sent[0].text).length, limit);
     const inputs = (await journal()).filter(e => e.data.author === "customer").map(e => e.data.text);
     assert.deepEqual(inputs.map(text => Array.from(text).length), [limit, limit]);
-    assert.equal(await counter.innerText(), "0 / 500");
+    assert.equal(await counter.innerText(), "0 / 1500");
   });
   assert.deepEqual(errorLog, []);
 });
