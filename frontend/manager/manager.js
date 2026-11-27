@@ -14,6 +14,7 @@ const authors = { customer: "Клиент", agent: "ИИ-агент", manager: "
 const currency = new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB" });
 const clock = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" });
 const drafts = new Map();
+const savingPrices = new Set();
 let items = [], selected = null, cursor = 0, generation = 0;
 let authenticated = false, timer, refreshNumber = 0, historyNumber = 0, retryAt = 0;
 
@@ -110,12 +111,16 @@ function showPurchaseLines(item) {
   const key = purchaseKey(item);
   panel.replaceChildren();
   panel.hidden = !key || item.status === "resolved";
+  const saving = savingPrices.has(key);
+  $("line-price").disabled = saving;
+  $("approve-price").querySelector("button").disabled = saving;
   if (panel.hidden) return;
   panel.append(element("h3", "Позиции на согласовании"));
   for (const line of items.filter(entry => purchaseKey(entry) === key)) {
     const name = line.products[0]?.name || line.quoteLine.offerId;
     const button = element("button", name + " · " + line.quoteLine.offerId + " · " + reasons[line.reason]);
     button.type = "button";
+    button.disabled = saving;
     button.setAttribute("aria-pressed", String(line.handoffId === item.handoffId));
     button.onclick = () => openCard(line);
     panel.append(button);
@@ -343,11 +348,17 @@ $("approve-price").onsubmit = async e => {
   if (!Number.isSafeInteger(unitPriceKopecks) || unitPriceKopecks < 1) {
     $("price-status").textContent = "Укажите положительную цену в рублях."; return;
   }
-  button.disabled = true;
+  const key = purchaseKey(item);
+  savingPrices.add(key);
+  showPurchaseLines(item);
+  $("price-status").textContent = "Сохраняю цену и обновляю версию КП…";
   try {
     await request("/manager/handoffs/" + encodeURIComponent(item.handoffId) + "/resolution",
       {type:"approve_line_price", ...item.quoteLine, unitPriceKopecks}, newKey());
     await refresh();
   } catch (error) { if (selected?.handoffId === item.handoffId) $("price-status").textContent = error.message; }
-  finally { button.disabled = false; }
+  finally {
+    savingPrices.delete(key);
+    showPurchaseLines(selected);
+  }
 };
