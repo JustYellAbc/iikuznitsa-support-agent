@@ -27,6 +27,28 @@ def tool(name, **arguments):
 
 
 @pytest.mark.usefixtures("index")
+def test_memory_correction_after_plain_text_uses_buyer_journal(api, provider):
+    responses, requests = provider
+    responses.extend(
+        [
+            tool("respond", kind="clarify", question="Какие условия нужны?"),
+            {"content": "Вы уточнили количество."},
+            tool("recall_message", author="buyer", which="last", quote_to_customer=True),
+            tool("recall_message", author="customer", which="last", quote_to_customer=True),
+        ]
+    )
+    cid = api.new_conversation()
+    statement = "Закупка рассчитана на 40 пользователей."
+    say(api, cid, statement)
+    reply = say(api, cid, "Сколько пользователей я указал?")[-1]
+    assert reply["text"] == f"Вы написали: «{statement}»"
+    assert "recall_message" in requests[-2]["messages"][-1]["content"]
+    issue = json.loads(requests[-1]["messages"][-1]["content"])["issues"][0]
+    assert issue["field"] == "author" and "customer" in issue["constraint"]
+    assert not reply["sources"]
+
+
+@pytest.mark.usefixtures("index")
 def test_compare_reads_named_alternatives_and_leaves_purchase_selection_empty(api, provider):
     answers, requests = provider
     answers.append(tool("compare_catalog", first="PaperDesk Pro", second="PaperDesk Extra"))

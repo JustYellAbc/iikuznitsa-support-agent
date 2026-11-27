@@ -257,6 +257,9 @@ async def llm_call(
     payload: dict[str, Any] = {"model": model, "messages": messages}
     if s.llm_base_url.rstrip("/") == _OPENCODE_GO and model == "qwen3.8-flash":
         payload["enable_thinking"] = False
+        # The support loop validates every final answer through its respond tool.
+        if step == "support_tools" and tools and tool_choice is None:
+            tool_choice = "required"
     if tools:
         payload["tools"] = tools
     if tool_choice is not None:

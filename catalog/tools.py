@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import sqlite3
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -95,6 +96,54 @@ def get_offer(index: Path, offer_id: str) -> ToolResult:
     if row is None or not _public_link(row["source"]):
         return _results([])
     return _results([_offer(row, version, detail=True)])
+
+
+def buyer_references(text: str):
+    """Recognise identifiers only. URLs are compared to the feed and never fetched."""
+    links = {}
+    url_pattern = r"https?://[^\s<>\"«»]+"
+    for match in re.finditer(url_pattern, text, re.I):
+        url = match[0].rstrip(".,);!").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        path = re.fullmatch(r"https://store\.softline\.ru/[^\s?#]+?-(\d+)", url, re.I)
+        if path:
+            links[url] = path[1]
+    prose = re.sub(url_pattern, " ", text, flags=re.I)
+    parts = [
+        word
+        for word in re.findall(r"(?<![\w./-])[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)+(?![\w/-])", prose)
+        if re.search(r"[A-Za-z]", word) and re.search(r"\d", word)
+    ]
+    return links, list(dict.fromkeys(parts))
+
+
+def referenced_offers(index: Path, links: dict[str, str], parts: list[str]) -> ToolResult:
+    """Read exact buyer references without making a purchase selection."""
+    try:
+        with open_index(index) as db:
+            version = source_version(db)
+            found = {}
+            for url, offer_id in links.items():
+                row = db.execute("SELECT * FROM offers WHERE id=?", (offer_id,)).fetchone()
+                if row and row["source"].rstrip("/") == url:
+                    found[row["id"]] = row
+            if parts:
+                params = ",".join("?" for _ in parts)
+                rows = db.execute(
+                    f"SELECT * FROM offers WHERE vendor_code COLLATE NOCASE IN ({params}) LIMIT 6", parts
+                ).fetchall()
+                if len(rows) <= 5:
+                    found.update((r["id"], r) for r in rows)
+            if len(found) > 5:
+                return _results([])
+            return _results(
+                [
+                    dict(_offer(r, version, detail=True), vendorCode=r["vendor_code"])
+                    for r in found.values()
+                    if _public_link(r["source"])
+                ]
+            )
+    except sqlite3.Error:
+        return ToolResult(ok=False, error="catalog_unavailable")
 
 
 def search_store_knowledge(index: Path, query: str, *, limit: int = 3) -> ToolResult:

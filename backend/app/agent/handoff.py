@@ -122,11 +122,11 @@ def handoff_reason(text: str) -> HandoffReason | None:
     return None
 
 
-def discovery_context(history, text):
+def discovery_context(history, text, *, max_turns=4):
     """Keep the buyer's consecutive answers to discovery questions together."""
     turns = [text]
     end = len(history)
-    while end >= 2 and len(turns) < 4:
+    while end >= 2 and len(turns) < max_turns:
         buyer, agent = history[end - 2 : end]
         if buyer.role != "client" or agent.role != "agent" or not agent.text.rstrip().endswith("?"):
             break
