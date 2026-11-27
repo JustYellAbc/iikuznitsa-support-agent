@@ -69,12 +69,20 @@ async def test_demo_qwen_reasoning_setting_in_http_body(db, monkeypatch, base, m
         assert payload["model"] == model
         if disable:
             assert payload["enable_thinking"] is False
+            assert payload["tool_choice"] == "required"
         else:
             assert "enable_thinking" not in payload
+            assert "tool_choice" not in payload
         return ok_response()
 
     provider(handler)
-    await llm_call([{"role": "user", "content": "test"}], step="support_tools", session_id="demo", profile=profile)
+    await llm_call(
+        [{"role": "user", "content": "test"}],
+        step="support_tools",
+        session_id="demo",
+        profile=profile,
+        tools=[{"type": "function", "function": {"name": "respond", "parameters": {"type": "object"}}}],
+    )
 
 
 async def test_llm_call_logs_tokens_cost_and_latency(db):
