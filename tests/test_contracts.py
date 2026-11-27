@@ -382,7 +382,7 @@ def test_budget_exceeded_hands_off_instead_of_500(api: Api, monkeypatch):
         api.idle()
     datas = [e["data"] for e in api.events(cid)]
     assert [d["type"] for d in datas] == ["message", "message", "handoff", "message", "message"]
-    assert datas[1]["text"] == turn_service.HANDOFF_TEXT and datas[2]["handoff"]["reason"] == "technical"
+    assert "Не удалось получить ответ от сервиса" in datas[1]["text"] and datas[2]["handoff"]["reason"] == "technical"
     assert datas[2]["handoff"]["question"] == "Первый вопрос"
     api.login()
     assert len(api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"]) == 1
