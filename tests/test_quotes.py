@@ -167,11 +167,21 @@ def test_quote_approval_publishes_new_revision_and_exact_document(api, tmp_path)
 
 
 @pytest.mark.parametrize("sku,reason", [("t2", "price_request"), ("t3", "availability")])
-def test_unavailable_stays_pending(api, tmp_path, sku, reason):
+def test_unavailable_requires_manager_approval_then_becomes_ready(api, tmp_path, sku, reason):
     cid = setup_quote(api, tmp_path, [sku], rules=True)
     assert request(api, cid, [(sku, 1)]).status_code == 202
     q = last_quote(api, cid)
-    assert q["totalKopecks"] is None
+    assert (q["state"], q["totalKopecks"]) == ("needs_review", None)
+    assert command(api, cid, q, "confirm_quote").json()["code"] == "terms_pending"
+    assert (
+        api.call(
+            "customer",
+            "POST",
+            f"/api/v1/conversations/{cid}/actions",
+            json={"type": "request_document", "kind": "quote_pdf", "quoteId": q["quoteId"], "revision": q["revision"]},
+        ).json()["code"]
+        == "terms_pending"
+    )
     api.login()
     [h] = [h for h in api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] if h.get("quoteLine")]
     assert h["reason"] == reason
@@ -181,8 +191,8 @@ def test_unavailable_stays_pending(api, tmp_path, sku, reason):
         f"/api/v1/manager/handoffs/{h['handoffId']}/resolution",
         json={"type": "approve_line_price", **h["quoteLine"], "unitPriceKopecks": 125},
     )
-    if reason == "availability":
-        assert res.json()["code"] == "terms_pending"
-    else:
-        assert res.status_code == 202 and last_quote(api, cid)["state"] == "needs_review"
-        assert api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"][0]["reason"] == "availability"
+    assert res.status_code == 202
+    ready = last_quote(api, cid)
+    assert (ready["state"], ready["revision"], ready["totalKopecks"]) == ("ready", 2, 125)
+    assert ready["lines"][0]["unitPriceKopecks"] == 125
+    assert api.call("manager", "GET", "/api/v1/manager/handoffs").json()["items"] == []

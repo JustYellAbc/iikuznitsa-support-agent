@@ -32,7 +32,7 @@ async def confirmed_snapshot(cid, owner, qid, revision):
     if selected != {line.offerId for line in snapshot.quote.lines}:
         raise ApiError(409, "stale_revision", quotes.STALE)
     if (
-        any(not d.product.available for d in snapshot.details)
+        any(not d.product.available and not d.decision for d in snapshot.details)
         and not price_policy.active_policy().rule.allow_auto_invoice
     ):
         raise ApiError(409, "terms_pending", "Для счёта нужно согласовать поставку.")

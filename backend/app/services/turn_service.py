@@ -153,6 +153,9 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
     datas = _reply_events(reply)
     async with get_db().tx() as conn:
         existing = await repository.find_open_handoff(cid, request.reason)
+        written = await append_reply(conn, cid, action_id, datas) if datas else []
+        if existing is None and len(request.products) == 1:
+            existing = await repository.find_open_quote_handoff(cid, request.reason, request.products[0].offerId)
         if existing is None:
             handoff = await repository.create_handoff(
                 cid,
@@ -162,8 +165,9 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
                 [p.model_dump(mode="json") for p in request.products],
                 conn=conn,
             )
-            datas.append(HandoffData(handoff=handoff).model_dump(mode="json"))
-        written = await append_reply(conn, cid, action_id, datas) if datas else []
+            written.extend(
+                await append_reply(conn, cid, action_id, [HandoffData(handoff=handoff).model_dump(mode="json")])
+            )
     events.publish(cid, written)
 
 
