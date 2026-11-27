@@ -69,6 +69,13 @@ def test_store_snapshot():
         assert sku in {item["offerId"] for item in hits}
         assert all(int(item["seatLimit"][0]) >= seats for item in hits)
     assert not search_catalog(path, "Почтовый сервер на 50 ГБ", by_need=True).data
+    for query in (
+        "Было 50 пользователей, теперь нужен почтовый сервер на 100 пользователей",
+        "Почтовый сервер на 50 пользователей или на 100 пользователей",
+    ):
+        assert search_catalog(path, query, by_need=True).data == []
+    repeated = search_catalog(path, "Почтовый сервер на 50 пользователей, у нас 50 сотрудников", by_need=True)
+    assert repeated.data and all(int(item["seatLimit"][0]) >= 50 for item in repeated.data)
     for sku, band, price in [("436672", "от 1 до 9", 520000), ("436675", "от 100 до 499", 440000)]:
         item = get_offer(path, sku).data[0]
         assert band in item["salesNotes"] and item["unitPriceKopecks"] == price

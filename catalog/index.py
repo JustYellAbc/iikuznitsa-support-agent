@@ -196,7 +196,9 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None, include
             ordering = []
             if named_family:
                 ordering.append("CASE WHEN o.name LIKE '%MDaemon Messaging Server%' THEN 0 ELSE 1 END")
-            seats = SEATS.findall(query) if named_family or by_need else []
+            seats = {value.lstrip("0") for value in SEATS.findall(query)} if named_family or by_need else set()
+            if len(seats) > 1:
+                return []  # Ask which capacity to select before ranking packs.
             seat_value = """trim(json_extract(o.params, '$."К-во пользователей до"[0]'))"""
             capacity = (
                 f"CASE WHEN {seat_value} <> '' AND {seat_value} NOT GLOB '*[^0-9]*' "
@@ -205,9 +207,9 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None, include
             if by_need and re.search(r"\d\s*(?:[гт]б|[gt]b|гигабайт\w*|терабайт\w*)\b", query, re.I):
                 # The catalog has seat capacity, but no indexed storage-capacity constraint.
                 return []
-            if len(seats) == 1:
+            if seats:
                 # The feed stores the upper capacity of each pack as a decimal string.
-                size = seats[0].lstrip("0")
+                size = next(iter(seats))
                 if not size or len(size) > 18:
                     return []
                 filters.append(f"{capacity} >= ?")
