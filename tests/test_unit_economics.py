@@ -1215,3 +1215,137 @@ def test_xlsx_preserves_fractional_call_frequency(tmp_path):
         assert wb.active["C9"].value == pytest.approx(1 / 3, abs=1e-14)
     finally:
         wb.close()
+
+
+def test_missing_call_history_keeps_labor_and_marks_economy_unknown(tmp_path):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    pricing = ue.load_pricing_config(_write_synthetic_pricing(tmp_path / "price.yml"))
+    cases = []
+    for i, cat in enumerate(NINE_CATEGORIES):
+        cases.extend(
+            [
+                {
+                    "conversation_id": f"agent-{i}",
+                    "category": cat,
+                    "passed": True,
+                    "closed_by_agent": True,
+                    "llm_calls": [],
+                },
+                {
+                    "conversation_id": f"op-{i}",
+                    "category": cat,
+                    "passed": False,
+                    "escalated": True,
+                    "closed_by_agent": False,
+                    "llm_calls": [],
+                    "cost_status": "exact",
+                },
+            ]
+        )
+
+    def compute(rows):
+        report = tmp_path / "t10.json"
+        report.write_text(json.dumps({"cases": rows}))
+        dialogs = ue.load_measurements(eval_report_paths=[report], telemetry_paths=[], split_summary=summary)
+        return ue.compute_unit_economics(dialogs, summary, pricing, usd_rub_rate=Decimal(100))
+
+    complete = compute(cases)
+    for case in cases[1::2]:
+        case.update(llm_calls=None, cost_status="unavailable", turns=[{"steps": []}, {}])
+    partial = compute(cases)
+    assert (partial.total_dialogs, partial.known_outcomes, partial.measured_dialogs, partial.escalated_dialogs) == (
+        18,
+        18,
+        9,
+        9,
+    )
+    assert partial.escalation_rate == complete.escalation_rate == Decimal("0.5")
+    assert partial.period_residual_operator_cost_rub == complete.period_residual_operator_cost_rub == 25000
+    assert (
+        partial.load_scenario.period_residual_operator_cost_rub
+        == complete.load_scenario.period_residual_operator_cost_rub
+    )
+    assert partial.load_scenario.daily_residual_operator_cost_rub == 25000
+    assert complete.net_savings_period_rub == -2000
+    assert partial.net_savings_period_rub is None and partial.load_scenario.net_savings_daily_rub is None
+    assert partial.telemetry_warnings and "9 из 18" in ue.render_markdown_report(partial, pricing)
+    assert "9/18" in ue.build_comment_lines(partial, pricing)[0]
+    no_calls = compute(cases[1::2])
+    assert not no_calls.has_measurements and no_calls.known_outcomes == no_calls.escalated_dialogs == 9
+    assert no_calls.period_residual_operator_cost_rub == 50000
+    assert no_calls.load_scenario.daily_residual_operator_cost_rub == 50000
+    assert no_calls.period_total_cost_rub is None and no_calls.net_savings_period_rub is None
+
+
+def test_conflicting_eval_reports_rejected_in_both_orders(tmp_path):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    call = {"model": "synth-smart", "step": "answer", "tokens_in": 1000, "tokens_out": 0}
+    early = {
+        "id": "scenario",
+        "conversation_id": "c1",
+        "category": NINE_CATEGORIES[0],
+        "passed": True,
+        "escalated": False,
+        "closed_by_agent": True,
+        "llm_calls": [call],
+    }
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    a.write_text(json.dumps({"cases": [early]}))
+
+    def load(paths):
+        return ue.load_measurements(eval_report_paths=paths, telemetry_paths=[], split_summary=summary)
+
+    assert load([a]) == load([a, a])
+    for later in (dict(early, llm_calls=[call, call]), dict(early, escalated=True, closed_by_agent=False)):
+        b.write_text(json.dumps({"cases": [later]}))
+        for order in ([a, b], [b, a]):
+            with pytest.raises(ue.InputDataError, match="несовместимые"):
+                load(order)
+
+
+@pytest.mark.parametrize(
+    "full_id,window_ids,valid",
+    [(8, [8], True), (8, [8, 9], False), (8, [9], False), (None, [8], True), (None, [8, 9], False)],
+)
+def test_full_snapshot_cannot_hide_new_window_calls(tmp_path, full_id, window_ids, valid):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    call = {"step": "agent_loop", "model": "synth-smart", "tokens_in": 1000, "tokens_out": 0}
+    a, b = tmp_path / "full.json", tmp_path / "window.json"
+    a.write_text(
+        json.dumps({"dialogs": [{"conversation_id": "c1", "calls": [dict(call, id=full_id)], "closed_by_agent": True}]})
+    )
+    b.write_text(json.dumps({"recent_calls": [dict(call, id=i, session_id="c1") for i in window_ids]}))
+    for order in ([a, b], [b, a]):
+        if valid:
+            dialogs = ue.load_measurements(eval_report_paths=[], telemetry_paths=order, split_summary=summary)
+            assert len(dialogs) == 1 and len(dialogs[0].calls) == 1
+        else:
+            with pytest.raises(ue.InputDataError, match="противоречит"):
+                ue.load_measurements(eval_report_paths=[], telemetry_paths=order, split_summary=summary)
+
+
+def test_telemetry_only_does_not_claim_zero_handoff_rate(tmp_path):
+    summary = ue.load_split_summary(_write_synthetic_split_summary(tmp_path / "split.json"))
+    pricing = ue.load_pricing_config(_write_synthetic_pricing(tmp_path / "pricing.yml"))
+    sample = tmp_path / "window.json"
+    sample.write_text(
+        json.dumps(
+            {
+                "recent_calls": [
+                    {
+                        "session_id": "c",
+                        "id": 9,
+                        "step": "answer",
+                        "model": "synth-smart",
+                        "tokens_in": 100,
+                        "tokens_out": 10,
+                    }
+                ]
+            }
+        )
+    )
+    dialogs = ue.load_measurements(eval_report_paths=[], telemetry_paths=[sample], split_summary=summary)
+    result = ue.compute_unit_economics(dialogs, summary, pricing, usd_rub_rate=Decimal(100))
+    assert result.known_outcomes == result.escalated_dialogs == 0
+    assert result.escalation_rate is None
+    assert "Доля эскалаций: н/д" in ue.render_markdown_report(result, pricing)

@@ -19,6 +19,8 @@ import datetime as dt
 import json
 import re
 import sys
+from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -129,9 +131,15 @@ class LLMCallRecord:
 class DialogMeasurement:
     dialog_id: str
     category: str | None
-    calls: tuple[LLMCallRecord, ...]
-    escalated: bool = False
+    calls: tuple[LLMCallRecord, ...] | None  # None means missing telemetry; () means a confirmed zero.
+    escalated: bool | None = False
     closed_by_agent: bool | None = None
+
+    @property
+    def confirmed_escalation(self) -> bool | None:
+        if self.escalated is None and self.closed_by_agent is True:
+            return False
+        return self.escalated
 
     @property
     def needs_operator(self) -> bool | None:
@@ -198,6 +206,8 @@ class UnitEconomicsResult:
     has_measurements: bool
     weighting_mode: str  # "archive_weighted" | "unweighted" | "none"
     measured_dialogs: int
+    total_dialogs: int
+    known_outcomes: int
     escalated_dialogs: int
     escalation_rate: Decimal | None
     covered_archive_share: Decimal
@@ -464,7 +474,10 @@ def _extract_calls_from_turns(turns: list[Any], ctx: str) -> tuple[list[LLMCallR
             continue
         steps = turn.get("steps")
         if not isinstance(steps, list):
-            continue
+            # A synchronous document reissue has no LLM work or trace entry.
+            if turn.get("close") == "sync_document":
+                continue
+            return [], False
         found_trace = True
         for s_idx, st in enumerate(steps):
             if not isinstance(st, dict):
@@ -490,7 +503,9 @@ def _load_telemetry_dumps(
     paths: list[Path],
     *,
     allow_incomplete_telemetry: bool = False,
-) -> tuple[dict[str, list[LLMCallRecord]], dict[str, str | None], dict[str, bool], dict[str, bool], list[str]]:
+) -> tuple[
+    dict[str, list[LLMCallRecord]], dict[str, str | None], dict[str, bool], dict[str, bool], set[str], list[str]
+]:
     """Читает один или несколько JSON-дампов /api/v1/manager/telemetry или per-dialog экспортов.
 
     Окно /manager/telemetry (recent_calls) ограничено 20 последними вызовами даже при all_time=true.
@@ -501,7 +516,8 @@ def _load_telemetry_dumps(
     categories_by_session: dict[str, str | None] = {}
     escalated_by_session: dict[str, bool] = {}
     warnings: list[str] = []
-    seen_call_ids: set[Any] = set()
+    window_ids: dict[str, dict[Any, LLMCallRecord]] = defaultdict(dict)
+    full_ids: dict[str, dict[Any, LLMCallRecord]] = defaultdict(dict)
     snapshots: dict[str, dict] = {}
     full_calls: dict[str, list[LLMCallRecord]] = {}
     outcomes: dict[str, bool] = {}
@@ -534,11 +550,10 @@ def _load_telemetry_dumps(
                     continue
                 snapshots[sid] = snapshot
                 full_calls[sid] = []
-                snapshot_ids = set()
                 if dlg.get("category") is not None:
                     categories_by_session[sid] = str(dlg["category"])
-                if dlg.get("escalated"):
-                    escalated_by_session[sid] = True
+                if isinstance(dlg.get("escalated"), bool):
+                    escalated_by_session[sid] = dlg["escalated"]
                 if isinstance(dlg.get("closed_by_agent"), bool):
                     outcomes[sid] = dlg["closed_by_agent"] and dlg.get("passed") is not False
                 elif dlg.get("passed") is False:
@@ -547,11 +562,14 @@ def _load_telemetry_dumps(
                     if not isinstance(call, dict):
                         raise InputDataError(f"{path}: dialogs[{idx}].calls[{c_idx}] должен быть объектом.")
                     call_id = call.get("id")
+                    record = _parse_call_dict(call, f"{path}:dialogs[{idx}].calls[{c_idx}]")
                     if call_id is not None:
-                        if call_id in snapshot_ids:
+                        if call_id in full_ids[sid]:
+                            if full_ids[sid][call_id] != record:
+                                raise InputDataError(f"Диалог {sid}: разные данные вызова {call_id}.")
                             continue
-                        snapshot_ids.add(call_id)
-                    full_calls[sid].append(_parse_call_dict(call, f"{path}:dialogs[{idx}].calls[{c_idx}]"))
+                        full_ids[sid][call_id] = record
+                    full_calls[sid].append(record)
             continue
 
         is_recent_window = False
@@ -591,23 +609,38 @@ def _load_telemetry_dumps(
             if not isinstance(call, dict):
                 raise InputDataError(f"{path}: элемент телеметрии [{idx}] должен быть объектом.")
             call_id = call.get("id")
-            if call_id is not None:
-                if call_id in seen_call_ids:
-                    continue
-                seen_call_ids.add(call_id)
             sid = call.get("session_id") or call.get("conversation_id")
             if not isinstance(sid, str) or not sid.strip():
                 raise InputDataError(
                     f"{path}: вызов [{idx}] не содержит session_id (нужен для группировки по обращениям)."
                 )
             sid = sid.strip()
-            calls_by_session.setdefault(sid, []).append(_parse_call_dict(call, f"{path}:calls[{idx}]"))
+            record = _parse_call_dict(call, f"{path}:calls[{idx}]")
+            if call_id is not None:
+                if call_id in window_ids[sid]:
+                    if window_ids[sid][call_id] != record:
+                        raise InputDataError(f"Диалог {sid}: разные данные вызова {call_id}.")
+                    continue
+                window_ids[sid][call_id] = record
+            calls_by_session.setdefault(sid, []).append(record)
             if call.get("category") is not None:
                 categories_by_session[sid] = str(call["category"])
 
-    # A full session export already includes the calls from overlapping telemetry windows.
-    calls_by_session.update(full_calls)
-    return calls_by_session, categories_by_session, escalated_by_session, outcomes, warnings
+    for sid, complete in full_calls.items():
+        window = calls_by_session.get(sid, [])
+        # An identified call can match its own ID or an anonymous record of the same signature.
+        # Multiplicity matters when two paid calls have identical token counts.
+        known = full_ids[sid]
+        anonymous = Counter(complete) - Counter(known.values())
+        new_ids = Counter(call for key, call in window_ids[sid].items() if key not in known)
+        if (
+            Counter(window) - Counter(complete)
+            or new_ids - anonymous
+            or any(known[key] != window_ids[sid][key] for key in known.keys() & window_ids[sid].keys())
+        ):
+            raise InputDataError(f"Диалог {sid}: окно телеметрии противоречит полному снимку вызовов.")
+        calls_by_session[sid] = complete
+    return calls_by_session, categories_by_session, escalated_by_session, outcomes, set(full_calls), warnings
 
 
 def load_measurements(
@@ -625,14 +658,13 @@ def load_measurements(
 
     cat_map = category_map or {}
     valid_categories = set(split_summary.categories.keys())
-    telemetry_calls, telemetry_cats, telemetry_esc, telemetry_outcomes, tel_warnings = _load_telemetry_dumps(
-        telemetry_paths, allow_incomplete_telemetry=allow_incomplete_telemetry
+    telemetry_calls, telemetry_cats, telemetry_esc, telemetry_outcomes, full_sessions, tel_warnings = (
+        _load_telemetry_dumps(telemetry_paths, allow_incomplete_telemetry=allow_incomplete_telemetry)
     )
     if warnings_out is not None:
         warnings_out.extend(tel_warnings)
     matched_sessions: set[str] = set()
-    seen_dialog_ids: set[str] = set()
-    dialogs: list[DialogMeasurement] = []
+    by_id: dict[str, DialogMeasurement] = {}
 
     for path in eval_report_paths:
         if not path.is_file():
@@ -669,64 +701,58 @@ def load_measurements(
                     _parse_call_dict(c, f"{path}:cases[{idx}].llm_calls[{c_i}]")
                     for c_i, c in enumerate(case["llm_calls"])
                 ]
-            elif isinstance(case.get("turns"), list):
+            elif case.get("cost_status") not in {"unavailable", "partial"} and isinstance(case.get("turns"), list):
                 turn_calls, has_trace = _extract_calls_from_turns(case["turns"], f"{path}:cases[{idx}]")
                 if has_trace:
                     calls = turn_calls
 
-            if calls is None and conv_id_str and conv_id_str in telemetry_calls:
-                calls = list(telemetry_calls[conv_id_str])
-            elif calls is None and case_id in telemetry_calls:
-                calls = list(telemetry_calls[case_id])
-
-            if calls is None:
-                # Если в eval-отчёте есть кейс без телеметрии вызовов и без совпадения в telemetry —
-                # не подставляем нули молча: пропускаем как незамеренный, а если таких 100%, ниже будет 0 диалогов.
-                continue
-
-            # Дедупликация: помечаем оба ключа (conversation_id и case_id), чтобы телеметрия не добавила дубль.
-            if conv_id_str:
-                matched_sessions.add(conv_id_str)
-            matched_sessions.add(case_id)
             dialog_id = conv_id_str or case_id
-            if dialog_id in seen_dialog_ids:
-                continue
-            seen_dialog_ids.add(dialog_id)
-            escalated = bool(case.get("escalated")) or bool(
-                (conv_id_str and telemetry_esc.get(conv_id_str)) or telemetry_esc.get(case_id)
-            )
-            closed = case.get("closed_by_agent", telemetry_outcomes.get(dialog_id))
+            telemetry_id = dialog_id if dialog_id in telemetry_calls else case_id
+            other_calls = telemetry_calls.get(telemetry_id)
+            if other_calls is not None:
+                matched_sessions.add(telemetry_id)
+                if calls is None:
+                    calls = other_calls
+                elif Counter(other_calls) - Counter(calls) or (
+                    telemetry_id in full_sessions and Counter(other_calls) != Counter(calls)
+                ):
+                    raise InputDataError(f"Диалог {dialog_id}: eval и телеметрия противоречат друг другу по вызовам.")
+
+            closed = case.get("closed_by_agent")
             if case.get("passed") is False:
                 closed = False
-            dialogs.append(
-                DialogMeasurement(
-                    dialog_id, category, tuple(calls), escalated, closed if isinstance(closed, bool) else None
-                )
+            tel_closed = telemetry_outcomes.get(telemetry_id)
+            if isinstance(closed, bool) and tel_closed is not None and tel_closed != closed:
+                raise InputDataError(f"Диалог {dialog_id}: противоречивые исходы в eval и телеметрии.")
+            escalated = case.get("escalated")
+            tel_escalated = telemetry_esc.get(telemetry_id)
+            if isinstance(escalated, bool) and tel_escalated is not None and tel_escalated != escalated:
+                raise InputDataError(f"Диалог {dialog_id}: противоречивые признаки передачи в eval и телеметрии.")
+            if not isinstance(escalated, bool):
+                escalated = tel_escalated
+            record = DialogMeasurement(
+                dialog_id,
+                category,
+                tuple(calls) if calls is not None else None,
+                escalated,
+                closed if isinstance(closed, bool) else tel_closed,
             )
+            previous = by_id.get(dialog_id)
+            if previous is not None and previous != record:
+                raise InputDataError(f"Диалог {dialog_id}: несовместимые снимки в eval-отчётах.")
+            by_id[dialog_id] = record
 
-    # Добавляем диалоги из телеметрии, не сматченные с eval-кейсами.
     for sid, calls in telemetry_calls.items():
-        if sid in matched_sessions or sid in seen_dialog_ids:
+        if sid in matched_sessions:
             continue
         category = cat_map.get(sid) or telemetry_cats.get(sid)
         if category is not None:
             category = category.strip()
             if category not in valid_categories:
-                raise InputDataError(
-                    f"Диалог телеметрии '{sid}' имеет неизвестную категорию {category!r}. "
-                    f"Допустимые категории из split_summary: {sorted(valid_categories)}."
-                )
-        seen_dialog_ids.add(sid)
-        dialogs.append(
-            DialogMeasurement(
-                dialog_id=sid,
-                category=category,
-                calls=tuple(calls),
-                escalated=telemetry_esc.get(sid, False),
-                closed_by_agent=telemetry_outcomes.get(sid),
-            )
-        )
+                raise InputDataError(f"Диалог телеметрии '{sid}' имеет неизвестную категорию {category!r}.")
+        by_id[sid] = DialogMeasurement(sid, category, tuple(calls), telemetry_esc.get(sid), telemetry_outcomes.get(sid))
 
+    dialogs = list(by_id.values())
     categorized = [d for d in dialogs if d.category is not None]
     uncategorized = [d for d in dialogs if d.category is None]
     if categorized and uncategorized:
@@ -769,10 +795,12 @@ def _call_cost_rub(call: LLMCallRecord, pricing: PricingConfig, usd_rub_rate: De
     return (cost_in + cost_out) * rate
 
 
-def _pilot_costs(manual: Decimal, technical: Decimal, labor_share: Decimal | None):
+def _pilot_costs(manual: Decimal, technical: Decimal | None, labor_share: Decimal | None):
     if labor_share is None:
         return None, None, None, None
     residual = manual * labor_share
+    if technical is None:
+        return residual, None, None, None
     total = technical + residual
     saving = manual - total
     return residual, total, saving, saving / manual * HUNDRED if manual > ZERO else ZERO
@@ -784,6 +812,7 @@ def _compute_load_scenario(
     avg_tokens_in_per_request: Decimal | None,
     avg_tokens_out_per_request: Decimal | None,
     labor_share: Decimal | None,
+    complete_costs: bool = True,
     daily_infra_cost_rub: Decimal,
     operator_cost_per_request_rub: Decimal,
     requests_per_day: int,
@@ -815,8 +844,10 @@ def _compute_load_scenario(
             full_cost_per_request_rub=None,
             operator_daily_cost_rub=operator_daily_cost_rub,
             operator_period_cost_rub=operator_period_cost_rub,
-            daily_residual_operator_cost_rub=None,
-            period_residual_operator_cost_rub=None,
+            daily_residual_operator_cost_rub=operator_daily_cost_rub * labor_share if labor_share is not None else None,
+            period_residual_operator_cost_rub=operator_period_cost_rub * labor_share
+            if labor_share is not None
+            else None,
             savings_per_request_rub=None,
             savings_daily_rub=None,
             savings_period_rub=None,
@@ -835,10 +866,10 @@ def _compute_load_scenario(
     full_cost_per_request_rub = period_total_cost_rub / req_period_dec
 
     daily_residual_operator, _, net_savings_daily_rub, _ = _pilot_costs(
-        operator_daily_cost_rub, daily_total_cost_rub, labor_share
+        operator_daily_cost_rub, daily_total_cost_rub if complete_costs else None, labor_share
     )
     period_residual_operator, _, net_savings_period_rub, net_savings_pct = _pilot_costs(
-        operator_period_cost_rub, period_total_cost_rub, labor_share
+        operator_period_cost_rub, period_total_cost_rub if complete_costs else None, labor_share
     )
 
     savings_per_request_rub = operator_cost_per_request_rub - full_cost_per_request_rub
@@ -872,6 +903,29 @@ def _compute_load_scenario(
     )
 
 
+def _weighted_share(
+    dialogs: list[DialogMeasurement], summary: SplitSummary, flag: Callable[[DialogMeasurement], bool | None]
+) -> Decimal | None:
+    if not dialogs or any(flag(d) is None for d in dialogs):
+        return None
+    if all(d.category is None for d in dialogs):
+        return Decimal(sum(1 for d in dialogs if flag(d))) / len(dialogs)
+    groups: dict[str, list[DialogMeasurement]] = defaultdict(list)
+    for d in dialogs:
+        groups[d.category].append(d)
+    weights = {category: summary.categories[category].share for category in groups}
+    total_weight = sum(weights.values(), ZERO)
+    if not total_weight:
+        return Decimal(sum(1 for d in dialogs if flag(d))) / len(dialogs)
+    return (
+        sum(
+            weights[category] * Decimal(sum(1 for d in group if flag(d))) / len(group)
+            for category, group in groups.items()
+        )
+        / total_weight
+    )
+
+
 def compute_unit_economics(
     dialogs: list[DialogMeasurement],
     split_summary: SplitSummary,
@@ -901,6 +955,20 @@ def compute_unit_economics(
     operator_cost_per_request_rub = pricing.operator.hourly_rate_rub * pricing.operator.minutes_per_request / SIXTY
     operator_period_cost_rub = operator_cost_per_request_rub * req_period_dec
 
+    total_dialogs = len(dialogs)
+    known_outcomes = sum(d.needs_operator is not None for d in dialogs)
+    escalated_dialogs = sum(d.escalated is True for d in dialogs)
+    escalation_rate = _weighted_share(dialogs, split_summary, lambda d: d.confirmed_escalation)
+    labor_share = _weighted_share(dialogs, split_summary, lambda d: d.needs_operator)
+    dialogs = [d for d in dialogs if d.calls is not None]
+    complete_costs = len(dialogs) == total_dialogs
+    if not complete_costs:
+        telemetry_warnings = (
+            *telemetry_warnings,
+            f"Телеметрия вызовов есть у {len(dialogs)} из {total_dialogs} обращений. "
+            "Оценка технических расходов опирается на замеренные обращения. Чистая экономия не определена.",
+        )
+
     # Пустые замеры — честный результат без подстановки нулей в переменную стоимость.
     if not dialogs:
         empty_cats = tuple(
@@ -918,7 +986,7 @@ def compute_unit_economics(
             active_variable_cost_rub=None,
             avg_tokens_in_per_request=None,
             avg_tokens_out_per_request=None,
-            labor_share=None,
+            labor_share=labor_share,
             daily_infra_cost_rub=daily_infra_cost_rub,
             operator_cost_per_request_rub=operator_cost_per_request_rub,
             requests_per_day=load_requests_per_day,
@@ -928,8 +996,10 @@ def compute_unit_economics(
             has_measurements=False,
             weighting_mode="none",
             measured_dialogs=0,
-            escalated_dialogs=0,
-            escalation_rate=None,
+            total_dialogs=total_dialogs,
+            known_outcomes=known_outcomes,
+            escalated_dialogs=escalated_dialogs,
+            escalation_rate=escalation_rate,
             covered_archive_share=ZERO,
             uncovered_archive_share=Decimal("1"),
             missing_categories=tuple(split_summary.categories.keys()),
@@ -952,7 +1022,9 @@ def compute_unit_economics(
             full_cost_per_request_rub=None,
             operator_cost_per_request_rub=operator_cost_per_request_rub,
             operator_period_cost_rub=operator_period_cost_rub,
-            period_residual_operator_cost_rub=None,
+            period_residual_operator_cost_rub=operator_period_cost_rub * labor_share
+            if labor_share is not None
+            else None,
             period_pilot_total_cost_rub=None,
             savings_per_request_rub=None,
             savings_period_rub=None,
@@ -1122,34 +1194,12 @@ def compute_unit_economics(
     daily_tokens_in = avg_tokens_in_per_request * base_req_per_day
     daily_tokens_out = avg_tokens_out_per_request * base_req_per_day
 
-    escalated_dialogs = sum(1 for d in dialogs if d.escalated)
-    if weighting_mode == "archive_weighted":
-        escalation_rate = sum(
-            (
-                norm_weights[c]
-                * (Decimal(sum(1 for d, _ in dialogs_by_cat[c] if d.escalated)) / Decimal(len(dialogs_by_cat[c])))
-                for c in norm_weights
-            ),
-            ZERO,
-        )
-    else:
-        escalation_rate = Decimal(escalated_dialogs) / Decimal(len(dialogs))
-
     period_variable_cost_rub = req_period_dec * active_variable_cost_rub
     period_total_cost_rub = period_variable_cost_rub + period_infra_cost_rub
     full_cost_per_request_rub = period_total_cost_rub / req_period_dec
 
-    labor_share = None
-    if all(d.needs_operator is not None for d in dialogs):
-        if weighting_mode == "archive_weighted":
-            labor_share = sum(
-                weight * Decimal(sum(1 for d, _ in dialogs_by_cat[c] if d.needs_operator)) / len(dialogs_by_cat[c])
-                for c, weight in norm_weights.items()
-            )
-        else:
-            labor_share = Decimal(sum(1 for d in dialogs if d.needs_operator)) / len(dialogs)
     period_residual_operator_cost_rub, period_pilot_total_cost_rub, net_savings_period_rub, net_savings_pct = (
-        _pilot_costs(operator_period_cost_rub, period_total_cost_rub, labor_share)
+        _pilot_costs(operator_period_cost_rub, period_total_cost_rub if complete_costs else None, labor_share)
     )
 
     savings_per_request_rub = operator_cost_per_request_rub - full_cost_per_request_rub
@@ -1160,6 +1210,7 @@ def compute_unit_economics(
         avg_tokens_in_per_request=avg_tokens_in_per_request,
         avg_tokens_out_per_request=avg_tokens_out_per_request,
         labor_share=labor_share,
+        complete_costs=complete_costs,
         daily_infra_cost_rub=daily_infra_cost_rub,
         operator_cost_per_request_rub=operator_cost_per_request_rub,
         requests_per_day=load_requests_per_day,
@@ -1170,6 +1221,8 @@ def compute_unit_economics(
         has_measurements=True,
         weighting_mode=weighting_mode,
         measured_dialogs=len(dialogs),
+        total_dialogs=total_dialogs,
+        known_outcomes=known_outcomes,
         escalated_dialogs=escalated_dialogs,
         escalation_rate=escalation_rate,
         covered_archive_share=covered_share,
@@ -1623,6 +1676,11 @@ def build_comment_lines(result: UnitEconomicsResult, pricing: PricingConfig) -> 
             "доли 9 категорий из архива чатов (не рабочий поток), покрытие 100%."
         )
 
+    if result.measured_dialogs < result.total_dialogs:
+        line1 += (
+            f" Учтены вызовы {result.measured_dialogs}/{result.total_dialogs} диалогов; "
+            f"известны исходы {result.known_outcomes}/{result.total_dialogs}."
+        )
     used_models = {s.model for s in result.steps} or set(pricing.models.keys())
     model_refs = "; ".join(
         f"{m}: {pricing.models[m].source_url} ({pricing.models[m].date})"
@@ -1780,8 +1838,9 @@ def render_markdown_report(result: UnitEconomicsResult, pricing: PricingConfig) 
         "## Параметры расчёта",
         "",
         "- **Единица учёта**: 1 запрос = 1 обращение = все LLM-вызовы в диалоге.",
-        f"- **Замерено диалогов**: {result.measured_dialogs} (из них передано менеджеру: {result.escalated_dialogs}, "
-        f"доля эскалаций: {esc_pct_cell})",
+        f"- **Замерено диалогов**: {result.measured_dialogs} из {result.total_dialogs} с данными о вызовах.",
+        f"- Исход известен для {result.known_outcomes} из {result.total_dialogs} обращений. "
+        f"Подтверждено передач менеджеру: {result.escalated_dialogs}. Доля эскалаций: {esc_pct_cell}.",
         "- Для переданного или незавершённого обращения закладываем полный ручной разбор по ставке оператора. "
         "При неизвестном исходе затраты труда и чистая экономия не определены. Технические расходы учтены.",
         f"- **Режим взвешивания**: `{result.weighting_mode}`",
