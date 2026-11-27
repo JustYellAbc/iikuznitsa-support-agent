@@ -32,7 +32,7 @@ from app.core.auth import Principal
 from app.core.errors import ApiError, invalid_input, not_found
 from app.db import repository
 from app.db.database import get_db
-from app.services import turn_service
+from app.services import quotes, turn_service
 
 OPERATOR_QUESTION = "Покупатель попросил подключить оператора."
 CONVERSATION_NOT_FOUND = "Диалог не найден."
@@ -67,11 +67,15 @@ async def idempotent(
             if stored.request_hash != request_hash:
                 raise ApiError(409, "key_conflict", "Ключ уже использован для другой команды.")
             return stored.status, stored.body
-        status, payload = await handler()
-        await repository.save_idempotent(
-            principal.id, method, path, key, repository.StoredResult(request_hash, status, payload)
-        )
-        return status, payload
+        command = repository.CommandReceipt((principal.id, method, path, key), request_hash)
+        token = repository.active_command.set(command)
+        try:
+            status, payload = await handler()
+            if not command.saved:
+                await command.save(status, payload)
+            return status, payload
+        finally:
+            repository.active_command.reset(token)
 
 
 # --- Доступ ---------------------------------------------------------------------------
@@ -123,7 +127,7 @@ async def submit_action(principal: Principal, conversation_id: str, action: Cust
     if isinstance(action, RequestOperatorAction):
         return await _request_operator(conv)
     if isinstance(action, ConfirmQuoteAction | RequestDocumentAction):
-        raise not_found("Расчёт не найден.")
+        return await quotes.quote_action(conversation_id, action)
     raise invalid_input("Неизвестная команда.")
 
 
@@ -141,6 +145,7 @@ async def _customer_message(conv: repository.Conversation, action: MessageAction
         found = await repository.get_handoff(action.handoffId)
         if found is None or found.handoff.conversationId != cid:
             raise not_found(HANDOFF_NOT_FOUND)
+        await quotes.check_line_revision(found.handoff)
         if found.handoff.status != "open":
             raise ApiError(409, "already_resolved", "Обращение уже закрыто.")
         data = MessageData(author="customer", purpose="input", text=text, sources=[], handoffId=action.handoffId)
@@ -155,6 +160,9 @@ async def _customer_message(conv: repository.Conversation, action: MessageAction
             "rate_limited",
             "Достигнут лимит сообщений в диалоге. Дождитесь ответа оператора или начните новый диалог.",
         )
+    result = await quotes.from_message(cid, text)
+    if result:
+        return result
     history = await repository.history_messages(cid)
     data = MessageData(author="customer", purpose="input", text=text, sources=[])
     await append(cid, action_id, [data.model_dump(mode="json")])
@@ -218,8 +226,9 @@ async def resolve_handoff(handoff_id: str, decision: ManagerDecision) -> Result:
     handoff = found.handoff
     if handoff.status != "open":
         raise ApiError(409, "already_resolved", "Обращение уже закрыто.")
+    await quotes.check_line_revision(handoff)
     if not isinstance(decision, ReplyDecision):
-        raise not_found("Строка расчёта не найдена.")
+        return await quotes.approve_price(handoff, decision)
 
     text = decision.reply.strip()
     if not text:
@@ -236,6 +245,7 @@ async def resolve_handoff(handoff_id: str, decision: ManagerDecision) -> Result:
     datas = [message.model_dump(mode="json")]
     async with get_db().tx() as conn:
         if decision.type == "close":
+            await quotes.invalidate_exception(conn, handoff)
             await repository.resolve_handoff(handoff_id, conn=conn)
             closed = handoff.model_copy(update={"status": "resolved"})
             datas.append(HandoffData(handoff=closed).model_dump(mode="json"))

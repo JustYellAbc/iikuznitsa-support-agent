@@ -236,7 +236,50 @@ class HandoffData(Contract):
     handoff: Handoff
 
 
-EventData = Annotated[MessageData | ProductsData | HandoffData, Field(discriminator="type")]
+class QuoteLine(Contract):
+    offerId: Id
+    name: Text
+    source: Source
+    packages: Annotated[int, Field(ge=1)]
+    unitPriceKopecks: Kopecks | None
+
+
+class CommercialTerms(Contract):
+    taxNote: str | None
+    payment: str | None
+    delivery: str | None
+    validUntil: str | None
+
+
+class Quote(Contract):
+    quoteId: Id
+    revision: Revision
+    state: Literal["needs_review", "ready", "confirmed"]
+    lines: list[QuoteLine]
+    knownSubtotalKopecks: Annotated[int, Field(ge=0)]
+    totalKopecks: Kopecks | None
+    terms: CommercialTerms
+
+
+class QuoteData(Contract):
+    type: Literal["quote"] = "quote"
+    quote: Quote
+
+
+class Document(Contract):
+    documentId: Id
+    quoteId: Id
+    revision: Revision
+    kind: Literal["quote_pdf", "demo_invoice"]
+    url: str
+
+
+class DocumentData(Contract):
+    type: Literal["document"] = "document"
+    document: Document
+
+
+EventData = Annotated[MessageData | ProductsData | HandoffData | QuoteData | DocumentData, Field(discriminator="type")]
 
 
 class Event(Contract):

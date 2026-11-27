@@ -122,6 +122,9 @@ function openCard(item) {
   $("card").hidden = !item;
   $("no-selection").hidden = Boolean(item);
   const resolved = item?.status === "resolved";
+  $("approve-price").hidden = !(item?.quoteLine && !resolved && item.reason === "price_request");
+  $("approve-price").reset();
+  $("price-status").textContent = "";
   $("compose").hidden = Boolean(resolved);
   $("knowledge").hidden = !resolved;
   $("article-form").reset();
@@ -200,9 +203,12 @@ async function refresh() {
       drafts.delete(id);
       $("result").textContent = "Обращение закрыто.";
     } else {
+      const current = selected && items.find(item => item.handoffId === selected.handoffId);
+      if (current && JSON.stringify(current.quoteLine) !== JSON.stringify(selected.quoteLine)) openCard(current);
       if (changed) showQueue();
       await readHistory();
     }
+    await refreshQuoteDrafts();
   } catch (error) {
     if (attempt === refreshNumber) connectionError(error);
   } finally {
@@ -260,3 +266,41 @@ $("compose").onsubmit = async e => {
 };
 
 window.addEventListener("DOMContentLoaded", refresh);
+
+async function refreshQuoteDrafts() {
+  const pending = (await request("/manager/drafts")).filter(d => d.events.some(e => e.type === "quote"));
+  if (!authenticated) return;
+  const rows = pending.map(d => {
+    const q = d.events.find(e => e.type === "quote").quote;
+    const row = element("div", ""), link = element("a", "Проверить PDF · версия " + q.revision);
+    link.href = "/api/v1/conversations/" + encodeURIComponent(d.conversation_id) + "/quotes/" +
+      encodeURIComponent(q.quoteId) + "/" + q.revision + "/preview.pdf";
+    const send = element("button", "Передать КП покупателю");
+    send.onclick = async () => {
+      send.disabled=true;
+      try { await request("/manager/drafts/" + encodeURIComponent(d.id) + "/send", {}, newKey()); await refresh(); }
+      catch (error) { $("result").textContent = error.message; send.disabled=false; }
+    };
+    row.append(link,send); return row;
+  });
+  $("quote-drafts").replaceChildren(...rows);
+  $("quote-moderation").hidden = !rows.length;
+}
+
+$("approve-price").onsubmit = async e => {
+  e.preventDefault();
+  const item = selected, button = e.currentTarget.querySelector("button");
+  if (!item?.quoteLine || button.disabled) return;
+  const [rub, cents = ""] = $("line-price").value.trim().split(/[.,]/);
+  const unitPriceKopecks = Number(rub + cents.padEnd(2, "0"));
+  if (!Number.isSafeInteger(unitPriceKopecks) || unitPriceKopecks < 1) {
+    $("price-status").textContent = "Укажите положительную цену в рублях."; return;
+  }
+  button.disabled = true;
+  try {
+    await request("/manager/handoffs/" + encodeURIComponent(item.handoffId) + "/resolution",
+      {type:"approve_line_price", ...item.quoteLine, unitPriceKopecks}, newKey());
+    await refresh();
+  } catch (error) { if (selected?.handoffId === item.handoffId) $("price-status").textContent = error.message; }
+  finally { button.disabled = false; }
+};
