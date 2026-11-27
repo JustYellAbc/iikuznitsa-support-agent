@@ -171,6 +171,26 @@ async def resolve_handoff(
     responses={200: {"content": {"application/pdf": {}}}, **ERRORS},
 )
 async def download_document(documentId: PathId, principal: Principal = Depends(require_principal)) -> Response:
+    if documentId.startswith("inv_"):
+        async with get_db().committed_read():
+            invoice = await get_db().fetchone(
+                "SELECT q.conversation_id, i.quote_id, i.revision FROM demo_invoices i "
+                "JOIN quote_revisions q USING(quote_id,revision) WHERE i.document_id=? AND i.pdf IS NOT NULL",
+                (documentId,),
+            )
+            if invoice is None:
+                raise not_found("Документ не найден.")
+            await svc.conversation_for(principal, invoice["conversation_id"])
+            pdf = await get_db().fetchval("SELECT pdf FROM demo_invoices WHERE document_id=?", (documentId,))
+        filename = f"Softline-demo-invoice-{documentId}-v{invoice['revision']}.pdf"
+        return Response(
+            pdf,
+            media_type="application/pdf",
+            headers={
+                "Cache-Control": "private, no-store",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
     row = await get_db().fetchone(
         "SELECT conversation_id, quote_id, revision FROM quote_revisions "
         "WHERE document_id=? AND issued_action IS NOT NULL",

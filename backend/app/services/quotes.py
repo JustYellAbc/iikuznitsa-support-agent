@@ -419,26 +419,30 @@ def current_quote(row, qid, revision):
     return read(row)
 
 
-async def quote_action(cid, action: ConfirmQuoteAction | RequestDocumentAction):
+async def actionable_quote(cid, qid, revision):
     from app.services.turn_service import is_busy
 
     if is_busy(cid):
         raise ApiError(409, "agent_busy", "Дождитесь проверки новых условий в чате.")
+    row = await latest(cid)
+    snapshot = current_quote(row, qid, revision)
+    await require_published(row)
+    await check_exceptions(cid, [d.product.offerId for d in snapshot.details])
+    if row["reselect"]:
+        raise ApiError(409, "stale_revision", "Покупатель изменил потребность. Требуется актуальный подбор.")
+    q = snapshot.quote
+    if q.state == "needs_review" or (q.terms.validUntil and q.terms.validUntil < date.today().isoformat()):
+        raise ApiError(409, "terms_pending", "Для выпуска документа требуется согласовать действующие условия.")
+    return row, snapshot
+
+
+async def quote_action(cid, action: ConfirmQuoteAction | RequestDocumentAction):
     async with get_db().tx() as conn:
-        row = await latest(cid)
-        snapshot = current_quote(row, action.quoteId, action.revision)
-        await require_published(row)
-        await check_exceptions(cid, [d.product.offerId for d in snapshot.details])
-        if row["reselect"]:
-            raise ApiError(409, "stale_revision", "Покупатель изменил потребность. Требуется актуальный подбор.")
+        row, snapshot = await actionable_quote(cid, action.quoteId, action.revision)
         q = snapshot.quote
-        if q.state == "needs_review" or (q.terms.validUntil and q.terms.validUntil < date.today().isoformat()):
-            raise ApiError(409, "terms_pending", "Для выпуска документа требуется согласовать действующие условия.")
         if isinstance(action, RequestDocumentAction):
             if action.kind != "quote_pdf":
-                if q.state != "confirmed":
-                    raise ApiError(409, "confirmation_required", "Подтвердите текущую ревизию КП.")
-                raise not_found("Демо-счёт ещё не выпущен.")
+                raise invalid_input("Ожидался запрос PDF коммерческого предложения.")
             doc = document(row)
             if row["issued_action"]:
                 return await repo.record_quote_response(conn, 200, doc.model_dump(mode="json"))

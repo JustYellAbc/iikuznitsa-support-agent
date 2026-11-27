@@ -78,6 +78,12 @@ export function renderEvent({ data, at }, conversationId, submit) {
         confirm.onclick = () => submit({type:"confirm_quote", quoteId:data.quote.quoteId, revision:data.quote.revision});
         row.append(confirm);
       }
+      if (data.quote.state === "confirmed" && submit) {
+        const invoice = element("button", "Получить демо-счёт");
+        invoice.type = "button"; invoice.dataset.confirmQuote = data.quote.quoteId;
+        invoice.onclick = () => submit({type:"request_document",kind:"demo_invoice",quoteId:data.quote.quoteId,revision:data.quote.revision});
+        row.append(invoice);
+      }
       break;
     case "document": {
       const link = element("a", data.document.kind === "quote_pdf" ? "Скачать КП" : "Скачать демо-счёт");

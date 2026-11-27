@@ -32,7 +32,7 @@ from app.core.auth import Principal
 from app.core.errors import ApiError, invalid_input, not_found
 from app.db import repository
 from app.db.database import get_db
-from app.services import quotes, turn_service
+from app.services import invoices, quotes, turn_service
 
 OPERATOR_QUESTION = "Покупатель попросил подключить оператора."
 CONVERSATION_NOT_FOUND = "Диалог не найден."
@@ -126,6 +126,8 @@ async def submit_action(principal: Principal, conversation_id: str, action: Cust
         return await _customer_message(conv, action)
     if isinstance(action, RequestOperatorAction):
         return await _request_operator(conv)
+    if isinstance(action, RequestDocumentAction) and action.kind == "demo_invoice":
+        return await invoices.request(conversation_id, principal.id, action)
     if isinstance(action, ConfirmQuoteAction | RequestDocumentAction):
         return await quotes.quote_action(conversation_id, action)
     raise invalid_input("Неизвестная команда.")
