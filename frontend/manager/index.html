@@ -42,6 +42,15 @@
             <button class="primary">Подтвердить цену строки</button>
             <p id="price-status" role="status"></p>
           </form>
+          <form id="terms-review" hidden>
+            <h3>Условия коммерческого предложения</h3>
+            <label>Оплата <input name="payment" required maxlength="200"></label>
+            <label>Поставка <input name="delivery" required maxlength="200"></label>
+            <label>Действует до <input name="validUntil" type="date" required></label>
+            <div id="terms-lines"></div>
+            <button class="primary">Согласовать и подготовить новую версию КП</button>
+          </form>
+          <p id="terms-feedback" role="status"></p>
           <form id="compose">
             <label for="reply">Ответ клиенту</label>
             <textarea id="reply" required maxlength="8000" rows="3" placeholder="Напишите сообщение…"></textarea>

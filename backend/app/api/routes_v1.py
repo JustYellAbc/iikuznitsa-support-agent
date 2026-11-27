@@ -24,7 +24,7 @@ from app.core.errors import ApiError, not_found
 from app.db import repository
 from app.db.database import get_db
 from app.services import conversation_service as svc
-from app.services import quotes
+from app.services import quote_terms, quotes
 
 router = APIRouter(prefix="/api/v1")
 
@@ -262,6 +262,65 @@ async def prepare_quote(
             key,
             body.model_dump(mode="json"),
             lambda: quotes.prepare(conversationId, body),
+        )
+    )
+
+
+@router.get("/conversations/{conversationId}/quotes/{quoteId}/{revision}/terms-review", tags=["КП"])
+async def terms_status(
+    conversationId: PathId, quoteId: PathId, revision: int, principal: Principal = Depends(require_principal)
+):
+    await svc.conversation_for(principal, conversationId)
+    async with get_db().committed_read():
+        return {"state": await quote_terms.state(conversationId, quoteId, revision)}
+
+
+@router.post("/conversations/{conversationId}/quotes/{quoteId}/{revision}/terms-review", status_code=202, tags=["КП"])
+async def request_terms_review(
+    request: Request,
+    conversationId: PathId,
+    quoteId: PathId,
+    revision: int,
+    key: IdempotencyKey,
+    principal: Principal = Depends(require_principal),
+):
+    if principal.role != "customer":
+        raise ApiError(403, "forbidden", "Запрос на согласование отправляет покупатель.")
+    await svc.conversation_for(principal, conversationId)
+    return _json(
+        await svc.idempotent(
+            principal,
+            "POST",
+            request.url.path,
+            key,
+            None,
+            lambda: quote_terms.request_review(conversationId, quoteId, revision),
+        )
+    )
+
+
+@router.get("/manager/handoffs/{handoffId}/terms-review", tags=["КП"])
+async def get_terms_review(handoffId: PathId, principal: Principal = Depends(require_manager)):
+    async with get_db().committed_read():
+        return await quote_terms.details(handoffId)
+
+
+@router.post("/manager/handoffs/{handoffId}/terms-review", status_code=202, tags=["КП"])
+async def approve_terms(
+    request: Request,
+    handoffId: PathId,
+    body: quote_terms.ReviewDecision,
+    key: IdempotencyKey,
+    principal: Principal = Depends(require_manager),
+):
+    return _json(
+        await svc.idempotent(
+            principal,
+            "POST",
+            request.url.path,
+            key,
+            body.model_dump(mode="json"),
+            lambda: quote_terms.approve(handoffId, body),
         )
     )
 

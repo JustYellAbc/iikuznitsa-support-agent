@@ -168,6 +168,7 @@ function openCard(item) {
   $("approve-price").hidden = !(item?.quoteLine && !resolved && item.reason === "price_request");
   $("approve-price").reset();
   $("price-status").textContent = "";
+  loadTermsReview(item, generation);
   $("compose").hidden = Boolean(resolved);
   $("knowledge").hidden = !resolved;
   $("article-form").reset();
@@ -183,6 +184,51 @@ function openCard(item) {
     readHistory();
   }
   showQueue();
+}
+
+async function loadTermsReview(item, opened) {
+  const form = $("terms-review"), feedback = $("terms-feedback"), lines = $("terms-lines");
+  form.hidden = true; form.onsubmit = null; feedback.textContent = ""; lines.replaceChildren();
+  if (!item || item.status !== "open" || item.reason !== "insufficient_evidence") return;
+  const path = "/manager/handoffs/" + encodeURIComponent(item.handoffId) + "/terms-review";
+  try {
+    const detail = await request(path);
+    if (!detail || opened !== generation) return;
+    for (const field of ["payment", "delivery", "validUntil"]) form.elements[field].value = detail.terms[field] || "";
+    const rows = detail.lines.map(line => {
+      const group = document.createElement("fieldset");
+      group.append(element("legend", line.name));
+      const field = (label, type, value) => {
+        const wrap = element("label", label), input = document.createElement("input");
+        input.type = type; input.required = true; input.value = value ?? "";
+        wrap.append(input); group.append(wrap); return input;
+      };
+      const article = field("Артикул", "text", line.article);
+      article.maxLength = 200;
+      const vat = field("НДС, %", "number", line.vatRate);
+      vat.min = "0"; vat.max = "100"; vat.step = "any";
+      lines.append(group); return {id: line.offerId, article, vat};
+    });
+    const submit = form.querySelector("button"); submit.disabled = false; form.hidden = false;
+    let previousBody, key;
+    form.onsubmit = async e => {
+      e.preventDefault();
+      if (submit.disabled || opened !== generation) return;
+      const body = {revision:detail.revision, payment:form.elements.payment.value.trim(),
+        delivery:form.elements.delivery.value.trim(), validUntil:form.elements.validUntil.value,
+        lines:Object.fromEntries(rows.map(row => [row.id,{article:row.article.value.trim(),vatRate:row.vat.value}]))};
+      const serialized = JSON.stringify(body);
+      if (serialized !== previousBody) { key = newKey(); previousBody = serialized; }
+      submit.disabled = true;
+      try {
+        await request(path, body, key);
+        if (opened === generation) { feedback.textContent = "Условия сохранены."; form.hidden = true; }
+        await refresh();
+      } catch (error) {
+        if (opened === generation) { feedback.textContent = error.message; submit.disabled = false; }
+      }
+    };
+  } catch (error) { if (opened === generation) feedback.textContent = error.message; }
 }
 
 function connectionError(error) {
