@@ -794,7 +794,8 @@ def test_b1_quiescence_waits_for_trailing_handoff_and_pii_scrubs_holdout() -> No
         assert t_res.passed is False
         assert t_res.timed_out is True
         assert t_res.closed_by_agent is False
-        assert len(t_res.latency_ms) == 1 and t_res.latency_ms[0] >= 90.0
+        assert t_res.latency_ms == []
+        assert t_res.first_meaningful_latency_ms is None
     finally:
         server.shutdown()
         server.server_close()

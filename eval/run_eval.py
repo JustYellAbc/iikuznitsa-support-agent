@@ -465,6 +465,11 @@ def _surfaced_offer_ids(events: list[dict]) -> tuple[set[str], str]:
     for quote in _quotes_from_events(events):
         ids.update(str(line.get("offerId")) for line in quote.get("lines", []))
     text = "\n".join(str(m.get("text", "")) for m in _agent_messages(events))
+    for message in _agent_messages(events):
+        for source in message.get("sources", []):
+            match = re.search(r"-(\d+)/?(?:[?#].*)?$", source.get("url", ""))
+            if match:
+                ids.add(match[1])
     return ids, text
 
 
@@ -832,7 +837,7 @@ def validate_product_names(
             # Match the same SKU identification rule as _offer_id_surfaced, including URLs in text or sources.
             cites_in_raw = bool(oid_re.search(raw_text))
             cites_in_sources = bool(oid_re.search(source_urls))
-            if not cites_in_raw and not (cites_in_sources and oid not in carded):
+            if not (cites_in_raw or cites_in_sources):
                 continue
             text = _URL_RE.sub(" ", raw_text)
             foreign_found = False
@@ -995,6 +1000,13 @@ def validate_case_expectations(
         if not _offer_id_surfaced(str(exp_oid), surfaced_ids, surfaced_text):
             errors.append(f"Expected offerId {exp_oid} not surfaced in products, quotes, or text")
 
+    if assertions.get("require_unknown_term") and not any(
+        re.search(r"срок|длительность|период действия", sentence, re.I)
+        and re.search(r"не указан|не определ|неизвест|нет данных|уточн|не подтверж|не удалось", sentence, re.I)
+        for sentence in SENTENCE_SPLIT_RE.split(agent_text)
+    ):
+        errors.append("Expected an explicit answer that the license term needs confirmation")
+
     has_clarification = any(m.get("purpose") == "clarification" for m in agent_msgs)
     if assertions.get("expect_clarification") and not has_clarification:
         errors.append("Expected clarifying question with purpose='clarification' from agent")
@@ -1025,6 +1037,10 @@ def validate_case_expectations(
     handoffs = _handoffs_from_events(events)
     if assertions.get("forbid_handoff") and handoffs:
         errors.append(f"Unexpected handoff event(s): {[h.get('handoffId') for h in handoffs]}")
+
+    if "expect_unique_open_handoff_count" in assertions:
+        latest = {h["handoffId"]: h for h in handoffs if h.get("handoffId")}
+        handoffs = [h for h in latest.values() if h.get("status") == "open"]
 
     if assertions.get("expect_handoff"):
         if not handoffs:
@@ -1113,7 +1129,7 @@ def _is_meaningful_event(event: dict) -> bool:
     if dtype in {"products", "handoff", "quote", "document"}:
         return True
     if dtype == "message":
-        return data.get("author") in {"agent", "manager"} and data.get("purpose") != "greeting"
+        return data.get("author") in {"agent", "manager"} and data.get("purpose") in {"answer", "clarification"}
     return False
 
 
@@ -1128,7 +1144,7 @@ def _turn_has_response(action_events: list[dict]) -> bool:
         dtype = data.get("type")
         if dtype in {"quote", "handoff", "document", "action_failed"}:
             return True
-        if dtype == "message" and data.get("author") in {"agent", "manager"} and data.get("purpose") != "greeting":
+        if dtype == "message" and _is_meaningful_event(event):
             return True
     return False
 
@@ -1519,9 +1535,18 @@ def _has_confirmed_agent_resolution(history: list[dict], last_action_id: str | N
         dtype = data.get("type")
         if dtype in {"handoff", "action_failed"}:
             return False
-        if dtype == "message" and data.get("author") == "manager":
+        if dtype == "message" and (
+            data.get("author") == "manager"
+            or (
+                data.get("purpose") == "notice"
+                and data.get("text") == "Готовлю ответ, оператор проверит его и пришлёт сюда."
+            )
+        ):
             return False
     target = [ev for ev in history if ev.get("actionId") == last_action_id] if last_action_id is not None else history
+    quotes = _quotes_from_events(target)
+    if quotes and (quotes[-1].get("state") not in {"ready", "confirmed"} or quotes[-1].get("totalKopecks") is None):
+        return False
     for ev in target:
         data = ev.get("data", {})
         dtype = data.get("type")
@@ -1674,8 +1699,7 @@ def run_case(
                 time.sleep(max(0.0, min(wait, deadline - now)))
 
             if turn_info["close"] == "timeout":
-                turn_info["latency_ms"] = round(timeout * 1000.0, 2)
-                result.latency_ms.append(turn_info["latency_ms"])
+                turn_info["latency_ms"] = round(first_meaningful_ms, 2) if first_meaningful_ms is not None else None
                 break
             if first_meaningful_ms is not None and turn_info["close"] != "action_failed":
                 turn_info["latency_ms"] = round(first_meaningful_ms, 2)
@@ -1963,6 +1987,10 @@ def format_markdown_report(
         )
         return "\n".join(lines) + "\n"
 
+    if hide_holdout_details and summary.get("suite") == "all":
+        private = [item for item in summary["cases"] if item.get("suite") == "holdout"]
+        lines.append(f"\nHoldout: {sum(1 for item in private if item['passed'])}/{len(private)} passed.")
+
     lines.extend(
         [
             "",
@@ -1973,6 +2001,8 @@ def format_markdown_report(
     failed_items: list[tuple[str, dict]] = []
     for item in summary["cases"]:
         is_holdout = item.get("suite") == "holdout"
+        if hide_holdout_details and is_holdout:
+            continue
         display_id = str(item.get("alias") or "<holdout>") if mask_holdout_ids and is_holdout else str(item["id"])
         status_str = "PASS" if item["passed"] else "FAIL"
         if item["escalated"]:

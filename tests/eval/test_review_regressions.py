@@ -290,7 +290,7 @@ def test_b1_silent_turn_without_allow_silent_still_times_out() -> None:
     assert res.timed_out and not res.passed and not res.closed_by_agent
     summary = run_eval.summarize_results([res], suite="x", mode="mvp")
     assert summary["timed_out_cases"] == 1
-    assert summary["latency_ms"]["p95"] == pytest.approx(600.0)
+    assert summary["latency_ms"]["p95"] is None
 
 
 def test_b1_late_events_of_previous_turn_are_checked_with_that_turn() -> None:
@@ -889,3 +889,78 @@ def test_pii_real_archive_share_of_masked_names_and_orgs() -> None:
     assert name_share >= 0.95, f"names masked {name_share:.0%}; residual chat ids: {residual_names}"
     assert org_share >= 0.95, f"organisations masked {org_share:.0%}; residual chat ids: {residual_orgs}"
     assert labels["имя"] >= raw_names and labels["организация"] >= 30, labels
+
+
+def test_pilot_publication_and_incomplete_quote_do_not_resolve():
+    pilot = _agent("Готовлю ответ, оператор проверит его и пришлёт сюда.", "notice")
+    answer = _agent("Ответ согласован")
+    assert not run_eval._is_meaningful_event(pilot[0])
+    assert not run_eval._turn_has_response(pilot)
+    assert run_eval._is_meaningful_event(answer[0])
+    assert not run_eval._has_confirmed_agent_resolution(pilot + answer, "a1")
+    pending = _ev(3, {"type": "quote", "quote": {"state": "needs_review", "totalKopecks": None}})
+    assert not run_eval._has_confirmed_agent_resolution(answer + [pending], "a1")
+
+
+def test_sunrav_requires_consistent_answer_and_explicit_term():
+    rules = CASES["open-price-61557"]["assertions"]
+    card = _ev(1, {"type": "products", "products": [_product("61557")]})
+
+    def errors(text, with_card):
+        return run_eval.validate_case_expectations(([card] if with_card else []) + _agent(text), rules, CATALOG)
+
+    assert errors("Adobe Photoshop стоит 4900 ₽. Срок неизвестен.", True)
+    assert errors("SunRav BookOffice стоит 4900 ₽.", True)
+    assert not errors("SunRav BookOffice стоит 4900 ₽. Срок неизвестен.", False)
+
+
+def test_repeat_handoff_validates_latest_card():
+    rules = CASES["open-tender-repeat"]["assertions"]
+    good = _handoff("tender", [_product("19576")], question="Тендер. Пришлите документы.")
+    broken = _handoff("tender", [], question="Как выбрать калькулятор?")
+    errors = run_eval.validate_case_expectations([_ev(1, good), _ev(2, broken)], rules, CATALOG)
+    assert any("handoff.products" in e for e in errors)
+    assert any("handoff question" in e for e in errors)
+
+
+def test_public_mixed_report_hides_holdout_errors():
+    results = [
+        run_eval.CaseResult(
+            case_id="open-example", suite="open", category="open", passed=True, escalated=False, closed_by_agent=False
+        ),
+        run_eval.CaseResult(
+            case_id="private-id",
+            suite="holdout",
+            category="private",
+            passed=False,
+            escalated=False,
+            closed_by_agent=False,
+            errors=["private-content"],
+        ),
+    ]
+    report = run_eval.summarize_results(results, suite="all", mode="mvp")
+    public = run_eval.format_markdown_report(report, mask_holdout_ids=True, hide_holdout_details=True)
+    assert "open-example" in public
+    assert "private-content" not in public and "private-id" not in public
+    assert report["failed_cases"] == 1
+
+
+@pytest.mark.parametrize("publish", [True, False])
+def test_pilot_latency_starts_at_submit_and_ends_at_publication(publish):
+    def script(_turn, body):
+        events = [
+            (0, _input(body["text"])),
+            (0.01, _agent("Готовлю ответ, оператор проверит его и пришлёт сюда.", "notice")[0]["data"]),
+        ]
+        if publish:
+            events.append((0.10, _agent("Срок указан в карточке")[0]["data"]))
+        return events
+
+    case = {"id": "pilot-example", "suite": "open", "turns": [{"action": {"type": "message", "text": "Какой срок?"}}]}
+    res = run_eval.run_case(Timed(script), case, CATALOG, timeout=0.5, poll_interval=0.005, settle_seconds=0.01)
+    assert not res.closed_by_agent
+    if publish:
+        assert res.passed, res.errors
+        assert res.first_meaningful_latency_ms >= 90
+    else:
+        assert res.first_meaningful_latency_ms is None and res.timed_out

@@ -130,6 +130,7 @@ def test_p2_substituted_product_name_fails_open_price_61557() -> None:
     ],
 )
 def test_p2_accepted_spellings_pass_open_price_61557(text: str) -> None:
+    text += " Срок не указан."
     res = _run(ScriptedClient(lambda body: [_input(body["text"]), _answer(text)]), CASES["open-price-61557"])
     assert res.passed is True, res.errors
 
@@ -638,7 +639,7 @@ def test_p1_url_only_article_catches_product_substitution() -> None:
     assert bad.passed is False
     assert any("61557" in e and "Adobe Photoshop" in e for e in bad.errors), bad.errors
 
-    legit = "SunRav BookOffice стоит 4 900 ₽. https://store.softline.ru/sunrav/-61557/"
+    legit = "SunRav BookOffice стоит 4 900 ₽. Срок неизвестен. https://store.softline.ru/sunrav/-61557/"
     ok = _run(ScriptedClient(lambda body: [_input(body["text"]), _answer(legit)]), case)
     assert ok.passed is True, ok.errors
 

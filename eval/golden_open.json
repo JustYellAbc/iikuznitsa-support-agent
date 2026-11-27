@@ -224,6 +224,7 @@
             "required_prices_rub": ["4900"],
             "required_urls": ["https://store.softline.ru/sunrav/-61557/"],
             "require_sources_on_answer": true,
+            "require_unknown_term": true,
             "anti_term_hallucination_offer_id": "61557"
           }
         }
@@ -234,6 +235,7 @@
         "required_prices_rub": ["4900"],
         "required_urls": ["https://store.softline.ru/sunrav/-61557/"],
         "require_sources_on_answer": true,
+        "require_unknown_term": true,
         "anti_term_hallucination_offer_id": "61557"
       }
     },
