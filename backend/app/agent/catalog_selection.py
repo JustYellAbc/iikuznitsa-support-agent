@@ -22,6 +22,12 @@ LATIN = re.compile(r"\b[a-z][a-z0-9.+-]*(?:\s+[a-z][a-z0-9.+-]*)*", re.I | re.AS
 STOP_NAME = re.compile(
     r"[,;!?]|\.\s|\s+(?:на|для|в редакции|по цене|лицензи\w*|купить|сколько|покупа\w*|продл\w*)\b", re.I
 )
+# A choice of terms describes the customer's question, not a selected catalog filter.
+TERM_OPTION = r"(?:на\s+)?(?:год|\d{1,3}\s*(?:мес(?:яц(?:а|ев|ы)?)?\.?|года?|лет)|бессроч\w*|навсегда)"
+TERM_ALTERNATIVES = re.compile(rf"\b{TERM_OPTION}\s+или\s+{TERM_OPTION}\b")
+TERM_QUESTION = re.compile(
+    r"\b(?:на\s+какой\s+срок|сколько\s+(?:лет|месяцев))\s+(?:(?:она|он|лицензия|подписка)\s+)?действует\b"
+)
 BUYER = "Пользователь"
 KIND = "Тип лицензии"
 CAPACITY = "К-во пользователей до"
@@ -71,10 +77,11 @@ class Selection:
             if re.search(pattern, s):
                 updated.organization = category
                 break
-        duration = re.search(r"\b(\d{1,3})\s*(мес(?:яц(?:а|ев|ы)?)?\.?|года?|лет)\b", s)
+        conditions = TERM_QUESTION.sub("", TERM_ALTERNATIVES.sub("", s))
+        duration = re.search(r"\b(\d{1,3})\s*(мес(?:яц(?:а|ев|ы)?)?\.?|года?|лет)\b", conditions)
         if duration:
             updated.months = int(duration[1]) * (1 if duration[2].startswith("мес") else 12)
-        elif re.search(r"\bна год\b", s):
+        elif re.search(r"\bна год\b", conditions):
             updated.months = 12
         if re.search(r"впервые|в первый раз|нов(?:ая|ую) (?:покупк|лицензи)|полная версия|перв(?:ая|ую) покупк", s):
             updated.kind = "Полная версия"
@@ -82,11 +89,13 @@ class Selection:
             updated.kind = "Продление"
         elif followup and re.fullmatch(r"(?:новая|новую|первичная|первый раз)[.! ]*", s):
             updated.kind = "Полная версия"
-        if re.search(r"\bне\s+(?:действует|активна)|\bнедействующ", s):
+        if re.search(r"\bне\s+(?:действует|активна)|\bнедействующ", conditions):
             updated.expired = True
-        elif re.search(r"не (?:истек|истёк|истекла|просроч)|ещ[её] действ|\bдействует\b|действующ|активная", s):
+        elif re.search(
+            r"не (?:истек|истёк|истекла|просроч)|ещ[её] действ|\bдействует\b|действующ|активная", conditions
+        ):
             updated.expired = False
-        elif re.search(r"просроч|истек|истёк|закончилась|истекла", s):
+        elif re.search(r"просроч|истек|истёк|закончилась|истекла", conditions):
             updated.expired = True
         updated.perpetual |= bool(re.search(r"навсегда|бессроч|после окончани", s))
         return updated
