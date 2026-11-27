@@ -70,7 +70,9 @@ def render(snapshot: Snapshot, *, invoice_number: str | None = None) -> bytes:
     recipient = [
         para(f"Куда: {snapshot.customer.company}", 10, True),
         para(f"ИНН {snapshot.customer.inn}   КПП {snapshot.customer.kpp}"),
-        para(f"КП № {q.quoteId.removeprefix('q_')[:12]} от {snapshot.dated:%d.%m.%Y}"),
+        para(
+            f"{'КП' if invoice_number else 'Исх.'} № {q.quoteId.removeprefix('q_')[:12]} от {snapshot.dated:%d.%m.%Y}"
+        ),
     ]
     sender = [
         letterhead,

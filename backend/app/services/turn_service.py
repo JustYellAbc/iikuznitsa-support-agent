@@ -15,6 +15,7 @@ from app.core.errors import ApiError
 from app.core.llm import BudgetExceededError
 from app.db import repository
 from app.db.database import get_db
+from app.services import quotes
 
 log = logging.getLogger(__name__)
 
@@ -105,8 +106,16 @@ def _reply_events(reply: AgentReply) -> list[dict[str, Any]]:
 
 async def _publish(conversation_id: str, action_id: str, datas: list[dict[str, Any]]) -> None:
     if datas:
-        written = await repository.append_events(conversation_id, action_id, datas)
+        async with get_db().tx() as conn:
+            written = await append_reply(conn, conversation_id, action_id, datas)
         events.publish(conversation_id, written)
+
+
+async def append_reply(conn, cid, action_id, datas):
+    written = await repository.append_events(cid, action_id, datas, conn=conn)
+    if any(d["type"] in ("products", "handoff") or d.get("purpose") in ("answer", "clarification") for d in datas):
+        await quotes.invalidate_changed_selection(conn, cid)
+    return written
 
 
 async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
@@ -149,7 +158,7 @@ async def _apply(session: Session, action_id: str, reply: AgentReply) -> None:
                 conn=conn,
             )
             datas.append(HandoffData(handoff=handoff).model_dump(mode="json"))
-        written = await repository.append_events(cid, action_id, datas, conn=conn) if datas else []
+        written = await append_reply(conn, cid, action_id, datas) if datas else []
     events.publish(cid, written)
 
 
@@ -165,9 +174,9 @@ async def send_draft(draft_id: str, text: str | None) -> list[dict[str, Any]] | 
         datas = [dict(d) for d in draft.events]
         for data in datas:
             if data.get("type") == "quote":
-                from app.services.quotes import check_exceptions
-
-                await check_exceptions(draft.conversation_id, [line["offerId"] for line in data["quote"]["lines"]])
+                await quotes.check_exceptions(
+                    draft.conversation_id, [line["offerId"] for line in data["quote"]["lines"]]
+                )
         messages = [d for d in datas if d.get("type") == "message"]
         if text is not None and not messages:
             datas.append(MessageData(author="agent", purpose="answer", text=text, sources=[]).model_dump(mode="json"))
@@ -181,6 +190,6 @@ async def send_draft(draft_id: str, text: str | None) -> list[dict[str, Any]] | 
                 if route and patch_id.startswith("p_") and not await repository.live_article(conn, patch_id):
                     raise ApiError(409, "stale_revision", "Статья снята или заменена. Проверьте и измените ответ.")
         await repository.mark_draft_sent(draft_id, conn=conn)
-        written = await repository.append_events(draft.conversation_id, draft.action_id, datas, conn=conn)
+        written = await append_reply(conn, draft.conversation_id, draft.action_id, datas)
     events.publish(draft.conversation_id, written)
     return written
