@@ -6,11 +6,13 @@
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from datetime import time as dtime
 from typing import Any, Literal
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -22,6 +24,16 @@ from app.db import repository
 Profile = Literal["smart", "fast"]
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
+_OPENCODE_GO = "https://opencode.ai/inference/go/openai/v1"
+log = logging.getLogger(__name__)
+_PHASES = {
+    "connect_tcp",
+    "start_tls",
+    "send_request_headers",
+    "send_request_body",
+    "receive_response_headers",
+    "receive_response_body",
+}
 
 
 class BudgetExceededError(RuntimeError):
@@ -108,7 +120,14 @@ def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
         s = get_settings()
-        _client = httpx.AsyncClient(proxy=s.llm_proxy_url or None, timeout=s.llm_timeout_s)
+        options = {}
+        if s.llm_base_url.rstrip("/") == _OPENCODE_GO:
+            # The stand intermittently stalls opening TCP to Go. Reconnect before sending the request.
+            options["limits"] = httpx.Limits(keepalive_expiry=60)
+            options["timeout"] = httpx.Timeout(s.llm_timeout_s, connect=min(2.5, s.llm_timeout_s))
+        else:
+            options["timeout"] = s.llm_timeout_s
+        _client = httpx.AsyncClient(proxy=s.llm_proxy_url or None, **options)
     return _client
 
 
@@ -125,27 +144,72 @@ async def close_http_client() -> None:
         _client = None
 
 
-async def _post_chat(payload: dict[str, Any], session_id: str | None = None) -> dict[str, Any]:
+class _AttemptTiming:
+    def __init__(self):
+        self.started = time.monotonic()
+        self.phase = "dispatch"
+        self.marks = {}
+
+    def elapsed(self):
+        return round((time.monotonic() - self.started) * 1000)
+
+    async def trace(self, event, _info):
+        # httpcore info may contain headers and exceptions. Persist only allowed event timings.
+        parts = event.split(".")
+        if len(parts) != 3:
+            return
+        _, phase, state = parts
+        if phase in _PHASES and state in {"started", "complete", "failed"}:
+            self.phase = phase
+            self.marks[f"{phase}.{state}"] = self.elapsed()
+
+
+async def _post_chat(payload: dict[str, Any], session_id: str | None = None, *, step: str = "") -> dict[str, Any]:
     s = get_settings()
     url = s.llm_base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {s.llm_api_key}"} if s.llm_api_key else {}
-    if s.llm_base_url.rstrip("/") == "https://opencode.ai/inference/go/openai/v1":
+    go = s.llm_base_url.rstrip("/") == _OPENCODE_GO
+    if go:
         headers["User-Agent"] = "SoftlineSupportLab/0.1"
         if session_id:
             headers["x-opencode-session"] = session_id
     last_error: Exception | None = None
-    for attempt in range(2):
+    call_id = uuid4().hex[:12]
+    attempts = 3 if go else 2
+    for attempt in range(attempts):
+        timing = _AttemptTiming()
+        outcome = "error"
         try:
-            resp = await _get_client().post(url, json=payload, headers=headers)
+            resp = await _get_client().post(url, json=payload, headers=headers, extensions={"trace": timing.trace})
+            outcome = f"http_{resp.status_code}"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         except httpx.TransportError as e:
+            outcome = type(e).__name__
             last_error = e
+            # Once the body may have reached the provider, a second POST can duplicate inference.
+            if not isinstance(e, httpx.ConnectError | httpx.ConnectTimeout):
+                break
         else:
             if resp.status_code == 200:
                 return resp.json()
-            last_error = LLMError(f"LLM HTTP {resp.status_code}: {resp.text[:500]}")
-            if resp.status_code not in _RETRY_STATUSES:
+            last_error = LLMError(f"LLM HTTP {resp.status_code}")
+            if resp.status_code not in _RETRY_STATUSES or attempt > 0:
                 break
-        if attempt == 0:
+        finally:
+            log.info(
+                "provider_attempt session=%s step=%s call=%s attempt=%d outcome=%s phase=%s elapsed_ms=%d marks_ms=%s",
+                session_id,
+                step,
+                call_id,
+                attempt + 1,
+                outcome,
+                timing.phase,
+                timing.elapsed(),
+                json.dumps(timing.marks),
+            )
+        if attempt + 1 < attempts:
             await asyncio.sleep(1.0)
     raise LLMError(str(last_error)) from last_error
 
@@ -198,14 +262,14 @@ async def llm_call(
         payload["max_tokens"] = max_tokens
 
     started = time.perf_counter()
-    data = _mock_completion(messages, model) if s.mock_llm else await _post_chat(payload, session_id)
+    data = _mock_completion(messages, model) if s.mock_llm else await _post_chat(payload, session_id, step=step)
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     try:
         choice = data["choices"][0]
         message = choice["message"]
     except (KeyError, IndexError, TypeError) as e:
-        raise LLMError(f"Unexpected LLM response: {str(data)[:500]}") from e
+        raise LLMError("Unexpected LLM response structure") from e
     usage = data.get("usage") or {}
     tokens_in = int(usage.get("prompt_tokens") or 0)
     tokens_out = int(usage.get("completion_tokens") or 0)
