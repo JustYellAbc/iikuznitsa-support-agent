@@ -964,3 +964,74 @@ def test_pilot_latency_starts_at_submit_and_ends_at_publication(publish):
         assert res.first_meaningful_latency_ms >= 90
     else:
         assert res.first_meaningful_latency_ms is None and res.timed_out
+
+
+@pytest.mark.parametrize("source_in_text", [True, False])
+@pytest.mark.parametrize(
+    "name,valid", [("SunRav BookOffice", True), ("Adobe Photoshop", False), ("Антивирус Касперского", False)]
+)
+def test_product_text_and_card_share_action(source_in_text, name, valid):
+    card = _product("61557")
+    text = f"{name} стоит 4900 ₽. Сведений о сроке действия в каталоге нет. Ссылку можно отправить на e-mail."
+
+    def reply(_turn, body):
+        return [
+            (0, _input(body["text"])),
+            (0, {"type": "products", "products": [card]}),
+            (0, _agent(text, url=card["source"]["url"] if source_in_text else None)[0]["data"]),
+        ]
+
+    result = run_eval.run_case(
+        Timed(reply), CASES["open-price-61557"], CATALOG, timeout=0.5, poll_interval=0.005, settle_seconds=0.015
+    )
+    assert result.passed is valid, result.errors
+    assert result.closed_by_agent is valid
+
+
+def test_multi_product_comparison_scopes_sources_to_products_on_each_line():
+    cards = [_product(oid) for oid in ("19645", "3850", "532803")]
+    text = (
+        "MDaemon Security Gateway и защита файлов — 41 227 ₽.\n"
+        "Kaspersky Security и защита файлов — 90 047 ₽.\n"
+        "Для файлов в обоих вариантах Dr.Web Server Security Suite."
+    )
+    answer = _agent(text)[0]
+    answer["data"]["sources"] = [p["source"] for p in cards]
+    events = [_ev(1, {"type": "products", "products": cards}), answer]
+    rules = CASES["open-branch-b-mail-files-50"]["turns"][1]["assertions"]
+    answer["data"]["text"] += "\nВ вашем контуре почта на Postfix в Linux, а для шлюза выделен Windows-сервер."
+    assert not run_eval.validate_case_expectations(events, rules, CATALOG)
+    answer["data"]["text"] = text.replace("MDaemon Security Gateway", "Артикул 19645 Kaspersky Security")
+    assert any("another product" in err for err in run_eval.validate_case_expectations(events, rules, CATALOG))
+
+    answer["data"]["text"] = text + "\nMDaemon Security Gateway (артикул 3850), Kaspersky Security (артикул 19645)"
+    assert any(
+        "another product" in err or "wrong product" in err
+        for err in run_eval.validate_case_expectations(events, rules, CATALOG)
+    )
+
+
+def test_other_action_card_does_not_validate_an_unnamed_answer():
+    card = _ev(1, {"type": "products", "products": [_product("61557")]}, "previous")
+    msg = _agent("Артикул 61557 стоит 4900 ₽. Срок неизвестен.")[0]
+    assert any(
+        "without its product name" in e for e in run_eval.validate_product_names([card, msg], ["61557"], CATALOG)
+    )
+
+
+def test_report_uses_one_first_reply_sample_per_dialog():
+    def reply(turn, body):
+        return [(0, _input(body["text"])), (0.06 if turn == 1 else 0.005, _agent("Полезный ответ.")[0]["data"])]
+
+    case = {"id": "three-turns", "suite": "open", "turns": [{"action": {"type": "message", "text": "Вопрос"}}] * 3}
+    result = run_eval.run_case(Timed(reply), case, CATALOG, timeout=0.4, poll_interval=0.002, settle_seconds=0.01)
+    assert result.passed, result.errors
+    no_reply = run_eval.CaseResult("empty", "open", "test", False, False, False)
+    summary = run_eval.summarize_results([result, no_reply], suite="open", mode="mvp")
+    first = summary["cases"][0]["first_meaningful_latency_ms"]
+    assert first == result.latency_ms[0]
+    assert summary["cases"][1]["first_meaningful_latency_ms"] is None
+    assert summary["first_meaningful_latency_ms"]["samples"] == 1
+    assert summary["first_meaningful_latency_ms"]["mean"] == first
+    assert summary["latency_ms"]["samples"] == 3
+    assert "1/2 conversations" in run_eval.format_markdown_report(summary)

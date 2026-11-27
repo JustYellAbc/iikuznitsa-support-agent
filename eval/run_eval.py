@@ -750,10 +750,20 @@ _GENERIC_NAME_TOKENS = frozenset(
         "на",
     }
 )
-# Latin words that may sit next to an article in a correct answer without naming another product.
-_NEUTRAL_LATIN_WORDS = frozenset(
-    {"softline", "rub", "rur", "pdf", "url", "https", "http", "www", "store", "sku", "offerid", "vat", "nds"}
+# Inspect an unfamiliar Latin name when the sentence actually attributes a sale or a price to it.
+# Platform names and contact details in unrelated prose are common in B2B support.
+_PRICED_NAME_RE = re.compile(
+    r"(?P<name>[A-Za-z][A-Za-z0-9.-]*(?:[ \t]+[A-Za-z][A-Za-z0-9.-]*)*)"
+    r"[ \t,:(—–-]*(?:(?:артикул|sku)\s*[:№#-]?\s*\d|стоит\b|по цене\b|"
+    r"(?:от\s+)?\d[\d .,]*\s*(?:₽|руб))",
+    re.I,
 )
+_RECOMMENDED_NAME_RE = re.compile(
+    r"(?:рекомендую|предлагаю|выбранный товар|название товара)\s*[:—-]?\s*"
+    r"(?P<name>[A-Za-z][A-Za-z0-9.-]*(?:[ \t]+[A-Za-z][A-Za-z0-9.-]*)*)",
+    re.I,
+)
+_NEUTRAL_LATIN_WORDS = frozenset({"softline", "rub", "rur", "pdf", "url", "sku", "offerid", "vat", "nds"})
 
 
 def _norm_name(text: str) -> str:
@@ -808,54 +818,65 @@ def validate_product_names(
     catalog = catalog_index or {}
     named = {oid: offer for oid, offer in catalog.items() if offer.name}
 
-    carded: set[str] = set()
-    items = [("Product", p) for p in _products_from_events(events)]
-    items += [("Quote line", line) for q in _quotes_from_events(events) for line in q.get("lines", [])]
-    for kind, item in items:
-        oid = str(item.get("offerId", ""))
-        offer = named.get(oid)
-        if offer is None:
-            continue
-        name = str(item.get("name", ""))
-        if not _names_product(name, offer_name_variants(offer)):
-            errors.append(f"{kind} {oid} name {name!r} does not match catalog product {offer.name!r}")
-        else:
-            carded.add(oid)
+    cards_by_action: dict[str, set[str]] = {}
+    expected = {str(oid): named[str(oid)] for oid in expected_offer_ids or [] if str(oid) in named}
+    for event in events:
+        items = [("Product", p) for p in _products_from_events([event])]
+        items += [("Quote line", line) for q in _quotes_from_events([event]) for line in q.get("lines", [])]
+        for kind, item in items:
+            oid = str(item.get("offerId", ""))
+            offer = named.get(oid)
+            if offer is None:
+                continue
+            name = str(item.get("name", ""))
+            if _names_product(name, offer_name_variants(offer)):
+                cards_by_action.setdefault(str(event.get("actionId")), set()).add(oid)
+            else:
+                errors.append(f"{kind} {oid} name {name!r} does not match catalog product {offer.name!r}")
 
-    for oid in [str(o) for o in (expected_offer_ids or [])]:
-        offer = named.get(oid)
-        if offer is None:
+    if not expected:
+        return errors
+    variants = {oid: offer_name_variants(offer) for oid, offer in expected.items()}
+    tokens = {oid: _offer_name_tokens(offer) for oid, offer in expected.items()}
+    # Curated aliases include Russian spellings and inflections of the reference products.
+    catalog_aliases = {_norm_name(a) for offer in named.values() for a in offer.aliases}
+    patterns = {oid: re.compile(rf"(?<!\d){re.escape(oid)}(?!\d)") for oid in expected}
+    for event in events:
+        msg = event.get("data", {})
+        if msg.get("type") != "message" or msg.get("author") != "agent" or msg.get("purpose") != "answer":
             continue
-        variants = offer_name_variants(offer)
-        allowed_tokens = _offer_name_tokens(offer) | _NEUTRAL_LATIN_WORDS
-        oid_re = re.compile(rf"(?<!\d){re.escape(oid)}(?!\d)")
-        for msg in _agent_messages(events):
-            if msg.get("purpose") == "greeting":
+        raw_text = str(msg.get("text", ""))
+        sources = {s.get("url") for s in msg.get("sources", []) if isinstance(s, dict)}
+        cards = cards_by_action.get(str(event.get("actionId")), set())
+        sourced = {oid for oid, offer in expected.items() if offer.url in sources}
+        cited = {oid for oid, pattern in patterns.items() if pattern.search(raw_text)}
+        linked = sourced | cited
+        context = linked or (cards & expected.keys())
+        if not context:
+            continue
+        for line in re.split(r"\n+|;\s*|(?<=[.!?])\s+|(?<=\))(?:,\s*|\s+и\s+)|,\s+(?=[A-ZА-ЯЁ])", raw_text):
+            clean_line = _URL_RE.sub(" ", line)
+            explicit = {oid for oid in context if patterns[oid].search(line)}
+            candidates = explicit or context
+            # With several product-ID pairs on one line, bind each parenthesized article to its own label.
+            # A shared list of message sources describes the comparison as a whole.
+            if any(_names_product(clean_line, variants[oid]) for oid in candidates):
                 continue
-            raw_text = str(msg.get("text", ""))
-            source_urls = " ".join(str(s.get("url", "")) for s in msg.get("sources", []) if isinstance(s, dict))
-            # Match the same SKU identification rule as _offer_id_surfaced, including URLs in text or sources.
-            cites_in_raw = bool(oid_re.search(raw_text))
-            cites_in_sources = bool(oid_re.search(source_urls))
-            if not (cites_in_raw or cites_in_sources):
-                continue
-            text = _URL_RE.sub(" ", raw_text)
-            foreign_found = False
-            for raw_line in raw_text.splitlines():
-                clean_line = _URL_RE.sub(" ", raw_line)
-                if (cites_in_raw and not oid_re.search(raw_line)) or _names_product(clean_line, variants):
-                    continue
-                foreign = [w for w in _LATIN_WORD_RE.findall(clean_line) if _norm_name(w) not in allowed_tokens]
-                if foreign:
-                    foreign_found = True
-                    errors.append(
-                        f"Agent text cites offerId {oid} with another product name {' '.join(foreign)!r}, "
-                        f"catalog product is {offer.name!r}"
-                    )
-            if not foreign_found and oid not in carded and not _names_product(text, variants):
+            allowed = _NEUTRAL_LATIN_WORDS.union(*(tokens[oid] for oid in candidates))
+            foreign = []
+            for syntax in (_PRICED_NAME_RE, _RECOMMENDED_NAME_RE):
+                for match in syntax.finditer(clean_line):
+                    foreign.extend(w for w in _LATIN_WORD_RE.findall(match["name"]) if _norm_name(w) not in allowed)
+            foreign.extend(alias for alias in sorted(catalog_aliases) if _names_product(clean_line, [alias]))
+            if foreign:
                 errors.append(
-                    f"Agent text cites offerId {oid} without its product name (catalog: {offer.name!r}) "
-                    "and no product card confirms it"
+                    f"Agent text cites offerId {', '.join(sorted(candidates))} "
+                    f"with another product name {' '.join(foreign)!r}"
+                )
+        for oid in sorted(linked - cards):
+            if not _names_product(_URL_RE.sub(" ", raw_text), variants[oid]):
+                errors.append(
+                    f"Agent text cites offerId {oid} without its product name and no product card confirms it"
                 )
     return errors
 
@@ -1002,7 +1023,12 @@ def validate_case_expectations(
 
     if assertions.get("require_unknown_term") and not any(
         re.search(r"срок|длительность|период действия", sentence, re.I)
-        and re.search(r"не указан|не определ|неизвест|нет данных|уточн|не подтверж|не удалось", sentence, re.I)
+        and re.search(
+            r"не указан|не определ|неизвест|нет (?:данных|сведений|информации)|уточн|не подтверж|не удалось"
+            r"|(?:сведений|данных|информации)\b[^.!?]*\bнет\b",
+            sentence,
+            re.I,
+        )
         for sentence in SENTENCE_SPLIT_RE.split(agent_text)
     ):
         errors.append("Expected an explicit answer that the license term needs confirmation")
@@ -1705,8 +1731,6 @@ def run_case(
                 turn_info["latency_ms"] = round(first_meaningful_ms, 2)
                 turn_info["post_ack_latency_ms"] = round(post_ack_ms or 0.0, 2)
                 result.latency_ms.append(first_meaningful_ms)
-                if result.first_meaningful_latency_ms is None:
-                    result.first_meaningful_latency_ms = first_meaningful_ms
 
         # Read the journal to its end (and until quiet) before any scenario check.
         cursor, last_event_at = _drain_until_quiet(
@@ -1751,13 +1775,9 @@ def run_case(
                     t_info["latency_ms"] = None
                     t_info.pop("post_ack_latency_ms", None)
         result.latency_ms = [float(t["latency_ms"]) for t in result.turns if t.get("latency_ms") is not None]
-        result.first_meaningful_latency_ms = next(
-            (
-                float(t["latency_ms"])
-                for t in result.turns
-                if t.get("latency_ms") is not None and t.get("close") != "timeout"
-            ),
-            None,
+        first_turn = result.turns[0] if result.turns else {}
+        result.first_meaningful_latency_ms = (
+            first_turn.get("latency_ms") if first_turn.get("close") != "timeout" else None
         )
 
         turn_action_ids: dict[int, str] = {}
@@ -1820,6 +1840,17 @@ def percentile(values: list[float], pct: float) -> float | None:
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (rank - lo)
 
 
+def _latency_summary(samples: list[float]) -> dict:
+    if not samples:
+        return {"samples": 0, "mean": None, "p50": None, "p95": None}
+    return {
+        "samples": len(samples),
+        "mean": round(sum(samples) / len(samples), 2),
+        "p50": round(percentile(samples, 50), 2),
+        "p95": round(percentile(samples, 95), 2),
+    }
+
+
 def load_category_weights(split_summary_path: Path = DEFAULT_SPLIT_SUMMARY) -> dict[str, float]:
     """Load real-world category weights from eval/split_summary.json."""
     if not split_summary_path.is_file():
@@ -1850,9 +1881,7 @@ def summarize_results(
     timed_out = sum(1 for r in results if r.timed_out)
 
     all_latencies = [ms for r in results for ms in r.latency_ms]
-    p50 = percentile(all_latencies, 50.0)
-    p95 = percentile(all_latencies, 95.0)
-    mean_lat = (sum(all_latencies) / len(all_latencies)) if all_latencies else None
+    first_replies = [r.first_meaningful_latency_ms for r in results if r.first_meaningful_latency_ms is not None]
 
     exact = [r for r in results if r.cost_status == "exact" and r.cost_rub is not None]
     if not exact:
@@ -1894,12 +1923,8 @@ def summarize_results(
         "closed_by_agent_rate": round(closed_by_agent / total, 4) if total else 0.0,
         "escalated_count": escalated,
         "escalated_rate": round(escalated / total, 4) if total else 0.0,
-        "latency_ms": {
-            "samples": len(all_latencies),
-            "mean": round(mean_lat, 2) if mean_lat is not None else None,
-            "p50": round(p50, 2) if p50 is not None else None,
-            "p95": round(p95, 2) if p95 is not None else None,
-        },
+        "latency_ms": _latency_summary(all_latencies),
+        "first_meaningful_latency_ms": _latency_summary(first_replies),
         "economics": {
             "cost_status": cost_status,
             "cases_with_exact_cost": len(exact),
@@ -1923,6 +1948,7 @@ def summarize_results(
                 "escalated": r.escalated,
                 "closed_by_agent": bool(r.passed and r.closed_by_agent and not r.escalated),
                 "timed_out": r.timed_out,
+                "first_meaningful_latency_ms": r.first_meaningful_latency_ms,
                 "latency_ms": [round(x, 2) for x in r.latency_ms],
                 "cost_rub": r.cost_rub,
                 "cost_status": r.cost_status,
@@ -1953,6 +1979,7 @@ def format_markdown_report(
     metrics (without per-case response texts); full holdout details and alias mappings stay in the
     private report files inside the holdout directory.
     """
+    first = summary.get("first_meaningful_latency_ms")
     lat = summary["latency_ms"]
     econ = summary["economics"]
     if econ["cost_status"] == "unavailable":
@@ -1972,12 +1999,17 @@ def format_markdown_report(
         "|---|---|",
         f"| Total cases | {summary['total_cases']} |",
         f"| Passed / Failed | {summary['passed_cases']} / {summary['failed_cases']} ({summary['pass_rate']:.1%}) |",
-        f"| Closed by agent | {summary['closed_by_agent_count']} ({summary['closed_by_agent_rate']:.1%}) |",
+        f"| Autonomous closures | {summary['closed_by_agent_count']} ({summary['closed_by_agent_rate']:.1%}) |",
         f"| Escalated | {summary['escalated_count']} ({summary['escalated_rate']:.1%}) |",
         f"| Timed out | {summary.get('timed_out_cases', 0)} |",
-        f"| Latency p50 / p95 (ms) | {lat['p50']} / {lat['p95']} (samples={lat['samples']}) |",
+        f"| Per-turn latency p50 / p95 (ms) | {lat['p50']} / {lat['p95']} (samples={lat['samples']}) |",
         f"| Avg cost / 500 cases per half-year proj (RUB) | {cost_line} |",
     ]
+    if first is not None:
+        lines.append(
+            f"| First meaningful reply to the initial request, mean (ms) | {first['mean']} "
+            f"({first['samples']}/{summary['total_cases']} conversations) |"
+        )
     if hide_holdout_details and summary.get("suite") == "holdout":
         lines.extend(
             [
