@@ -203,6 +203,31 @@ async def test_no_second_inference_after_read_timeout(db, caplog):
     assert "outcome=ReadTimeout" in caplog.text
 
 
+async def test_go_reconnects_before_request_submission_and_counts_one_completion(db, monkeypatch, caplog):
+    settings = get_settings()
+    settings.llm_base_url = "https://opencode.ai/inference/go/openai/v1/"
+    assert llm._get_client().timeout.connect == min(2.5, settings.llm_timeout_s)
+    await llm.close_http_client()
+    attempts = 0
+
+    def sometimes_reachable(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.ConnectTimeout("unreachable")
+        return ok_response()
+
+    provider(sometimes_reachable)
+    caplog.set_level(logging.INFO, logger=llm.__name__)
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda _: _noop())
+    await llm_call([], step="support_tools")
+    assert attempts == 3
+    assert len(await repository.recent_llm_calls()) == 1
+    records = [rec.getMessage() for rec in caplog.records if rec.name == llm.__name__]
+    assert len({rec.split(" call=")[1].split()[0] for rec in records}) == 1
+    assert "attempt=3 outcome=http_200" in records[-1]
+
+
 async def test_mock_mode_logs_without_network(db):
     llm.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(lambda r: pytest.fail("network"))))
     resp = await llm_call([{"role": "user", "content": "Сколько стоит MDaemon?"}], step="agent_stub")

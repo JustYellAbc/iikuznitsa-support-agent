@@ -24,6 +24,7 @@ from app.db import repository
 Profile = Literal["smart", "fast"]
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
+_OPENCODE_GO = "https://opencode.ai/inference/go/openai/v1"
 log = logging.getLogger(__name__)
 _PHASES = {
     "connect_tcp",
@@ -119,7 +120,14 @@ def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
         s = get_settings()
-        _client = httpx.AsyncClient(proxy=s.llm_proxy_url or None, timeout=s.llm_timeout_s)
+        options = {}
+        if s.llm_base_url.rstrip("/") == _OPENCODE_GO:
+            # The stand intermittently stalls opening TCP to Go. Reconnect before sending the request.
+            options["limits"] = httpx.Limits(keepalive_expiry=60)
+            options["timeout"] = httpx.Timeout(s.llm_timeout_s, connect=min(2.5, s.llm_timeout_s))
+        else:
+            options["timeout"] = s.llm_timeout_s
+        _client = httpx.AsyncClient(proxy=s.llm_proxy_url or None, **options)
     return _client
 
 
@@ -160,13 +168,15 @@ async def _post_chat(payload: dict[str, Any], session_id: str | None = None, *, 
     s = get_settings()
     url = s.llm_base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {s.llm_api_key}"} if s.llm_api_key else {}
-    if s.llm_base_url.rstrip("/") == "https://opencode.ai/inference/go/openai/v1":
+    go = s.llm_base_url.rstrip("/") == _OPENCODE_GO
+    if go:
         headers["User-Agent"] = "SoftlineSupportLab/0.1"
         if session_id:
             headers["x-opencode-session"] = session_id
     last_error: Exception | None = None
     call_id = uuid4().hex[:12]
-    for attempt in range(2):
+    attempts = 3 if go else 2
+    for attempt in range(attempts):
         timing = _AttemptTiming()
         outcome = "error"
         try:
@@ -185,7 +195,7 @@ async def _post_chat(payload: dict[str, Any], session_id: str | None = None, *, 
             if resp.status_code == 200:
                 return resp.json()
             last_error = LLMError(f"LLM HTTP {resp.status_code}")
-            if resp.status_code not in _RETRY_STATUSES:
+            if resp.status_code not in _RETRY_STATUSES or attempt > 0:
                 break
         finally:
             log.info(
@@ -199,7 +209,7 @@ async def _post_chat(payload: dict[str, Any], session_id: str | None = None, *, 
                 timing.elapsed(),
                 json.dumps(timing.marks),
             )
-        if attempt == 0:
+        if attempt + 1 < attempts:
             await asyncio.sleep(1.0)
     raise LLMError(str(last_error)) from last_error
 
