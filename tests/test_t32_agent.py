@@ -365,7 +365,12 @@ def test_named_selection_resumes_after_customer_supplies_fields(api, provider, o
     cid = api.new_conversation()
     assert say(api, cid, opening)[-1]["purpose"] == "clarification"
     events = say(api, cid, reply)
-    assert {p["offerId"] for e in events for p in e.get("products", [])} == codes
+    if len(codes) == 1:
+        assert {p["offerId"] for e in events for p in e.get("products", [])} == codes
+    else:
+        assert all(code in events[-1]["text"] for code in codes)
+        assert {s["url"].rsplit("/", 1)[-1] for s in events[-1]["sources"]} == codes
+        assert not api.call("customer", "GET", f"/api/v1/conversations/{cid}/quotes/current").json()["selection"]
     assert len(requests) == 1
 
 

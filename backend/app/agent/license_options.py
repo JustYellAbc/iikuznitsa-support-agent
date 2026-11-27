@@ -10,6 +10,7 @@ from app.core.errors import ApiError
 from app.core.llm import LLMError
 
 CAPACITY_LIST = re.compile(r"\b(\d+(?:\s*(?:,|и|или)\s*\d+)+)\s+(?:мест|пользовател)", re.I)
+DURATION = re.compile(r"\b\d+\s*(?:мес(?:яц\w*)?|год\w*|лет)\b", re.I)
 # Only resume automatically when the entire reply supplies purchase fields.
 # Mixed requests (new product, exclusions, documents, etc.) go through the model.
 FIELD_REPLY = re.compile(
@@ -29,6 +30,8 @@ def followup_capacities(text):
     if Selection("").qualifiers(text, followup=True) == Selection(""):
         return None
     if re.search(r"\bили\b", CAPACITY_LIST.sub("", text), re.I):
+        return None
+    if len(DURATION.findall(text)) > 1:
         return None
     counts = [int(n) for group in CAPACITY_LIST.finditer(text) for n in re.findall(r"\d+", group[1])]
     counts.extend(int(n) for n in SEATS.findall(text))
@@ -126,6 +129,14 @@ def license_selection(name, seats, turns):
     for turn in scope:
         selection = selection.qualifiers(turn, followup=True)
         technical_text = name_pattern(name).sub("", turn)
+        if len(DURATION.findall(technical_text)) > 1 or re.search(
+            r"\b\d+(?:\s*(?:,|и|или)\s*\d+)+\s*(?:месяц|год|лет)", technical_text, re.I
+        ):
+            raise SelectionInputError(
+                "terms",
+                "Запрошено несколько сроков. Уточни срок каждой позиции.",
+                "На какой срок проверить лицензию сначала?",
+            )
         platform = re.compile(r"\b(?:linux|windows(?:\s+(?:server\s+)?\d+(?:\s+r2)?)?|macos|android|ios)\b", re.I)
         delivery = re.compile(r"\b(?:электронн|коробочн)\w*\s+(?:поставк|доставк)\w*|\bкоробк\w*", re.I)
         systems = attribute_values(platform, technical_text, "Какая операционная система вам подходит?")

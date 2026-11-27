@@ -2,6 +2,7 @@ import pytest
 
 from app.agent.license_options import (
     alternate_proposals,
+    followup_capacities,
     license_selection,
     quote_preview,
     resolve_options,
@@ -70,6 +71,14 @@ def test_alternative_quantities_do_not_become_a_basket():
     variants = [LicenseVariant(name="Atlas", seats=n) for n in (5, 20)]
     assert alternate_proposals(["Нужен расчёт Atlas на 5 и 20 пользователей."], variants)
     assert alternate_proposals(["Два отдельных КП на Atlas и Orion.", "Для юрлица."])
+
+
+@pytest.mark.parametrize("terms", ["на 12 и 24 месяца", "на 12 месяцев и на 24 месяца"])
+def test_duration_comparison_cannot_silently_select_first_term(terms):
+    reply = f"Первая покупка. Покажите варианты {terms}."
+    assert followup_capacities(reply) is None
+    with pytest.raises(ValueError, match="несколько сроков"):
+        license_selection("Atlas Desk", None, ["Нужен Atlas Desk для компании", reply])
 
 
 @pytest.mark.parametrize("negative", ["только не Windows", "только не коробочная поставка", "Linux не подходит"])

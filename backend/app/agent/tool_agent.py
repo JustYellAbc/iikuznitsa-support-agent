@@ -658,10 +658,19 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                 sources,
                 HandoffRequest(reason=policy.reason, question=policy.question, products=products),
             )
-        if purpose == "answer" and re.search(r"\bкп\b|коммерческ\w*\s+предложен", " ".join(buyer_turns), re.I):
-            if alternate_proposals(buyer_turns, args.variants) and len(hits) > 1:
-                question = "Для каждого варианта оформим отдельное КП. С какого начать?"
-                return body + "\n" + question, "clarification", [], sources, None
+        wants_quote = re.search(r"\bкп\b|коммерческ\w*\s+предложен", " ".join(buyer_turns), re.I)
+        if len(hits) > 1 and alternate_proposals(buyer_turns if wants_quote else [text], args.variants):
+            lines = [
+                hit.text + (" Артикул: " + hit.products[0].offerId + "." if len(hit.products) == 1 else "")
+                for hit in hits
+            ]
+            question = (
+                "Для каждого варианта оформим отдельное КП. С какого начать?"
+                if wants_quote
+                else "Какой вариант вы выбираете?"
+            )
+            return "\n".join([*lines, question]), "clarification", [], sources, None
+        if purpose == "answer" and wants_quote:
             preview = await asyncio.to_thread(quote_preview, settings, hits, buyer_turns, args.variants)
             if preview:
                 body = preview
