@@ -105,8 +105,57 @@ def test_mandatory_price_route_uses_verified_sku_once(api, provider):
     events = say(api, api.new_conversation(), "Сколько стоит артикул ask?")
     assert len(requests) == 1 and not responses
     assert "Цена по запросу" in events[-2]["text"]
+    assert "подтвердить менеджер" in events[-2]["text"]
     h = events[-1]["handoff"]
     assert h["reason"] == "price_request" and [p["offerId"] for p in h["products"]] == ["ask"]
+
+
+@pytest.mark.usefixtures("index")
+def test_ambiguous_turns_offer_help_then_recover_without_a_ticket(api, provider):
+    from app.agent.handoff import ASK_PRODUCT, OFFER_HELP
+
+    responses, _ = provider
+    responses.extend(
+        [
+            tool("respond", kind="handoff", reason="insufficient_evidence"),
+            tool("respond", kind="handoff", reason="technical"),
+            tool("get_offer", offer_id="new20"),
+            tool("respond", kind="product", refs=["r1"], field="price"),
+        ]
+    )
+    cid = api.new_conversation()
+    first = say(api, cid, "Как с этим быть?")
+    assert first[-1]["text"] == ASK_PRODUCT and first[-1]["purpose"] == "clarification"
+    second = say(api, cid, "А с другим вариантом как быть?")
+    assert second[-1]["text"] == OFFER_HELP and second[-1]["purpose"] == "clarification"
+    resolved = say(api, cid, "Вот артикул new20. Сколько стоит?")
+    assert resolved[-1]["purpose"] == "answer" and "1 234,56" in resolved[-1]["text"]
+    assert all(e["data"]["type"] != "handoff" for e in api.events(cid))
+
+
+def test_confirmed_help_after_two_misses_opens_one_case(api, provider):
+    responses, _ = provider
+    responses.extend([tool("respond", kind="handoff")] * 2)
+    cid = api.new_conversation()
+    say(api, cid, "Что с этим делать?")
+    say(api, cid, "Пока не понимаю.")
+    result = say(api, cid, "Да, пожалуйста")
+    assert [e["handoff"]["reason"] for e in result if e["type"] == "handoff"] == ["insufficient_evidence"]
+
+
+@pytest.mark.usefixtures("index")
+def test_stalled_clarification_cannot_trigger_an_unrelated_knowledge_search(api, provider):
+    from app.agent.handoff import OFFER_HELP
+
+    responses, requests = provider
+    responses.append(tool("respond", kind="clarify", question="О какой операции идёт речь?"))
+    cid = api.new_conversation()
+    say(api, cid, "А это как там сделать?")
+    unresolved = say(api, cid, "Не понял, всё ещё не получается. Что делать?")
+    assert unresolved[-1]["text"] == OFFER_HELP and len(requests) == 1
+    responses.extend([tool("get_offer", offer_id="new20"), tool("respond", kind="product", refs=["r1"], field="price")])
+    answered = say(api, cid, "Всё ещё не понимаю, сколько стоит артикул new20?")
+    assert "1 234,56" in answered[-1]["text"] and answered[-1]["purpose"] == "answer"
 
 
 def test_repeated_unregistered_tool_stops_without_showing_invented_price(api, provider):

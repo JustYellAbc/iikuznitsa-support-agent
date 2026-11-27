@@ -29,13 +29,13 @@ from dataclasses import asdict, replace
 import app.agent.needs as needs
 from app.agent.catalog_selection import Selection, named_request, select, selection_for
 from app.agent.handoff import (
-    CONFIRMED,
     HUMAN_REQUEST,
     OFFER_HELP,
     OPERATOR_QUESTION,
     ActionType,
     SearchFinding,
     bare_request,
+    handoff_notice,
     handoff_reason,
     route_action,
 )
@@ -260,13 +260,13 @@ async def run_turn(
         published_products = products if selected or products != original_products else []
         reply_text = hit.text if hit else ""
         if route:
-            reply_text = route.clarification or CONFIRMED
+            reply_text = route.clarification or handoff_notice(route.reason)
             if escalate and hit and topics:
                 if route.reason == "availability":
                     detail = hit.text.removesuffix("\n\n" + OPERATOR_QUESTION)
-                    reply_text = f"{detail} {CONFIRMED}"
+                    reply_text = f"{detail} {handoff_notice(route.reason)}"
                 elif route.reason == "price_request":
-                    reply_text = f"Цена по запросу. {CONFIRMED}"
+                    reply_text = f"Цена по запросу. {handoff_notice(route.reason)}"
         return AgentReply(
             turn=AgentTurn(
                 turn_id=new_id("turn"),
