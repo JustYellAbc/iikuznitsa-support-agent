@@ -1,5 +1,5 @@
 [tool.pytest.ini_options]
-testpaths = ["tests", "backend/app/agent"]
+testpaths = ["tests", "backend/app/agent", "catalog"]
 pythonpath = ["backend"]
 
 [tool.ruff]
