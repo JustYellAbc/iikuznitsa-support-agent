@@ -50,6 +50,48 @@ def test_repeated_search_without_new_offers_stops_and_clarifies(api, provider):
     assert any(step.tool == "catalog_repeated_results" for step in trace)
 
 
+@pytest.mark.usefixtures("index")
+def test_refining_search_can_use_same_card_without_an_extra_model_round(api, provider):
+    answers, requests = provider
+    queries = ["PaperDesk", "PaperDesk Pro", "PaperDesk для покупки", "PaperDesk Pro"]
+    answers.extend(tool("search_catalog", query=q) for q in queries)
+    answers.append(tool("respond", kind="product", refs=["r1"], field="delivery"))
+    cid = api.new_conversation()
+    result = say(api, cid, "Какая поставка у PaperDesk Pro?")
+    assert "Электронный" in result[-1]["text"] and result[-1]["sources"][0]["url"].endswith("/desk")
+    trace = api.client.portal.call(list_turns, cid)[-1].steps
+    assert sum(s.tool == "search_catalog" for s in trace) == 3
+    assert not any(s.tool == "get_offer" for s in trace)
+    assert len(requests) == len(queries) + 1
+
+
+@pytest.mark.usefixtures("index")
+@pytest.mark.parametrize("model_offers_help", [True, False])
+def test_empty_catalog_results_offer_operator_before_opening_case(api, provider, model_offers_help):
+    answers, requests = provider
+    search = tool("search_catalog", query="NotACatalogProduct")
+    answers.extend(
+        [search, tool("respond", kind="handoff", reason="outside_catalog")] if model_offers_help else [search] * 3
+    )
+    cid = api.new_conversation()
+    first = say(api, cid, "Хочу купить NotACatalogProduct")
+    assert "оператора" in first[-1]["text"] and first[-1]["purpose"] == "clarification"
+    assert not any(e["type"] == "handoff" for e in first)
+    assert len(requests) == (2 if model_offers_help else 3)
+    accepted = say(api, cid, "Да, подключайте.")
+    assert len([e for e in accepted if e["type"] == "handoff"]) == 1
+
+
+@pytest.mark.usefixtures("index")
+def test_exact_sku_with_wrong_buyer_reports_verified_restriction(api, provider):
+    answers, requests = provider
+    answers.append(tool("get_offer", offer_id="new20"))
+    events = say(api, api.new_conversation(), "Я физлицо. Хочу купить артикул new20 для себя.")
+    assert len(requests) == 1
+    assert "Юрлицо" in events[-1]["text"] and events[-1]["sources"][0]["url"].endswith("/new20")
+    assert not any(e["type"] in {"products", "handoff"} for e in events)
+
+
 @pytest.fixture
 def provider(monkeypatch):
     responses = []
@@ -294,3 +336,73 @@ def test_unrelated_yes_does_not_open_quote(last):
     from app.agent.quote_intent import offers_quote
 
     assert not offers_quote(last)
+
+
+@pytest.mark.usefixtures("index")
+def test_missing_capacity_only_retries_if_the_evidence_changes(api, provider):
+    responses, requests = provider
+    responses.extend([tool("select_licenses", variants=[{"name": "PaperDesk Pro", "seats": 40}])] * 2)
+    events = say(api, api.new_conversation(), "Хочу лицензию PaperDesk Pro.")
+    assert len(requests) == 2 and "сколько пользователей" in events[-1]["text"]
+    assert all(event["type"] not in {"handoff", "products"} for event in events)
+
+
+@pytest.mark.usefixtures("index")
+@pytest.mark.parametrize(
+    ("opening", "reply", "codes"),
+    [
+        ("MDaemon на 20 пользователей для компании", "Это новая покупка, берём впервые.", {"new20"}),
+        (
+            "MDaemon для компании",
+            "Первая покупка. Покажите для сравнения варианты на 5 и 20 пользователей.",
+            {"new5", "new20"},
+        ),
+    ],
+)
+def test_named_selection_resumes_after_customer_supplies_fields(api, provider, opening, reply, codes):
+    responses, requests = provider
+    responses.append(tool("select_licenses", variants=[{"name": "MDaemon"}]))
+    cid = api.new_conversation()
+    assert say(api, cid, opening)[-1]["purpose"] == "clarification"
+    events = say(api, cid, reply)
+    if len(codes) == 1:
+        assert {p["offerId"] for e in events for p in e.get("products", [])} == codes
+    else:
+        assert all(code in events[-1]["text"] for code in codes)
+        assert {s["url"].rsplit("/", 1)[-1] for s in events[-1]["sources"]} == codes
+        assert not api.call("customer", "GET", f"/api/v1/conversations/{cid}/quotes/current").json()["selection"]
+    assert len(requests) == 1
+
+
+@pytest.mark.usefixtures("index")
+def test_named_selection_allows_new_topic_after_clarification(api, provider):
+    responses, requests = provider
+    responses.extend(
+        [
+            tool("select_licenses", variants=[{"name": "MDaemon"}]),
+            tool("select_licenses", variants=[{"name": "PaperDesk Pro"}]),
+        ]
+    )
+    cid = api.new_conversation()
+    say(api, cid, "MDaemon для компании")
+    events = say(api, cid, "Новая покупка. Вместо этого нужен PaperDesk Pro для юрлица.")
+    assert {p["offerId"] for e in events for p in e.get("products", [])} == {"desk"}
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("request_text", ["два КП", "2 коммерческих предложения", "КП на каждый товар"])
+def test_separate_quotes_do_not_publish_a_combined_basket(api, index, provider, request_text):  # noqa: F811
+    import sqlite3
+
+    with sqlite3.connect(index) as db:
+        db.execute("UPDATE offers SET available=1 WHERE id='verify'")
+    responses, _ = provider
+    responses.append(tool("select_licenses", variants=[{"name": "PaperDesk Pro"}, {"name": "Widget Server"}]))
+    events = say(
+        api,
+        api.new_conversation(),
+        f"Пришлите {request_text} на PaperDesk Pro и Widget Server. Для юрлица, покупаем впервые.",
+    )
+    reply = events[-1]
+    assert reply["purpose"] == "clarification" and "отдельное КП" in reply["text"]
+    assert "910 ₽" not in reply["text"] and all(e["type"] not in {"products", "quote"} for e in events)

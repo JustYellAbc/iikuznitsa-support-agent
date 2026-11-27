@@ -64,6 +64,8 @@ class Selection:
     organization: str = ""
     edition: str = ""
     group_id: str | None = None
+    platforms: tuple[str, ...] = ()
+    delivery: str = ""
 
     def qualifiers(self, text: str, *, followup: bool) -> "Selection":
         updated = replace(self)
@@ -238,6 +240,7 @@ class Result:
     suggestion: str = ""
     followup: Selection | None = None
     handoff_reason: HandoffReason | None = None
+    awaiting_fields: bool = False
 
 
 def result(text: str, purpose: str = "clarification", products=(), *, sources=()) -> Result:
@@ -368,6 +371,22 @@ def select(index: Path, selection: Selection) -> Result:
         rows = [r for r in rows if selection.kind in r["params"].get(KIND, [])]
     if selection.organization:
         rows = [r for r in rows if selection.organization in r["params"].get("Тип организации", [])]
+    if selection.platforms:
+        rows = [
+            r
+            for r in rows
+            if all(
+                any(
+                    re.search(r"(?<!\w)" + re.escape(platform) + r"(?!\w)", v, re.I)
+                    for v in r["params"].get("Платформа", [])
+                )
+                for platform in selection.platforms
+            )
+        ]
+    if selection.delivery:
+        rows = [
+            r for r in rows if any(selection.delivery in v.casefold() for v in r["params"].get("Способ доставки", []))
+        ]
     if selection.edition:
         rows = [
             r
@@ -442,7 +461,9 @@ def select(index: Path, selection: Selection) -> Result:
         elif expired and len(expired) < len(rows):
             questions.append("Подписка ещё действует или уже истекла?")
     if questions:
-        return result(prefix + " ".join(questions), sources=[source])
+        pending = result(prefix + " ".join(questions), sources=[source])
+        pending.awaiting_fields = True
+        return pending
     products = [offer_product(r) for r in rows[:3]]
     if len(rows) != 1:
         options = "; ".join(f"{p.name} (ID {p.offerId})" for p in products)

@@ -45,7 +45,7 @@ def named_product(text):
     return any(word.strip(".-").casefold() not in platforms for match in LATIN.findall(text) for word in match.split())
 
 
-async def run_turn(session, history, text, emit_step, *, action_type, finding):
+async def run_turn(session, history, text, emit_step, *, action_type, finding, allow_open_intake=True):
     if action_type != "message" or finding or bare_request(text.casefold()) or named_product(text):
         return None
     start = perf_counter()
@@ -62,7 +62,7 @@ async def run_turn(session, history, text, emit_step, *, action_type, finding):
                 prior = step.args
             if step.tool not in {"product_facts", "published_knowledge"}:
                 break
-    if not prior and not (initial_need(text) or open_intake(text)):
+    if not prior and not (initial_need(text) or (allow_open_intake and open_intake(text))):
         return None
     previous = Brief(**prior["brief"]) if prior else Brief(goal="mail" if initial_need(text) else "discovery")
     body = HUMAN_REQUEST.sub("", text)

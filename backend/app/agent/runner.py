@@ -132,6 +132,18 @@ async def run_turn(
         if get_settings().agent_engine == "tools":
             from app.agent.tool_agent import run_tool_turn
 
+            if not retry:
+                structured = await needs.run_turn(
+                    session,
+                    history,
+                    user_text,
+                    emit_step,
+                    action_type=action_type,
+                    finding=finding,
+                    allow_open_intake=False,
+                )
+                if structured:
+                    return structured
             return await run_tool_turn(
                 session,
                 history,

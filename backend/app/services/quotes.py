@@ -16,7 +16,7 @@ from app.agent.quote_calculation import (
     calculate,
     catalog_lines,
 )
-from app.agent.quote_intent import REQUEST, offers_quote
+from app.agent.quote_intent import REQUEST, basket_resize, offers_quote
 from app.agent.quote_pdf import render
 from app.config import get_settings
 from app.contracts.t04 import (
@@ -388,6 +388,7 @@ async def from_message(cid: str, text: str):
             result, written = await clarification(conn, cid, text, reply, open_form=bool(selected))
         events.publish(cid, written)
         return result
+    confirmation = re.fullmatch(r"версия (\d{1,9}): на ([1-9]\d{0,4}) пользователей[.!]?", clean)
     seats = re.fullmatch(
         rf"(?:(?:{CHANGE_QUOTE})\s+|теперь\s+|вместо \d+ (?:нужно |на )?)?(?:нужно |нужны |на )?([1-9]\d{{0,4}})\s+"
         r"(?:мест[ао]?|пользовател(?:я|ей|ь))(?:\s+для\s+(?:обоих|всех)\s+(?:продуктов|позиций))?"
@@ -395,14 +396,40 @@ async def from_message(cid: str, text: str):
         text.strip(),
         re.I,
     )
-    if seats and (current := await latest(cid)):
+    resize = basket_resize(text) if not seats and not handoff_reason(clean) else None
+    if (seats or resize or confirmation) and (current := await latest(cid)):
+        if resize and resize[1]:
+            async with get_db().tx() as conn:
+                if (await latest(cid))["revision"] != current["revision"]:
+                    raise ApiError(409, "stale_revision", STALE)
+                if current["reselect"]:
+                    raise ApiError(409, "stale_revision", STALE)
+                await require_published(current)
+                await conn.execute(
+                    "INSERT OR REPLACE INTO quote_resize_confirmations VALUES(?,?,?,?)",
+                    (cid, current["quote_id"], current["revision"], resize[0]),
+                )
+                result, written = await clarification(
+                    conn,
+                    cid,
+                    text,
+                    f"Пересчитать все строки версии {current['revision']} на {resize[0]} пользователей "
+                    f"с прежними условиями? Для подтверждения напишите «Версия {current['revision']}: "
+                    f"на {resize[0]} пользователей». "
+                    "Для изменения отдельных строк откройте форму КП.",
+                )
+            events.publish(cid, written)
+            return result
         old = read(current)
         req = ProposalRequest(
-            customer=Customer(company=seats[2], inn=seats[3], kpp=seats[4].upper()) if seats[2] else old.customer,
+            customer=Customer(company=seats[2], inn=seats[3], kpp=seats[4].upper())
+            if seats and seats[2]
+            else old.customer,
             items=[Item(offerId=d.product.offerId, packages=d.packages) for d in old.details],
             baseRevision=old.quote.revision,
         )
-        return await prepare(cid, req, customer_message=text, seats=int(seats[1]))
+        count = int(confirmation[2]) if confirmation else int(seats[1]) if seats else resize[0]
+        return await prepare(cid, req, customer_message=text, seats=count)
     quantity = re.fullmatch(
         r"(?:теперь\s+|(?:измените|поменяйте)\s+(?:количество\s+)?на\s+)?"
         r"(?:по\s+)?([1-9]\d{0,5})\s+упаков(?:ка|ки|ок|ку)"
@@ -496,6 +523,20 @@ async def prepare_revision(conn, cid, request, customer_message, seats):
     if request.baseRevision != revision:
         raise ApiError(409, "stale_revision", STALE)
     # Seat changes resolve the old lines against the catalogue. Other inputs must come from the current selection.
+    if seats is not None:
+        if not current or current["reselect"] or set(ids) != {p["offerId"] for p in await repo.last_products(cid)}:
+            raise ApiError(409, "stale_revision", STALE)
+        pending = await get_db().fetchone("SELECT * FROM quote_resize_confirmations WHERE conversation_id=?", (cid,))
+        reply = (customer_message or "").strip().casefold().rstrip(".!")
+        if reply.startswith("версия ") or pending and not basket_resize(reply):
+            if (
+                not pending
+                or (pending["quote_id"], pending["revision"], pending["seats"])
+                != (current["quote_id"], revision, seats)
+                or reply != f"версия {revision}: на {seats} пользователей"
+            ):
+                raise ApiError(409, "stale_revision", STALE)
+        await conn.execute("DELETE FROM quote_resize_confirmations WHERE conversation_id=?", (cid,))
     if seats is None and set(ids).difference(await selectable_products(cid)):
         raise invalid_input("Сначала подберите эти позиции в чате под текущие условия.")
     s = get_settings()

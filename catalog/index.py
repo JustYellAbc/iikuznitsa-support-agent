@@ -244,7 +244,7 @@ def search(index, query, scope="catalog", limit=5, *, license_type=None, include
             ordering.extend(["bm25(products,8,10,3,1)", "o.id"])
             rows = db.execute(
                 f"""
-                SELECT o.id,o.vendor_code,o.name,o.edition,o.price,o.currency,o.available,
+                SELECT o.id,o.group_id,o.vendor_code,o.name,o.edition,o.price,o.currency,o.available,
                        o.price_state,o.source,o.params,o.details FROM products
                 JOIN offers o ON o.rowid=products.rowid WHERE {" AND ".join(filters)}
                 ORDER BY {", ".join(ordering)} LIMIT ?

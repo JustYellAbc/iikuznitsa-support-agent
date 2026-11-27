@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS quote_revisions (
     issued_action TEXT, reselect INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, revision), UNIQUE (quote_id, revision)
 );
+CREATE TABLE IF NOT EXISTS quote_resize_confirmations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+    quote_id TEXT NOT NULL, revision INTEGER NOT NULL, seats INTEGER NOT NULL,
+    FOREIGN KEY (quote_id, revision) REFERENCES quote_revisions(quote_id, revision)
+);
 CREATE TABLE IF NOT EXISTS quote_selection_resets (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
     after_seq INTEGER NOT NULL
