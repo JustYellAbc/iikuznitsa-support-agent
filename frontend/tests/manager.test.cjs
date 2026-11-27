@@ -147,11 +147,13 @@ test("Менеджер уточняет и закрывает обращение
       await desk.route("**/manager/handoffs", route => route.fulfill({json:{items:pending}}));
       await desk.route("**/conversations/*/events?*", route => route.fulfill({json:{events:[], nextAfter:0,hasMore:false}}));
       let approved;
+      let releaseApproval;
+      const slowApproval = new Promise(resolve => { releaseApproval = resolve; });
       await desk.route("**/handoffs/h-B/resolution", route => {
         approved = route.request().postDataJSON();
         pending = [line("A","q1"),pending[2]];
         pending[0].quoteLine.revision=2;
-        return route.fulfill({status:202,json:{}});
+        return slowApproval.then(() => route.fulfill({status:202,json:{}}));
       });
       await desk.goto(baseURL+"/manager");
       const queue = desk.locator("#queue button");
@@ -163,6 +165,9 @@ test("Менеджер уточняет и закрывает обращение
       await lines.filter({hasText:"Товар B"}).click();
       await desk.locator("#line-price").fill("123,45");
       await desk.getByRole("button",{name:"Подтвердить цену строки"}).click();
+      assert.equal(await lines.first().isDisabled(),true);
+      assert.equal(await desk.locator("#line-price").isDisabled(),true);
+      releaseApproval();
       await desk.locator("#question").getByText("Согласовать A").waitFor();
       assert.deepEqual(approved,{type:"approve_line_price",quoteId:"q1",revision:1,offerId:"B",unitPriceKopecks:12345});
       assert.equal(await lines.count(),1);
