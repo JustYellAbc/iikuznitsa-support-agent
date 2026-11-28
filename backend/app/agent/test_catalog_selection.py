@@ -23,14 +23,21 @@ def test_quote_name_does_not_hide_an_actual_customer_type():
 
 
 @pytest.fixture
-def index(tmp_path):
+def index(tmp_path, request):
     path = get_settings().data_dir / "private" / "catalog.sqlite3"
     shop = ET.Element("yml_catalog", date="2026-01-01")
     categories = ET.SubElement(shop, "categories")
     ET.SubElement(categories, "category", id="1").text = "PaperDesk"
     offers = ET.SubElement(shop, "offers")
     family = "MDaemon Messaging Server"
+    extra_offers = []
+    if getattr(request, "param", None) == "resize":
+        extra_offers = [
+            ("19578", family, "94341", "40", "Полная версия"),
+            ("380385", "Windows 11 Pro", "30448", None, "Полная версия"),
+        ]
     for code, name, price, size, kind in [
+        *extra_offers,
         ("new20", family, "1234.56", "20", "Полная версия"),
         ("new5", family, "321", "5", "Полная версия"),
         ("renew", family + " продление подписки на обновления", "875", "20", "Продление"),

@@ -189,27 +189,26 @@ def test_model_uses_tools_and_cannot_reuse_twenty_for_thirty_seven(api, provider
 
 @pytest.mark.usefixtures("index")
 @pytest.mark.parametrize(
-    ("first", "change", "seats", "offer", "price"),
+    ("first", "change", "offer", "price"),
     [
-        ("new20", "А на 5 пользователей какая цена и срок?", 5, "new5", "321 ₽"),
+        ("new20", "А на 5 пользователей какая цена и срок?", "new5", "321 ₽"),
         (
             "new5",
             "Теперь нужно на 20 пользователей. Сколько будет стоить и как получить КП?",
-            20,
             "new20",
             "1 234,56 ₽",
         ),
     ],
 )
-def test_seat_change_after_shown_card_reselects_the_same_product(api, provider, first, change, seats, offer, price):
+def test_seat_change_after_shown_card_reselects_the_same_product(api, provider, first, change, offer, price):
     responses, requests = provider
     initial = 20 if first == "new20" else 5
-    responses.extend(tool("select_licenses", variants=[{"name": "MDaemon", "seats": n}]) for n in (initial, seats))
+    responses.append(tool("select_licenses", variants=[{"name": "MDaemon", "seats": initial}]))
     cid = api.new_conversation()
     shown = say(api, cid, f"Нужен MDaemon на {initial} пользователей для компании, покупаем впервые.")
     assert [p["offerId"] for p in shown[-2]["products"]] == [first]
     events = say(api, cid, change)
-    assert len(requests) == 2 and not responses
+    assert len(requests) == 1 and not responses
     assert [p["offerId"] for p in events[-2]["products"]] == [offer]
     assert price in events[-1]["text"] and "называется" not in events[-1]["text"]
     assert ("Подготовить КП" in events[-1]["text"]) == ("КП" in change)
@@ -228,7 +227,7 @@ def test_full_card_name_after_clarified_selection_keeps_the_buyer_product(api, p
     assert say(api, cid, "Нужен MDaemon на 20 пользователей")[-1]["purpose"] == "clarification"
     shown = say(api, cid, "Компания, покупаем впервые")
     assert [p["offerId"] for p in shown[-2]["products"]] == ["new20"]
-    events = say(api, cid, "А на 5 пользователей какая цена и срок?")
+    events = say(api, cid, "Подберите всё-таки на 5 пользователей, какая цена и срок?")
     assert len(requests) == 2 and not responses
     assert [p["offerId"] for p in events[-2]["products"]] == ["new5"]
     assert "321 ₽" in events[-1]["text"] and "называется" not in events[-1]["text"]
@@ -249,12 +248,43 @@ def test_card_shown_before_a_search_clarification_still_grounds_the_next_seat_ch
     cid = api.new_conversation()
     say(api, cid, "Нужен MDaemon на 20 пользователей")
     assert [p["offerId"] for p in say(api, cid, "Компания, покупаем впервые")[-2]["products"]] == ["new20"]
-    assert say(api, cid, "А на 5 пользователей какая цена и срок?")[-1]["purpose"] == "clarification"
+    assert (
+        say(api, cid, "Поищите ещё варианты на 5 пользователей, какая цена и срок?")[-1]["purpose"] == "clarification"
+    )
     events = say(api, cid, "Теперь нужно на 5 пользователей сколько будет стоить и как получить КП?")
     assert json.loads(requests[-1]["messages"][-1]["content"])["previous_offers"] == []
     assert len(requests) == 4 and not responses
     assert [p["offerId"] for p in events[-2]["products"]] == ["new5"]
     assert "Подготовить КП" in events[-1]["text"] and "называется" not in events[-1]["text"]
+
+
+@pytest.mark.parametrize("index", ["resize"], indirect=True)
+@pytest.mark.parametrize("legacy_question", [False, True])
+def test_add_one_key_after_a_resize_or_its_old_clarification(api, provider, index, monkeypatch, legacy_question):  # noqa: F811
+    responses, requests = provider
+    responses.append(tool("select_licenses", variants=[{"name": "MDaemon", "seats": 20}]))
+    cid = api.new_conversation()
+    say(api, cid, "Нужен MDaemon на 20 пользователей")
+    say(api, cid, "Компания, покупаем впервые")
+    assert say(api, cid, "А на 5 пользователей какая цена и срок?")[-2]["products"][0]["offerId"] == "new5"
+    change = "Теперь нужно на 40 пользоваетелй. Сколько будет стоить и как получить КП?"
+    if legacy_question:
+        # Reproduce the already-published pre-fix search and clarification via the API.
+        responses.extend(
+            [
+                tool("search_catalog", query="MDaemon Messaging Server"),
+                tool("respond", kind="clarify", question="Покупаете новую лицензию или продлеваете действующую?"),
+            ]
+        )
+        with monkeypatch.context() as old:
+            old.setattr("app.agent.tool_agent.resized_seats", lambda _: None)
+            assert say(api, cid, change)[-1]["purpose"] == "clarification"
+    else:
+        events = say(api, cid, change)
+        assert events[-2]["products"][0]["offerId"] == "19578" and "Подготовить КП" in events[-1]["text"]
+    events = say(api, cid, "А еще нужен один ключ Windows 11 Pro для ИП")
+    assert [p["offerId"] for p in events[-2]["products"]] == ["19578", "380385"]
+    assert events[-1]["purpose"] == "answer" and len(requests) == (3 if legacy_question else 1)
 
 
 @pytest.mark.usefixtures("index")

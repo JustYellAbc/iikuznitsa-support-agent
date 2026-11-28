@@ -6,12 +6,14 @@ from catalog.index import KNOWLEDGE, build
 
 from app.agent.catalog_selection import Selection
 from app.agent.license_options import (
+    SelectionInputError,
     alternate_proposals,
     followup_capacities,
     kind_before_name,
     license_dialog_context,
     license_selection,
     quote_preview,
+    resized_seats,
     resolve_options,
     scoped_turns,
     shown_label,
@@ -320,3 +322,29 @@ def test_vendor_added_by_the_model_is_trimmed_to_the_buyer_wording(windows_index
 def test_vendor_trimming_keeps_the_name_hallucination_guard(windows_index, name, request_text):
     with pytest.raises(ValueError, match="дословно"):
         resolve_options(windows_index, [LicenseVariant(name=name)], [request_text])
+
+
+def test_resize_requires_only_one_stated_capacity_and_no_new_product():
+    assert resized_seats("Теперь нужно на 40 пользоваетелй. Сколько будет стоить и как получить КП?") == 40
+    assert followup_capacities("5 и 40 пользоваетелй") == [5, 40]
+    for mixed in ("А Касперский на 40 пользователей?", "40 полезных ключей", "на 5 и 40 мест", "на 5 мест на 3 года"):
+        assert resized_seats(mixed) is None
+    assert Selection("").qualifiers("40 полезных ключей", followup=True).seats is None
+
+
+@pytest.mark.parametrize("count", ["Один", "1"])
+def test_capacity_reply_is_bound_to_the_asked_basket_line(index, count):  # noqa: F811
+    names = ["Atlas", "Orion"]
+    variants = [LicenseVariant(name=name, seats=1) for name in names]
+    initial = "Нужен Atlas и Orion"
+    with pytest.raises(SelectionInputError) as failure:
+        resolve_options(index, variants, [initial])
+    assert failure.value.question == "На сколько пользователей нужна лицензия «Atlas»?"
+    history = [SimpleNamespace(role="client", text=initial), SimpleNamespace(role="agent", text=failure.value.question)]
+    turns = license_dialog_context(history, count)
+    assert license_selection("Atlas", 1, scoped_turns("Atlas", variants, turns)).seats == 1
+    assert license_selection("Orion", None, scoped_turns("Orion", variants, turns)).seats is None
+    history[-1].text = "На сколько пользователей нужна лицензия «Другое ПО»?"
+    assert license_dialog_context(history, count)[-1] == count
+    history[-1].text = "На сколько пользователей или месяцев?"
+    assert license_dialog_context(history, count)[-1] == count
