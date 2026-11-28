@@ -4,14 +4,14 @@ import re
 import sqlite3
 from contextlib import closing
 
-from app.agent.catalog_selection import COUNT_WORDS, MDAEMON, SEATS, WORD, Selection, named_request, select
+from app.agent.catalog_selection import COUNT_WORDS, MDAEMON, SEATS, USER_UNIT, WORD, Selection, named_request, select
 from app.agent.handoff import discovery_context
 from app.agent.needs_catalog import money
 from app.agent.quote_calculation import Item, catalog_lines
 from app.core.errors import ApiError
 from app.core.llm import LLMError
 
-CAPACITY_LIST = re.compile(r"\b(\d+(?:\s*(?:,|и|или)\s*\d+)+)\s+(?:мест|пользовател)", re.I)
+CAPACITY_LIST = re.compile(rf"\b(\d+(?:\s*(?:,|и|или)\s*\d+)+)\s+(?:мест|{USER_UNIT})", re.I)
 DURATION = re.compile(r"\b\d+\s*(?:мес(?:яц\w*)?|год\w*|лет)\b", re.I)
 # Keys, licenses or pieces count packages, not the capacity certified for the card.
 PACKAGES = re.compile(
@@ -23,9 +23,50 @@ FIELD_REPLY = re.compile(
     r"(?:это|мы|на|для|и|или|покупа(?:ет|ем)|бер[её]м|впервые|первая|новая|покупка|"
     r"коммерческ(?:ое|ая|ой)|юрлицо|компани[яию]|организаци[яию]|физлицо|"
     r"электронная|коробочная|поставка|месяц(?:а|ев)?|год|лет|"
-    r"покажите|сравнения|вариант(?:ы|а)?|пользовател(?:я|ей|ь)|мест(?:о|а)?|\d{1,6})",
+    rf"покажите|сравнения|вариант(?:ы|а)?|{USER_UNIT}|мест(?:о|а)?|\d{{1,6}})",
     re.I,
 )
+
+
+# Only an unambiguous change to a single line may bypass tool choice.
+RESIZE_UNIT = re.compile(rf"\b([1-9]\d{{0,5}})\s+(?:{USER_UNIT}|мест(?:о|а)?)\b", re.I)
+RESIZE_WORDS = set(
+    "а и на для теперь тогда если нужно надо сколько будет стоить стоит как какая какова "
+    "цена стоимость какой срок получить оформить запросить кп коммерческое предложение".split()
+)
+ADDED_KEY = re.compile(
+    r"(?:а\s+)?ещ[её]\s+нужен\s+(?:один|1)\s+ключ\s+((?a:[a-z][a-z0-9-]*(?: +[a-z0-9][a-z0-9-]*)*))"
+    r"(?: +для +ИП)?[.!]?",
+    re.I,
+)
+SPOKEN_SEATS = (
+    dict.fromkeys(("один", "одна", "одного", "одну"), 1)
+    | {word: n for n, word in enumerate("две три четыре пять шесть семь восемь девять десять".split(), 2)}
+    | {"два": 2}
+)
+
+
+def resized_seats(text):
+    matches = list(RESIZE_UNIT.finditer(text))
+    if len(matches) != 1:
+        return None
+    rest = text[: matches[0].start()] + " " + text[matches[0].end() :]
+    words = re.findall(r"\w+|[^\w\s.,!?]", rest.casefold())
+    return int(matches[0][1]) if all(w in RESIZE_WORDS for w in words) else None
+
+
+def shown_family_name(history, card):
+    family = card.name.partition(" (")[0].casefold()
+    for message in reversed(history[-16:]):
+        if message.role == "client":
+            product = named_request(message.text)
+            if (
+                product
+                and key_words(product.name)
+                and re.search(r"(?<!\w)" + re.escape(product.name) + "$", family, re.I)
+            ):
+                return product.name
+    return None
 
 
 def followup_capacities(text):
@@ -119,10 +160,15 @@ def license_dialog_context(history, text):
     turns = discovery_context(history, text, max_turns=8)
     exchanges = history[len(history) - 2 * (len(turns) - 1) :]
     for i, question in enumerate(exchanges[1::2], 1):
-        count = re.fullmatch(r"(?:на\s+)?([1-9]\d{0,5})[.!]?", turns[i].strip(), re.I)
+        count = re.fullmatch(r"(?:на\s+)?([1-9]\d{0,5}|[а-яё]+)[.!]?", turns[i].strip().casefold())
         if count and re.search(r"(?:на\s+)?сколько\s+(?:пользовател|рабочих мест|мест\b)", question.text, re.I):
             if question.text.count("?") == 1 and " или " not in question.text.casefold():
-                turns[i] = count[1] + " пользователей"
+                value = count[1] if count[1].isdigit() else SPOKEN_SEATS.get(count[1])
+                if value:
+                    line = re.search(r"нужна лицензия «([^»]+)»\?", question.text)
+                    if line and not any(name_pattern(line[1]).search(t) for t in turns[:i]):
+                        continue
+                    turns[i] = (f"{line[1]} — " if line else "") + f"{value} пользователей"
     return turns
 
 
@@ -281,10 +327,15 @@ def resolve_options(index, variants, turns, *, prior_kind="", previous=()):
     except sqlite3.Error as exc:
         raise LLMError("catalog_unavailable") from exc
     labeled = [v.model_copy(update={"name": label}) for v, (label, _) in zip(variants, grounded, strict=True)]
-    selections = [
-        license_selection(item.name, item.seats, scoped_turns(item.name, labeled, turns), lookup=lookup)
-        for item, (_, lookup) in zip(labeled, grounded, strict=True)
-    ]
+    selections = []
+    for item, (_, lookup) in zip(labeled, grounded, strict=True):
+        try:
+            scope = scoped_turns(item.name, labeled, turns)
+            selections.append(license_selection(item.name, item.seats, scope, lookup=lookup))
+        except SelectionInputError as exc:
+            if exc.code == "capacity" and len(labeled) > 1:
+                exc.question = f"На сколько пользователей нужна лицензия «{item.name}»?"
+            raise
     if prior_kind and len(selections) == 1 and not selections[0].kind:
         selections[0].kind = prior_kind
     if len({(s.name.casefold(), s.seats) for s in selections}) != len(selections):

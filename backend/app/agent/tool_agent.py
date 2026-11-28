@@ -35,13 +35,17 @@ from app.agent.handoff import (
 )
 from app.agent.knowledge import keeps_question_qualifiers
 from app.agent.license_options import (
+    ADDED_KEY,
     SelectionInputError,
     alternate_proposals,
     followup_capacities,
     kind_before_name,
     license_dialog_context,
+    name_pattern,
     quote_preview,
+    resized_seats,
     resolve_options,
+    shown_family_name,
     shown_product_turns,
 )
 from app.agent.product_answers import topics_for
@@ -679,14 +683,15 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         evidence.catalog_miss = not data["results"]
         return data
 
-    async def select_licenses(args):
+    async def select_licenses(args, *, shown=None):
         buyer_turns = license_dialog_context(history, text)
         prior_kind = kind_before_name(history, buyer_turns, args.variants)
         if previous and len(buyer_turns) == 1 and re.search(r"пересчит|тот же|этот же", text, re.I):
             prior = next((m.text for m in reversed(history) if m.role == "client"), None)
             if prior:
                 buyer_turns = [prior, text]
-        shown = previous or await asyncio.to_thread(shown_cards, index, history)
+        if shown is None:
+            shown = previous or await asyncio.to_thread(shown_cards, index, history)
         carried = shown_product_turns(history, text, args.variants, shown)
         if len(carried) > len(buyer_turns) and carried[-len(buyer_turns) :] == buyer_turns:
             buyer_turns = carried
@@ -815,6 +820,23 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
                         )
                     except SelectionInputError:
                         pass  # The saved name or quantities no longer match the buyer's words.
+        seats = resized_seats(text) if len(turns) == 1 else None
+        after_resize = len(history) >= 4 and resized_seats(history[-2].text)
+        added = ADDED_KEY.fullmatch(text.strip()) if len(turns) == 1 or after_resize else None
+        if kb_retry is None and (seats or added):
+            shown = previous
+            # A failed resize may have replaced the active offer with a clarification.
+            if added and not shown and after_resize:
+                shown = await asyncio.to_thread(shown_cards, index, history[-4:-2])
+            if len(shown) == 1 and (name := shown_family_name(history, shown[0])):
+                variants = [LicenseVariant(name=name, seats=seats)]
+                if added and 2 <= len(added[1]) <= 100 and not name_pattern(added[1]).search(shown[0].name):
+                    variants.append(LicenseVariant(name=added[1]))
+                if seats or len(variants) == 2:
+                    try:
+                        return await select_licenses(LicenseOptions(variants=variants), shown=shown)
+                    except SelectionInputError:
+                        pass  # Delegate when the history cannot ground both the name and the quantity.
         if (
             len(turns) == 1
             and not previous
