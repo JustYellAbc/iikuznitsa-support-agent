@@ -4,6 +4,7 @@ from xml.etree import ElementTree as ET
 import pytest
 from catalog.index import KNOWLEDGE, build
 
+from app.agent.catalog_selection import Selection
 from app.agent.license_options import (
     alternate_proposals,
     followup_capacities,
@@ -178,13 +179,30 @@ def test_single_license_keeps_stated_capacity_and_rejects_unstated_one():
         license_selection("Windows 11 Pro", 1, ["Одна лицензия Windows 11 Pro на 5 пользователей"])
 
 
+@pytest.mark.parametrize(
+    ("text", "seats"),
+    [
+        ("Нужно 5 таких пользователей", 5),
+        ("Теперь 40 таких же мест", 40),
+        ("Добавьте 10 дополнительных мест", 10),
+        ("3 новых пользователя", 3),
+    ],
+)
+def test_seat_count_allows_a_word_between_number_and_unit(text, seats):
+    assert Selection("").qualifiers(text, followup=False).seats == seats
+    assert license_selection("MDaemon", seats, ["Нужен MDaemon на 20 пользователей", text]).seats == seats
+
+
+WINDOWS = "Microsoft Windows 11 Pro FQC-10572, электронный ключ"
+
+
 @pytest.fixture
 def windows_index(tmp_path):
     shop = ET.Element("yml_catalog", date="2026-01-01")
     ET.SubElement(ET.SubElement(shop, "categories"), "category", id="1").text = "ПО"
     offers = ET.SubElement(shop, "offers")
     for code, name, price, term in [
-        ("380385", "Microsoft Windows 11 Pro FQC-10572, электронный ключ", "30448", "бессрочная"),
+        ("380385", WINDOWS, "30448", "бессрочная"),
         # Prefix search matches "pro" in PROMT and "11" in the registry number.
         ("489326", "PROMT Neural Training Addon, для ОС Windows (рег. номер ПО 11647)", "190000", "12 мес."),
     ]:
@@ -215,3 +233,22 @@ def test_one_windows_key_for_sole_trader_shows_the_card(windows_index):
     [hit] = resolve_options(windows_index, [LicenseVariant(name="Windows 11 Pro", seats=1)], turns)
     assert hit.purpose == "answer" and [p.offerId for p in hit.products] == ["380385"]
     assert "30 448 ₽" in hit.text and "?" not in hit.text
+
+
+@pytest.mark.parametrize(
+    ("change", "count"),
+    [
+        ("А если нужно 5 таких ключей", 5),
+        ("А если 5 таких ключей?", 5),
+        ("Нужно 3 новых лицензии", 3),
+        ("Возьмём 2 таких же ключа", 2),
+    ],
+)
+def test_counted_keys_after_shown_card_are_packages_not_capacity(windows_index, change, count):
+    first = "Нужен один ключ Windows 11 Pro для ИП"
+    history = [SimpleNamespace(role="client", text=first), SimpleNamespace(role="agent", text=WINDOWS + ".")]
+    variants = [LicenseVariant(name="Windows 11 Pro", seats=count)]
+    turns = shown_product_turns(history, change, variants, [SimpleNamespace(name=WINDOWS)])
+    assert turns == [first, change]
+    [hit] = resolve_options(windows_index, variants, turns)
+    assert hit.purpose == "answer" and [p.offerId for p in hit.products] == ["380385"] and "?" not in hit.text

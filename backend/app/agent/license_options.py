@@ -3,7 +3,7 @@
 import re
 import sqlite3
 
-from app.agent.catalog_selection import MDAEMON, SEATS, Selection, named_request, select
+from app.agent.catalog_selection import COUNT_WORDS, MDAEMON, SEATS, Selection, named_request, select
 from app.agent.handoff import discovery_context
 from app.agent.needs_catalog import money
 from app.agent.quote_calculation import Item, catalog_lines
@@ -12,9 +12,9 @@ from app.core.llm import LLMError
 
 CAPACITY_LIST = re.compile(r"\b(\d+(?:\s*(?:,|и|или)\s*\d+)+)\s+(?:мест|пользовател)", re.I)
 DURATION = re.compile(r"\b\d+\s*(?:мес(?:яц\w*)?|год\w*|лет)\b", re.I)
-# One key, license or piece is a package count, not the capacity certified for the card.
-SINGLE_PACKAGE = re.compile(
-    r"\b(?:один|одн(?:а|у|ой|ого)|1)\s+(?:электронн\w*\s+)?(?:ключ\w*|лицензи\w*|шт\b|штук\w*|экземпляр\w*)", re.I
+# Keys, licenses or pieces count packages, not the capacity certified for the card.
+PACKAGES = re.compile(
+    rf"\b(\d{{1,6}}|один|одн(?:а|у|ой|ого))\s+{COUNT_WORDS}(?:ключ\w*|лицензи\w*|шт\b|штук\w*|экземпляр\w*)", re.I
 )
 # Only resume automatically when the entire reply supplies purchase fields.
 # Mixed requests (new product, exclusions, documents, etc.) go through the model.
@@ -200,7 +200,8 @@ def license_selection(name, seats, turns):
         for group in CAPACITY_LIST.finditer(scope[-1]):
             counts.update(int(n) for n in re.findall(r"\d+", group[1]))
         if seats != selection.seats and seats not in counts:
-            if seats == 1 and not counts and SINGLE_PACKAGE.search(" ".join(scope)):
+            packages = {int(n) if n.isdigit() else 1 for n in PACKAGES.findall(" ".join(scope))}
+            if not counts and seats in packages:
                 return selection
             raise SelectionInputError(
                 "capacity",
