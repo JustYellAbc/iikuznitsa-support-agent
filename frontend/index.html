@@ -7,9 +7,28 @@
   <title>Softline · ИИ-агент поддержки</title>
   <style>
     :root { --demo-h: 30px; }
-    body { font-family: system-ui, sans-serif; margin: 0; color: #1a1a1a; background: #fff; }
-    main { max-width: 640px; margin: 48px auto; padding: 0 16px; }
-    code { background: #f2f2f2; padding: 2px 4px; border-radius: 4px; }
+    :root { --ink: #22212a; --muted: #625f68; --accent: #a20c33; --accent-dark: #85092a; --line: #dedbe0; color-scheme: light; }
+    body { font: 16px/1.5 Inter, "Segoe UI", system-ui, sans-serif; margin: 0; color: var(--ink); background: #f7f6f2; }
+    main { box-sizing: border-box; min-height: calc(100vh - var(--demo-h)); display: flex; align-items: center; justify-content: center; padding: 32px 16px; }
+    .card { box-sizing: border-box; width: 100%; max-width: 600px; padding: 40px; background: #fff; border: 1px solid var(--line); border-radius: 8px; text-align: center; }
+    .card h1 { margin: 0 0 4px; font-size: 26px; line-height: 1.25; font-weight: 600; }
+    .card h1 small { display: block; margin-top: 6px; color: var(--muted); font-size: 15px; font-weight: 400; }
+    .lead { margin: 16px 0 28px; color: var(--muted); }
+    .actions { display: flex; flex-direction: column; gap: 12px; }
+    .btn { display: block; padding: 13px 20px; border: 1px solid var(--accent); border-radius: 6px; font-weight: 600; text-decoration: none; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+    .btn-secondary { background: #fff; color: var(--accent); }
+    .btn-secondary:hover { background: #fbf1f4; }
+    .btn:focus-visible { outline: 3px solid #e6a3b5; outline-offset: 2px; }
+    .service { margin: 28px 0 0; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+    .service a { color: var(--ink); }
+    code { background: #f2f0ec; padding: 1px 4px; border-radius: 4px; font-size: 0.95em; }
+    @media (max-width: 480px) {
+      main { align-items: flex-start; padding: 20px 12px; }
+      .card { padding: 24px 18px; }
+      .card h1 { font-size: 22px; }
+    }
     .demo-banner { position: sticky; top: 0; display: flex; align-items: center; justify-content: center; height: var(--demo-h); padding: 0 12px; overflow: hidden; background: #22212a; color: #fff; font-size: 13px; line-height: 16px; text-align: center; white-space: nowrap; }
     .demo-banner > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
     @media (max-width: 800px) {
@@ -22,15 +41,16 @@
 </head>
 <body>
   <div class="demo-banner" role="note"><span><b>Демо-прототип конкурса „ИИкузница“</b><span class="demo-extra"> — учебно-конкурсный стенд,</span> не является официальным магазином store.softline.ru</span></div>
-  <!-- Заглушка. frontend/ — зона Михаила: замените этот файл виджетом и консолью менеджера. -->
   <main>
-    <h1>ИИ-агент поддержки Softline</h1>
-    <p>Стенд работает. Интерфейс чата появится здесь.</p>
-    <ul>
-      <li><a href="/manager/">Рабочее место менеджера</a></li>
-      <li><a href="/health">/health</a> — состояние стенда</li>
-      <li><a href="/api/docs">/api/docs</a> — OpenAPI (Swagger UI)</li>
-    </ul>
+    <section class="card" aria-labelledby="title">
+      <h1 id="title">ИИ-консультант витрины store.softline.ru <small>Прототип для конкурса «ИИкузница»</small></h1>
+      <p class="lead">Подбор ПО по каталогу 136 тыс. SKU, расчёт КП и счёта с контролем ценовых режимов и рабочее место оператора.</p>
+      <nav class="actions" aria-label="Разделы стенда">
+        <a class="btn btn-primary" href="/chat/">Открыть витрину и чат покупателя</a>
+        <a class="btn btn-secondary" href="/manager/">Кабинет оператора и база знаний</a>
+      </nav>
+      <p class="service">Для жюри: <a href="/api/docs"><code>/api/docs</code></a> — OpenAPI · <a href="/health"><code>/health</code></a> — статус стенда</p>
+    </section>
   </main>
 </body>
 </html>
