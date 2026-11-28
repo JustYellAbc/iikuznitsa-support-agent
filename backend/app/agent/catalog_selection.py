@@ -283,6 +283,10 @@ def _lookup(db: sqlite3.Connection, selection: Selection) -> tuple[list, str]:
         ).fetchall()
 
     rows = candidates(words)
+    # Prefix search also matches longer words ("pro" in PROMT); whole-word hits take precedence.
+    whole = [r for r in rows if set(words) <= set(WORD.findall(r["name"].casefold()))]
+    if whole and len(rows) <= LIMIT:
+        return whole, ""
     if rows or len(words) != 1 or len(words[0]) < 5:
         return rows, ""
     # Category labels are the feed's own vocabulary. A fuzzy hit is an alternative, never an exact SKU.

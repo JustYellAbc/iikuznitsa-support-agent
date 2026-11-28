@@ -1,6 +1,8 @@
 from types import SimpleNamespace
+from xml.etree import ElementTree as ET
 
 import pytest
+from catalog.index import KNOWLEDGE, build
 
 from app.agent.license_options import (
     alternate_proposals,
@@ -174,3 +176,42 @@ def test_single_license_keeps_stated_capacity_and_rejects_unstated_one():
     assert license_selection("MDaemon", 1, ["MDaemon на 20 пользователей", "Нужна одна лицензия"]).seats == 20
     with pytest.raises(ValueError, match="Вместимость"):
         license_selection("Windows 11 Pro", 1, ["Одна лицензия Windows 11 Pro на 5 пользователей"])
+
+
+@pytest.fixture
+def windows_index(tmp_path):
+    shop = ET.Element("yml_catalog", date="2026-01-01")
+    ET.SubElement(ET.SubElement(shop, "categories"), "category", id="1").text = "ПО"
+    offers = ET.SubElement(shop, "offers")
+    for code, name, price, term in [
+        ("380385", "Microsoft Windows 11 Pro FQC-10572, электронный ключ", "30448", "бессрочная"),
+        # Prefix search matches "pro" in PROMT and "11" in the registry number.
+        ("489326", "PROMT Neural Training Addon, для ОС Windows (рег. номер ПО 11647)", "190000", "12 мес."),
+    ]:
+        row = ET.SubElement(offers, "offer", id=code, available="true")
+        for key, value in {
+            "name": name,
+            "price": price,
+            "currencyId": "RUB",
+            "categoryId": "1",
+            "url": "https://example.org/store/" + code,
+        }.items():
+            ET.SubElement(row, key).text = value
+        for key, value in {
+            "Срок действия": term,
+            "Пользователь": "не определено",
+            "Тип организации": "Коммерческая",
+        }.items():
+            ET.SubElement(row, "param", name=key).text = value
+    feed = tmp_path / "windows.xml"
+    ET.ElementTree(shop).write(feed, encoding="utf-8")
+    path = tmp_path / "windows.sqlite3"
+    build(feed, path, KNOWLEDGE)
+    return path
+
+
+def test_one_windows_key_for_sole_trader_shows_the_card(windows_index):
+    turns = ["Нужен один ключ Windows 11 Pro для ИП"]
+    [hit] = resolve_options(windows_index, [LicenseVariant(name="Windows 11 Pro", seats=1)], turns)
+    assert hit.purpose == "answer" and [p.offerId for p in hit.products] == ["380385"]
+    assert "30 448 ₽" in hit.text and "?" not in hit.text
