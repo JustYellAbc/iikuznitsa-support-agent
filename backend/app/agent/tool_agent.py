@@ -41,6 +41,7 @@ from app.agent.license_options import (
     license_dialog_context,
     quote_preview,
     resolve_options,
+    shown_product_turns,
 )
 from app.agent.product_answers import topics_for
 from app.agent.quote_intent import offers_quote
@@ -669,6 +670,8 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
             prior = next((m.text for m in reversed(history) if m.role == "client"), None)
             if prior:
                 buyer_turns = [prior, text]
+        if len(buyer_turns) == 1:
+            buyer_turns = shown_product_turns(history, text, args.variants, previous)
         start = time.monotonic()
         hits = await asyncio.to_thread(resolve_options, index, args.variants, buyer_turns, prior_kind=prior_kind)
         trace_args = {"variants": len(hits)}

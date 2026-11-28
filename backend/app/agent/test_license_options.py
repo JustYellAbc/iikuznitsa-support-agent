@@ -11,6 +11,7 @@ from app.agent.license_options import (
     quote_preview,
     resolve_options,
     scoped_turns,
+    shown_product_turns,
 )
 from app.agent.test_catalog_selection import index as index
 from app.agent.tool_agent import LicenseVariant
@@ -111,3 +112,65 @@ def test_duration_comparison_cannot_silently_select_first_term(terms):
 def test_negative_technical_constraint_requires_clarification(negative):
     with pytest.raises(ValueError, match="исключил это условие"):
         license_selection("Nova Studio", 10, [f"Nova Studio на 10 пользователей, {negative}."])
+
+
+MDAEMON_20 = (
+    "MDaemon Technologies, Ltd. MDaemon Messaging Server (лицензия с подпиской на обновления на 1 год), "
+    "20 пользователей"
+)
+
+
+@pytest.mark.parametrize(
+    ("change", "seats"),
+    [
+        ("Теперь нужно на 40 пользователей. Сколько будет стоить и как получить КП?", 40),
+        ("А на 5 пользователей какая цена и срок?", 5),
+    ],
+)
+def test_seat_change_after_shown_card_keeps_the_named_product(change, seats):
+    first = "Нужен MDaemon на 20 пользователей. Коммерческое юрлицо, покупаем впервые."
+    history = [SimpleNamespace(role="client", text=first), SimpleNamespace(role="agent", text=MDAEMON_20 + ".")]
+    shown = [SimpleNamespace(name=MDAEMON_20)]
+    variants = [LicenseVariant(name="MDaemon", seats=seats)]
+    with pytest.raises(ValueError, match="дословно"):
+        license_selection("MDaemon", seats, license_dialog_context(history, change))
+    turns = shown_product_turns(history, change, variants, shown)
+    assert turns == [first, change]
+    selection = license_selection("MDaemon", seats, turns)
+    assert (selection.name, selection.seats, selection.kind, selection.buyer, selection.organization) == (
+        "MDaemon Messaging Server",
+        seats,
+        "Полная версия",
+        "Юрлицо",
+        "Коммерческая",
+    )
+
+
+def test_shown_card_does_not_replace_a_newly_named_or_unshown_product():
+    history = [SimpleNamespace(role="client", text="Нужен MDaemon на 20 пользователей.")]
+    shown = [SimpleNamespace(name=MDAEMON_20)]
+    switch = "А Kaspersky Security на 40 пользователей?"
+    assert shown_product_turns(history, switch, [LicenseVariant(name="Kaspersky Security")], shown) == [switch]
+    change = "А на 40 пользователей?"
+    assert shown_product_turns(history, change, [LicenseVariant(name="Kaspersky Security")], shown) == [change]
+    assert shown_product_turns(history, change, [LicenseVariant(name="MDaemon")], []) == [change]
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Нужен один ключ Windows 11 Pro для ИП",
+        "Нужна одна лицензия Windows 11 Pro",
+        "1 ключ Windows 11 Pro",
+        "Windows 11 Pro, 1 лицензия",
+        "Windows 11 Pro, 1 шт.",
+    ],
+)
+def test_single_key_is_a_package_count_not_card_capacity(request_text):
+    assert license_selection("Windows 11 Pro", 1, [request_text]).seats is None
+
+
+def test_single_license_keeps_stated_capacity_and_rejects_unstated_one():
+    assert license_selection("MDaemon", 1, ["MDaemon на 20 пользователей", "Нужна одна лицензия"]).seats == 20
+    with pytest.raises(ValueError, match="Вместимость"):
+        license_selection("Windows 11 Pro", 1, ["Одна лицензия Windows 11 Pro на 5 пользователей"])

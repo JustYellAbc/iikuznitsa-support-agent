@@ -188,6 +188,34 @@ def test_model_uses_tools_and_cannot_reuse_twenty_for_thirty_seven(api, provider
 
 
 @pytest.mark.usefixtures("index")
+@pytest.mark.parametrize(
+    ("first", "change", "seats", "offer", "price"),
+    [
+        ("new20", "А на 5 пользователей какая цена и срок?", 5, "new5", "321 ₽"),
+        (
+            "new5",
+            "Теперь нужно на 20 пользователей. Сколько будет стоить и как получить КП?",
+            20,
+            "new20",
+            "1 234,56 ₽",
+        ),
+    ],
+)
+def test_seat_change_after_shown_card_reselects_the_same_product(api, provider, first, change, seats, offer, price):
+    responses, requests = provider
+    initial = 20 if first == "new20" else 5
+    responses.extend(tool("select_licenses", variants=[{"name": "MDaemon", "seats": n}]) for n in (initial, seats))
+    cid = api.new_conversation()
+    shown = say(api, cid, f"Нужен MDaemon на {initial} пользователей для компании, покупаем впервые.")
+    assert [p["offerId"] for p in shown[-2]["products"]] == [first]
+    events = say(api, cid, change)
+    assert len(requests) == 2 and not responses
+    assert [p["offerId"] for p in events[-2]["products"]] == [offer]
+    assert price in events[-1]["text"] and "называется" not in events[-1]["text"]
+    assert ("Подготовить КП" in events[-1]["text"]) == ("КП" in change)
+
+
+@pytest.mark.usefixtures("index")
 def test_mandatory_price_route_uses_verified_sku_once(api, provider):
     responses, requests = provider
     responses.append(tool("get_offer", offer_id="ask"))
