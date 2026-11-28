@@ -3,7 +3,7 @@
 import re
 import sqlite3
 
-from app.agent.catalog_selection import MDAEMON, SEATS, Selection, named_request, select
+from app.agent.catalog_selection import COUNT_WORDS, MDAEMON, SEATS, Selection, named_request, select
 from app.agent.handoff import discovery_context
 from app.agent.needs_catalog import money
 from app.agent.quote_calculation import Item, catalog_lines
@@ -12,6 +12,10 @@ from app.core.llm import LLMError
 
 CAPACITY_LIST = re.compile(r"\b(\d+(?:\s*(?:,|и|или)\s*\d+)+)\s+(?:мест|пользовател)", re.I)
 DURATION = re.compile(r"\b\d+\s*(?:мес(?:яц\w*)?|год\w*|лет)\b", re.I)
+# Keys, licenses or pieces count packages, not the capacity certified for the card.
+PACKAGES = re.compile(
+    rf"\b(\d{{1,6}}|один|одн(?:а|у|ой|ого))\s+{COUNT_WORDS}(?:ключ\w*|лицензи\w*|шт\b|штук\w*|экземпляр\w*)", re.I
+)
 # Only resume automatically when the entire reply supplies purchase fields.
 # Mixed requests (new product, exclusions, documents, etc.) go through the model.
 FIELD_REPLY = re.compile(
@@ -83,6 +87,18 @@ def kind_before_name(history, turns, variants):
                 return kind
         break
     return ""
+
+
+def shown_product_turns(history, text, variants, previous):
+    """A change of terms after a shown card may omit the product name the buyer used earlier."""
+    labels = [name_pattern(v.name) for v in variants]
+    if any(label.search(text) for label in labels) or not all(
+        any(label.search(p.name) for p in previous) for label in labels
+    ):
+        return [text]
+    earlier = [m.text for m in history if m.role == "client"][-8:]
+    start = next((i for i in reversed(range(len(earlier))) if any(lb.search(earlier[i]) for lb in labels)), None)
+    return [text] if start is None else [*earlier[start:], text]
 
 
 def scoped_turns(name, variants, turns):
@@ -184,6 +200,9 @@ def license_selection(name, seats, turns):
         for group in CAPACITY_LIST.finditer(scope[-1]):
             counts.update(int(n) for n in re.findall(r"\d+", group[1]))
         if seats != selection.seats and seats not in counts:
+            packages = {int(n) if n.isdigit() else 1 for n in PACKAGES.findall(" ".join(scope))}
+            if not counts and seats in packages:
+                return selection
             raise SelectionInputError(
                 "capacity",
                 "Вместимость должна быть указана покупателем для этой позиции. Если он назвал число покупаемых "

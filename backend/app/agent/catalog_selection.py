@@ -16,7 +16,11 @@ from app.services.price_policy import OfferAssessment, assess, is_supported_curr
 WORD = re.compile(r"[^\W_]+")
 CANDIDATE_QUESTION = "Вам подходит именно этот вариант?"
 MDAEMON = re.compile(r"\b(?:mda?e?mo?n|mdeamon|мд[еэ]й?мон|мдаймон|эмдеймон)\b", re.I)
-SEATS = re.compile(r"\b(\d{1,9})\s*[- ]?\s*(?:пользоват|человек|сотрудник|рабочи[хе] мест|мест|users?|seats?)", re.I)
+# A pronoun or adjective may stand between a count and its unit: "5 таких ключей", "10 дополнительных мест".
+COUNT_WORDS = r"(?:(?:так\w*|эт(?:их|от|у|а|и)|тех|же|нов\w*|дополнительн\w*|электронн\w*)\s+){0,2}"
+SEATS = re.compile(
+    rf"\b(\d{{1,9}})\s*[- ]?\s*{COUNT_WORDS}(?:пользоват|человек|сотрудник|рабочи[хе] мест|мест|users?|seats?)", re.I
+)
 CODE = re.compile(r"\b(?:артикул(?:а|у|е|ом)?\b|offerid|sku|код(?:а|у|е|ом)? товара\b|id)\s*[:#№-]?\s*([\w.-]+)", re.I)
 NAMED = re.compile(r"\b(?:ищу|найти|нуж(?:ен|на|но)|подберите|купить|купим|интересует|сколько стоит)\s+", re.I)
 LATIN = re.compile(r"\b[a-z][a-z0-9.+-]*(?:\s+[a-z][a-z0-9.+-]*)*", re.I | re.ASCII)
@@ -283,6 +287,10 @@ def _lookup(db: sqlite3.Connection, selection: Selection) -> tuple[list, str]:
         ).fetchall()
 
     rows = candidates(words)
+    # Prefix search also matches longer words ("pro" in PROMT); whole-word hits take precedence.
+    whole = [r for r in rows if set(words) <= set(WORD.findall(r["name"].casefold()))]
+    if whole and len(rows) <= LIMIT:
+        return whole, ""
     if rows or len(words) != 1 or len(words[0]) < 5:
         return rows, ""
     # Category labels are the feed's own vocabulary. A fuzzy hit is an alternative, never an exact SKU.
