@@ -673,7 +673,9 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
         if len(buyer_turns) == 1:
             buyer_turns = shown_product_turns(history, text, args.variants, previous)
         start = time.monotonic()
-        hits = await asyncio.to_thread(resolve_options, index, args.variants, buyer_turns, prior_kind=prior_kind)
+        hits = await asyncio.to_thread(
+            resolve_options, index, args.variants, buyer_turns, prior_kind=prior_kind, previous=previous
+        )
         trace_args = {"variants": len(hits)}
         if len(hits) == 1 and hits[0].awaiting_fields:
             trace_args["pending_name"] = args.variants[0].name

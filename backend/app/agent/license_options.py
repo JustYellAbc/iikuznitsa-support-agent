@@ -2,8 +2,9 @@
 
 import re
 import sqlite3
+from contextlib import closing
 
-from app.agent.catalog_selection import COUNT_WORDS, MDAEMON, SEATS, Selection, named_request, select
+from app.agent.catalog_selection import COUNT_WORDS, MDAEMON, SEATS, WORD, Selection, named_request, select
 from app.agent.handoff import discovery_context
 from app.agent.needs_catalog import money
 from app.agent.quote_calculation import Item, catalog_lines
@@ -59,6 +60,60 @@ def name_pattern(name):
     return re.compile(r"(?<!\w)" + re.escape(name) + r"(?!\w)", re.I)
 
 
+# Numbers, editions, licensing terms and company suffixes do not identify a product family.
+GENERIC_WORD = re.compile(
+    r"для|на|с|и|в|по|for|the|and|of|with|год\w*|лет|мес\w*|пользовател\w*|users?|лиценз\w*|licen[cs]\w*|"
+    r"ключ\w*|подписк\w*|обновлен\w*|продлен\w*|электронн\w*|pro|professional|standard|edition|home|business|"
+    r"enterprise|plus|basic|premium|ultimate|server|suite|version|верси\w*|ltd|inc|llc|gmbh|corp\w*|technologies"
+)
+
+
+def key_words(name):
+    return {
+        w for w in WORD.findall(name.casefold()) if len(w) > 1 and not w.isdigit() and not GENERIC_WORD.fullmatch(w)
+    }
+
+
+def shown_label(name, turn, previous, names):
+    """The buyer's word for a shown card: a distinctive word the variant name shares with that card."""
+    cards = [p.name for p in previous if name_pattern(name).search(p.name)]
+    words = key_words(name) & set().union(*map(key_words, cards))
+    words -= set().union(*(key_words(other) for other in names if other != name))
+    found = (name_pattern(word).search(turn) for word in sorted(words, key=len, reverse=True))
+    return next((m[0] for m in found if m), None)
+
+
+def vendor_trimmed(index, name, turns):
+    """The buyer's wording when the model prefixed it with the vendor of a catalog card containing the name."""
+    rests = [name[m.start() :] for m in list(re.finditer(r"\S+", name))[1:]]
+    rests = [r for r in rests if key_words(r) and any(name_pattern(r).search(t) for t in turns)]
+    if not rests or not index.is_file():
+        return None
+    expr = " AND ".join(f'name:"{w}"' for w in WORD.findall(name.casefold()))
+    with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        cards = db.execute(
+            "SELECT o.name, o.vendor FROM products JOIN offers o ON o.rowid=products.rowid "
+            "WHERE products MATCH ? LIMIT 50",
+            (expr,),
+        ).fetchall()
+    for rest in rests:
+        prefix = key_words(name[: -len(rest)])
+        if any(name_pattern(name).search(card) and prefix <= key_words(vendor or "") for card, vendor in cards):
+            return rest
+    return None
+
+
+def grounded_label(index, name, turns, previous, names):
+    """Return the buyer's wording that grounds a variant and the name to look up in the catalog."""
+    if any(name_pattern(name).search(t) for t in turns):
+        return name, name
+    rest = vendor_trimmed(index, name, turns)
+    if rest:
+        return rest, rest
+    label = next(filter(None, (shown_label(name, t, previous, names) for t in reversed(turns))), None)
+    return (label, name) if label else (name, name)
+
+
 def license_dialog_context(history, text):
     """Resolve a short numeric answer against the unit in the question that elicited it."""
     turns = discovery_context(history, text, max_turns=8)
@@ -91,13 +146,18 @@ def kind_before_name(history, turns, variants):
 
 def shown_product_turns(history, text, variants, previous):
     """A change of terms after a shown card may omit the product name the buyer used earlier."""
-    labels = [name_pattern(v.name) for v in variants]
-    if any(label.search(text) for label in labels) or not all(
-        any(label.search(p.name) for p in previous) for label in labels
-    ):
+    names = [v.name for v in variants]
+    shown = [
+        n for n in names if not name_pattern(n).search(text) and any(name_pattern(n).search(p.name) for p in previous)
+    ]
+    if not shown:
         return [text]
+
+    def mentions(turn):
+        return any(name_pattern(n).search(turn) or shown_label(n, turn, previous, names) for n in shown)
+
     earlier = [m.text for m in history if m.role == "client"][-8:]
-    start = next((i for i in reversed(range(len(earlier))) if any(lb.search(earlier[i]) for lb in labels)), None)
+    start = next((i for i in reversed(range(len(earlier))) if mentions(earlier[i])), None)
     return [text] if start is None else [*earlier[start:], text]
 
 
@@ -150,7 +210,7 @@ def attribute_values(pattern, text, question):
     return [m[0].casefold() for m in matches]
 
 
-def license_selection(name, seats, turns):
+def license_selection(name, seats, turns, *, lookup=None):
     """Only bind a label and seat count grounded in the buyer's messages."""
     pattern = name_pattern(name)
     anchor = next((i for i in reversed(range(len(turns))) if pattern.search(turns[i])), None)
@@ -172,7 +232,8 @@ def license_selection(name, seats, turns):
                 "excluded", "Покупатель исключил эту позицию.", "Какой продукт подобрать вместо исключённого?"
             )
 
-    selection = named_request(name) if MDAEMON.search(name) else Selection(name)
+    product = lookup or name
+    selection = named_request(product) if MDAEMON.search(product) else Selection(product)
     for turn in scope:
         selection = selection.qualifiers(turn, followup=True)
         technical_text = name_pattern(name).sub("", turn)
@@ -213,9 +274,16 @@ def license_selection(name, seats, turns):
     return selection
 
 
-def resolve_options(index, variants, turns, *, prior_kind=""):
+def resolve_options(index, variants, turns, *, prior_kind="", previous=()):
+    names = [v.name for v in variants]
+    try:
+        grounded = [grounded_label(index, v.name, turns, previous, names) for v in variants]
+    except sqlite3.Error as exc:
+        raise LLMError("catalog_unavailable") from exc
+    labeled = [v.model_copy(update={"name": label}) for v, (label, _) in zip(variants, grounded, strict=True)]
     selections = [
-        license_selection(item.name, item.seats, scoped_turns(item.name, variants, turns)) for item in variants
+        license_selection(item.name, item.seats, scoped_turns(item.name, labeled, turns), lookup=lookup)
+        for item, (_, lookup) in zip(labeled, grounded, strict=True)
     ]
     if prior_kind and len(selections) == 1 and not selections[0].kind:
         selections[0].kind = prior_kind
