@@ -378,7 +378,9 @@ def select(index: Path, selection: Selection) -> Result:
     if selection.buyer:
         buyers = values(BUYER)
         if buyers and selection.buyer not in buyers:
-            buyer_restriction = Source(url=source.url, label="В карточках указан тип покупателя: " + ", ".join(sorted(buyers)))
+            buyer_restriction = Source(
+                url=source.url, label="В карточках указан тип покупателя: " + ", ".join(sorted(buyers))
+            )
         rows = [r for r in rows if selection.buyer in r["params"].get(BUYER, [])]
     if selection.organization:
         rows = [r for r in rows if selection.organization in r["params"].get("Тип организации", [])]

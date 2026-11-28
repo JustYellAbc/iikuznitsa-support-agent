@@ -335,7 +335,7 @@ def test_recall_matching_requires_the_requested_subject_even_when_a_generic_word
         )
 
 
-def test_previous_clarification_citation_is_not_price_evidence_for_new_product(stand_api, provider, index):
+def test_previous_clarification_citation_is_not_price_evidence_for_new_product(stand_api, provider, index):  # noqa: F811
     with closing(sqlite3.connect(index)) as db:
         db.execute(
             "UPDATE offers SET id='321', source='https://store.softline.ru/vendor/paperdesk-321/' WHERE id='desk'"
