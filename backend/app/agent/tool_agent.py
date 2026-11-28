@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
@@ -50,6 +51,7 @@ from app.contracts.schemas import AgentReply, AgentTurn, HandoffRequest, StepTra
 from app.contracts.t04 import Product, Source
 from app.core.llm import LLMError, llm_call
 from app.db.repository import new_id, visible_turns
+from app.services.catalog_snapshot import open_index
 from eval.pii import scrub_pii
 
 MAX_OUTPUT_TOKENS = 800
@@ -153,7 +155,9 @@ FUNCTIONS = {
     "select_licenses": (
         LicenseOptions,
         "Подобрать лицензию по названию покупателя. Для каждой позиции или вместимости передай название "
-        "дословно, включая опечатки. Сервер применит условия покупки, задаст недостающий вопрос или покажет позиции.",
+        "дословно, включая опечатки. Сервер применит условия покупки, задаст недостающий вопрос или покажет позиции. "
+        "Если карточка уже показана, а покупатель меняет число мест или ключей либо спрашивает цену или срок "
+        "для другого количества, вызови select_licenses, а не search_catalog: срок есть в карточке.",
     ),
     "compare_catalog": (
         Compare,
@@ -375,6 +379,18 @@ def detail_reply(row, field_name, title_edition, *, compact):
     # The official name is still evidence, even when the separate edition field is absent.
     summary = product_line(row, "summary", compact=compact and field_name != "edition")
     return f"{summary} {missing} в карточке.", True
+
+
+def shown_cards(index, history):
+    """Cards the buyer last saw. A later clarification supersedes the selection, not the dialog context."""
+    for message in reversed(history[-8:]):
+        if message.role == "agent" and message.sources and index.is_file():
+            marks = ",".join("?" for _ in message.sources)
+            with open_index(index) as db:
+                rows = db.execute(f"SELECT name FROM offers WHERE source IN ({marks})", message.sources).fetchall()
+            if rows:
+                return [SimpleNamespace(name=row["name"]) for row in rows]
+    return []
 
 
 def capacity_question(turns):
@@ -670,11 +686,13 @@ async def run_tool_turn(session, history, text, previous, emit, *, kb_retry=None
             prior = next((m.text for m in reversed(history) if m.role == "client"), None)
             if prior:
                 buyer_turns = [prior, text]
-        if len(buyer_turns) == 1:
-            buyer_turns = shown_product_turns(history, text, args.variants, previous)
+        shown = previous or await asyncio.to_thread(shown_cards, index, history)
+        carried = shown_product_turns(history, text, args.variants, shown)
+        if len(carried) > len(buyer_turns) and carried[-len(buyer_turns) :] == buyer_turns:
+            buyer_turns = carried
         start = time.monotonic()
         hits = await asyncio.to_thread(
-            resolve_options, index, args.variants, buyer_turns, prior_kind=prior_kind, previous=previous
+            resolve_options, index, args.variants, buyer_turns, prior_kind=prior_kind, previous=shown
         )
         trace_args = {"variants": len(hits)}
         if len(hits) == 1 and hits[0].awaiting_fields:
