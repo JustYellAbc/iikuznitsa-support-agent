@@ -216,6 +216,25 @@ def test_seat_change_after_shown_card_reselects_the_same_product(api, provider, 
 
 
 @pytest.mark.usefixtures("index")
+def test_full_card_name_after_clarified_selection_keeps_the_buyer_product(api, provider):
+    responses, requests = provider
+    responses.extend(
+        [
+            tool("select_licenses", variants=[{"name": "MDaemon", "seats": 20}]),
+            tool("select_licenses", variants=[{"name": "MDaemon Messaging Server", "seats": 5}]),
+        ]
+    )
+    cid = api.new_conversation()
+    assert say(api, cid, "Нужен MDaemon на 20 пользователей")[-1]["purpose"] == "clarification"
+    shown = say(api, cid, "Компания, покупаем впервые")
+    assert [p["offerId"] for p in shown[-2]["products"]] == ["new20"]
+    events = say(api, cid, "А на 5 пользователей какая цена и срок?")
+    assert len(requests) == 2 and not responses
+    assert [p["offerId"] for p in events[-2]["products"]] == ["new5"]
+    assert "321 ₽" in events[-1]["text"] and "называется" not in events[-1]["text"]
+
+
+@pytest.mark.usefixtures("index")
 def test_mandatory_price_route_uses_verified_sku_once(api, provider):
     responses, requests = provider
     responses.append(tool("get_offer", offer_id="ask"))

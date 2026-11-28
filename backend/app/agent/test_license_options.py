@@ -14,6 +14,7 @@ from app.agent.license_options import (
     quote_preview,
     resolve_options,
     scoped_turns,
+    shown_label,
     shown_product_turns,
 )
 from app.agent.test_catalog_selection import index as index
@@ -201,14 +202,15 @@ def windows_index(tmp_path):
     shop = ET.Element("yml_catalog", date="2026-01-01")
     ET.SubElement(ET.SubElement(shop, "categories"), "category", id="1").text = "ПО"
     offers = ET.SubElement(shop, "offers")
-    for code, name, price, term in [
-        ("380385", WINDOWS, "30448", "бессрочная"),
+    for code, name, vendor, price, term in [
+        ("380385", WINDOWS, "Программы и лицензии Microsoft Corporation", "30448", "бессрочная"),
         # Prefix search matches "pro" in PROMT and "11" in the registry number.
-        ("489326", "PROMT Neural Training Addon, для ОС Windows (рег. номер ПО 11647)", "190000", "12 мес."),
+        ("489326", "PROMT Neural Training Addon, для ОС Windows (рег. номер ПО 11647)", "PROMT", "190000", "12 мес."),
     ]:
         row = ET.SubElement(offers, "offer", id=code, available="true")
         for key, value in {
             "name": name,
+            "vendor": vendor,
             "price": price,
             "currencyId": "RUB",
             "categoryId": "1",
@@ -252,3 +254,69 @@ def test_counted_keys_after_shown_card_are_packages_not_capacity(windows_index, 
     assert turns == [first, change]
     [hit] = resolve_options(windows_index, variants, turns)
     assert hit.purpose == "answer" and [p.offerId for p in hit.products] == ["380385"] and "?" not in hit.text
+
+
+def test_full_card_name_from_the_model_finds_the_buyer_short_name(index):  # noqa: F811
+    first, answer = "Нужен MDaemon на 20 пользователей", "Компания, покупаем впервые"
+    history = [
+        SimpleNamespace(role="client", text=first),
+        SimpleNamespace(role="agent", text="На кого оформляется лицензия? Покупаете впервые или продлеваете?"),
+        SimpleNamespace(role="client", text=answer),
+        SimpleNamespace(role="agent", text=MDAEMON_20 + "."),
+    ]
+    change = "А на 5 пользователей какая цена и срок?"
+    shown = [SimpleNamespace(name=MDAEMON_20)]
+    variants = [LicenseVariant(name="MDaemon Messaging Server", seats=5)]
+    turns = shown_product_turns(history, change, variants, shown)
+    assert turns == [first, answer, change]
+    with pytest.raises(ValueError, match="дословно"):
+        resolve_options(index, variants, turns)
+    [hit] = resolve_options(index, variants, turns, previous=shown)
+    assert hit.purpose == "answer" and [p.offerId for p in hit.products] == ["new5"] and "321 ₽" in hit.text
+
+
+def test_shown_card_is_not_found_by_generic_or_shared_words(index):  # noqa: F811
+    shown = [SimpleNamespace(name=MDAEMON_20)]
+    change = "А на 5 пользователей?"
+    history = [
+        SimpleNamespace(role="client", text="Нужен сервер Pro на 1 год"),
+        SimpleNamespace(role="agent", text="."),
+    ]
+    variants = [LicenseVariant(name="MDaemon Messaging Server", seats=5)]
+    assert shown_product_turns(history, change, variants, shown) == [change]
+    sibling = [LicenseVariant(name="MDaemon Connector for Outlook", seats=5)]
+    with pytest.raises(ValueError, match="дословно"):
+        resolve_options(index, sibling, ["Нужен MDaemon на 20 пользователей", change], previous=shown)
+    both = [*shown, SimpleNamespace(name=MDAEMON_20.replace("Messaging Server", "Connector for Outlook"))]
+    names = ["MDaemon Messaging Server", "MDaemon Connector for Outlook"]
+    assert shown_label(names[0], "Нужен MDaemon на 20 пользователей", shown, names[:1]) == "MDaemon"
+    assert shown_label(names[0], "Нужен MDaemon на 20 пользователей", both, names) is None
+
+
+def test_vendor_added_by_the_model_is_trimmed_to_the_buyer_wording(windows_index):
+    turns = ["Нужен один ключ Windows 11 Pro для ИП"]
+    [hit] = resolve_options(windows_index, [LicenseVariant(name="Microsoft Windows 11 Pro", seats=1)], turns)
+    assert hit.purpose == "answer" and [p.offerId for p in hit.products] == ["380385"] and "?" not in hit.text
+    history = [
+        SimpleNamespace(role="client", text="Нужен MDaemon на 20 пользователей"),
+        SimpleNamespace(role="agent", text="."),
+    ]
+    more = "А ещё нужен один ключ Windows 11 Pro"
+    basket = [
+        LicenseVariant(name="MDaemon Messaging Server", seats=20),
+        LicenseVariant(name="Microsoft Windows 11 Pro"),
+    ]
+    assert shown_product_turns(history, more, basket, [SimpleNamespace(name=MDAEMON_20)]) == [history[0].text, more]
+
+
+@pytest.mark.parametrize(
+    ("name", "request_text"),
+    [
+        ("Microsoft Windows 11 Home", "Нужен один ключ Windows 11 Pro"),
+        ("Microsoft Windows 11 Pro Workstations", "Нужен один ключ Windows 11 Pro"),
+        ("PROMT Neural Training Addon", "Нужен Training Addon"),
+    ],
+)
+def test_vendor_trimming_keeps_the_name_hallucination_guard(windows_index, name, request_text):
+    with pytest.raises(ValueError, match="дословно"):
+        resolve_options(windows_index, [LicenseVariant(name=name)], [request_text])
