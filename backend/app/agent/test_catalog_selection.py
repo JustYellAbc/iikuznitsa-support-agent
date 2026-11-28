@@ -224,7 +224,8 @@ def test_renewal_type_conflict_is_scoped_to_matching_platform_and_capacity(index
     with closing(sqlite3.connect(index)) as db:
         db.execute("UPDATE offers SET params=json_set(params, '$.Платформа', json_array('Linux'))")
         db.execute(
-            "UPDATE offers SET name=name || ' продление просроченной подписки', params=json_set(params, '$.Платформа', json_array('Windows')) WHERE id='new5'"
+            "UPDATE offers SET name=name || ' продление просроченной подписки', "
+            "params=json_set(params, '$.Платформа', json_array('Windows')) WHERE id='new5'"
         )
         db.execute("DELETE FROM offers WHERE id IN ('renew','late')")
         db.commit()
