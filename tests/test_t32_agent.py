@@ -235,6 +235,29 @@ def test_full_card_name_after_clarified_selection_keeps_the_buyer_product(api, p
 
 
 @pytest.mark.usefixtures("index")
+def test_card_shown_before_a_search_clarification_still_grounds_the_next_seat_change(api, provider):
+    responses, requests = provider
+    query = "MDaemon Messaging Server 5 пользователей лицензия с подпиской на обновления"
+    responses.extend(
+        [
+            tool("select_licenses", variants=[{"name": "MDaemon", "seats": 20}]),
+            tool("search_catalog", query=query),
+            tool("respond", kind="clarify", question="Какой вариант лицензии вам нужен?"),
+            tool("select_licenses", variants=[{"name": "MDaemon Messaging Server", "seats": 5}]),
+        ]
+    )
+    cid = api.new_conversation()
+    say(api, cid, "Нужен MDaemon на 20 пользователей")
+    assert [p["offerId"] for p in say(api, cid, "Компания, покупаем впервые")[-2]["products"]] == ["new20"]
+    assert say(api, cid, "А на 5 пользователей какая цена и срок?")[-1]["purpose"] == "clarification"
+    events = say(api, cid, "Теперь нужно на 5 пользователей сколько будет стоить и как получить КП?")
+    assert json.loads(requests[-1]["messages"][-1]["content"])["previous_offers"] == []
+    assert len(requests) == 4 and not responses
+    assert [p["offerId"] for p in events[-2]["products"]] == ["new5"]
+    assert "Подготовить КП" in events[-1]["text"] and "называется" not in events[-1]["text"]
+
+
+@pytest.mark.usefixtures("index")
 def test_mandatory_price_route_uses_verified_sku_once(api, provider):
     responses, requests = provider
     responses.append(tool("get_offer", offer_id="ask"))
